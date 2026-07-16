@@ -83,7 +83,9 @@ class ZycleClient(
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
             val dev = result?.device ?: return
             val name = result.scanRecord?.deviceName ?: dev.name
-            if (name != null && name.startsWith(namePrefix, ignoreCase = true)) { stopScan(); connect(dev) }
+            if (name != null && name.startsWith(namePrefix, ignoreCase = true)) {
+                FileLog.event("Zycle found '$name' ${dev.address} rssi=${result.rssi}"); stopScan(); connect(dev)
+            }
         }
         override fun onScanFailed(errorCode: Int) { Log.w(tag, "scan failed $errorCode"); if (!stopped) handler.postDelayed({ startScan() }, 2000) }
     }
@@ -147,17 +149,23 @@ class ZycleClient(
 
         @Deprecated("Deprecated in Java")
         override fun onCharacteristicRead(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) @Suppress("DEPRECATION") onValue(ch.uuid, ch.value?.copyOf() ?: ByteArray(0))
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                val v = @Suppress("DEPRECATION") (ch.value?.copyOf() ?: ByteArray(0))
+                FileLog.event("Zycle read ${shortUuid(ch.uuid)} = ${FileLog.hex(v)}")   // identity/feature/ranges values
+                onValue(ch.uuid, v)
+            } else FileLog.event("Zycle read ${shortUuid(ch.uuid)} failed status=$status")
             opDone()
         }
 
-        override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) { opDone() }
+        override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) FileLog.event("Zycle write ${shortUuid(ch.uuid)} status=$status")
+            opDone()
+        }
 
         @Deprecated("Deprecated in Java")
         override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
             val value = @Suppress("DEPRECATION") (ch.value?.copyOf() ?: ByteArray(0))
-            // Log non-power notifications (buttons, status, control responses) rate-limited; power is 4 Hz.
-            if (!GattUuids.isPowerChar(ch.uuid)) logNotif(ch.uuid, value)
+            logNotif(ch.uuid, value)   // all notifications (power included), rate-limited per char
             onValue(ch.uuid, value)
         }
     }
@@ -186,7 +194,8 @@ class ZycleClient(
     private fun enqueueSubscribe(g: BluetoothGatt, ch: BluetoothGattCharacteristic) = enqueue {
         g.setCharacteristicNotification(ch, true)
         val d = ch.getDescriptor(cccd)
-        if (d == null) { opDone(); return@enqueue }
+        if (d == null) { FileLog.event("Zycle subscribe ${shortUuid(ch.uuid)} — no CCCD"); opDone(); return@enqueue }
+        FileLog.event("Zycle subscribe ${shortUuid(ch.uuid)}")
         @Suppress("DEPRECATION")
         run {
             d.value = if (ch.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)

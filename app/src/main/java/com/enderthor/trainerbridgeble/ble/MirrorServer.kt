@@ -95,7 +95,10 @@ class MirrorServer(
             val service = BluetoothGattService(svc.uuid,
                 if (svc.primary) BluetoothGattService.SERVICE_TYPE_PRIMARY else BluetoothGattService.SERVICE_TYPE_SECONDARY)
             for (cs in svc.chars) {
-                val ch = BluetoothGattCharacteristic(cs.uuid, cs.properties, cs.permissions)
+                // Android's CLIENT-side getPermissions() is 0 (permissions aren't exposed to a central), so
+                // mirroring cs.permissions verbatim leaves the char with NO read/write permission and apps
+                // can't use it. Derive permissions from the discovered PROPERTIES instead.
+                val ch = BluetoothGattCharacteristic(cs.uuid, cs.properties, permissionsFor(cs.properties))
                 for (dU in cs.descriptors) ch.addDescriptor(BluetoothGattDescriptor(dU,
                     BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE))
                 // Ensure a CCCD exists on notify/indicate chars even if the trainer didn't list it.
@@ -104,10 +107,24 @@ class MirrorServer(
                     ch.addDescriptor(BluetoothGattDescriptor(cccd, BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE))
                 service.addCharacteristic(ch)
                 chars[cs.uuid] = ch
+                FileLog.event("mirror char ${shortUuid(svc.uuid)}/${shortUuid(cs.uuid)} props=${cs.properties}")
             }
             pendingServices.add(service)
         }
+        FileLog.event("mirror built ${pendingServices.size} services")
         addNextService()
+    }
+
+    /** Read/write GATT permissions for a mirrored characteristic, derived from its BLE properties. */
+    private fun permissionsFor(properties: Int): Int {
+        var perm = 0
+        if (properties and (BluetoothGattCharacteristic.PROPERTY_READ or
+                BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0)
+            perm = perm or BluetoothGattCharacteristic.PERMISSION_READ
+        if (properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or
+                BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE or BluetoothGattCharacteristic.PROPERTY_SIGNED_WRITE) != 0)
+            perm = perm or BluetoothGattCharacteristic.PERMISSION_WRITE
+        return perm
     }
 
     private fun addNextService() { pendingServices.poll()?.let { s -> runCatching { server?.addService(s) } } }
@@ -132,6 +149,7 @@ class MirrorServer(
         val ch = chars[charUuid] ?: return
         val subs = subscribers[charUuid] ?: return
         if (subs.isEmpty()) return
+        logRelay(charUuid, value, out, subs.size)
         handler.post {
             val srv = server ?: return@post
             val indicate = ch.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
@@ -210,8 +228,8 @@ class MirrorServer(
 
     // ── advertising ──────────────────────────────────────────────────────────────────────────────────
     private val advCallback = object : android.bluetooth.le.AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { advertising = true; onStatus("anunciando $ADVERTISED_NAME") }
-        override fun onStartFailure(errorCode: Int) { advertising = false; onStatus("fallo al anunciar ($errorCode)") }
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { advertising = true; onStatus("anunciando $ADVERTISED_NAME"); FileLog.event("advertising as $ADVERTISED_NAME") }
+        override fun onStartFailure(errorCode: Int) { advertising = false; onStatus("fallo al anunciar ($errorCode)"); FileLog.event("advertise failed $errorCode") }
     }
 
     private fun startAdvertising() {
@@ -222,7 +240,8 @@ class MirrorServer(
             .setConnectable(true).setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM).build()
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
-            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1826)))   // FTMS — apps scan for this
+            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1826)))   // FTMS — Bestcycling scans for this
+            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1818)))   // Cycling Power — the Garmin pairs power here
             .build()
         val scanResp = AdvertiseData.Builder().setIncludeDeviceName(true).build()   // carries the renamed name
         runCatching { advertiser.startAdvertising(settings, data, scanResp, advCallback) }
@@ -232,6 +251,15 @@ class MirrorServer(
         if (!advertising) return
         advertising = false
         runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(advCallback) }
+    }
+
+    private val relayLogMs = ConcurrentHashMap<UUID, Long>()
+    private fun logRelay(uuid: UUID, inV: ByteArray, outV: ByteArray, nClients: Int) {
+        val now = System.currentTimeMillis()
+        if (now - (relayLogMs[uuid] ?: 0L) < 500L) return   // rate-limit power (4 Hz); other chars log promptly
+        relayLogMs[uuid] = now
+        val corr = if (!outV.contentEquals(inV)) " -> ${FileLog.hex(outV)}" else ""
+        FileLog.event("relay ${shortUuid(uuid)} = ${FileLog.hex(inV)}$corr to $nClients")
     }
 
     private fun shortUuid(u: UUID?): String {
