@@ -82,11 +82,15 @@ class SimSource(
     override fun write(charUuid: UUID, bytes: ByteArray, withResponse: Boolean) {
         FileLog.event("SIM write ${bytes.joinToString("") { "%02X".format(it) }}")
         if (charUuid != CONTROL || bytes.isEmpty()) return
-        when (bytes[0].toInt() and 0xFF) {
+        val op = bytes[0].toInt() and 0xFF
+        when (op) {
             0x05 -> if (bytes.size >= 3) ergTarget = (bytes[1].toInt() and 0xFF) or ((bytes[2].toInt() and 0xFF) shl 8)  // Set Target Power
             0x04 -> if (bytes.size >= 2) { resistance = (bytes[1].toInt() and 0xFF).coerceIn(0, 100); emitResistance() }   // Set Target Resistance (app → down)
             0x01 -> ergTarget = null   // Reset
         }
+        // Control Point Response indication (0x80 <reqOp> <success>) — a real trainer sends this, and apps
+        // gate their ERG handshake on it, so emit it or sim control never "takes".
+        onValue(CONTROL, byteArrayOf(0x80.toByte(), (op and 0xFF).toByte(), 0x01))
     }
 
     private fun indoorBikeData(power: Int, cadence: Int, speedKmh: Double, resistance: Int): ByteArray {
@@ -96,7 +100,8 @@ class SimSource(
         return byteArrayOf(0x64, 0x00, lo(speed), hi(speed), lo(cad), hi(cad), lo(resistance), hi(resistance), lo(power), hi(power))
     }
 
-    private fun cyclingPower(power: Int): ByteArray = byteArrayOf(0x20, 0x00, lo(power), hi(power))
+    // CPM (0x2A63): flags 0x0000 (power-only; instantaneous power is mandatory at bytes 2-3, no flag).
+    private fun cyclingPower(power: Int): ByteArray = byteArrayOf(0x00, 0x00, lo(power), hi(power))
 
     private fun lo(v: Int) = (v and 0xFF).toByte()
     private fun hi(v: Int) = ((v shr 8) and 0xFF).toByte()

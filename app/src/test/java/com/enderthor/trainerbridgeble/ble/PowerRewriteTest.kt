@@ -27,6 +27,13 @@ class PowerRewriteTest {
         assertArrayEquals(bytes(0x44, 0x00, 0x2C, 0x01, 0xB4, 0x00, 0x86, 0x00), PowerRewrite.correctIndoorBikeData(v, c))
     }
 
+    @Test fun indoorBikeData_rewritesPowerWithResistanceFieldPresent() {
+        // flags 0x0064 (speed + cadence + RESISTANCE bit5 + power): speed(2) cadence(2) resistance(2) power(2)
+        // power raw 100 (0x0064) at bytes 8-9 → 134 (0x0086); resistance (bytes 6-7) untouched
+        val v = bytes(0x64, 0x00, 0x2C, 0x01, 0xB4, 0x00, 0x14, 0x00, 0x64, 0x00)
+        assertArrayEquals(bytes(0x64, 0x00, 0x2C, 0x01, 0xB4, 0x00, 0x14, 0x00, 0x86, 0x00), PowerRewrite.correctIndoorBikeData(v, c))
+    }
+
     @Test fun inverseTargetPower_invertsSetTargetPower() {
         // Set Target Power (0x05), 200 W (0x00C8) → invert = round((200-28)/1.06)=162 (0x00A2)
         assertArrayEquals(bytes(0x05, 0xA2, 0x00), PowerRewrite.inverseTargetPower(bytes(0x05, 0xC8, 0x00), c))
