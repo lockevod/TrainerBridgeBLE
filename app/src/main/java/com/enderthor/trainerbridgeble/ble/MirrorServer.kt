@@ -53,18 +53,41 @@ class MirrorServer(
     private val cccd: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     private var originalName: String? = null
     @Volatile private var advertising = false
+    @Volatile private var built = false   // build the mirrored GATT once; a trainer reconnect keeps it
 
     fun start() {
         val srv = runCatching { mgr.openGattServer(context, serverCallback) }.getOrNull()
         if (srv == null) { onStatus("no se pudo abrir el servidor BLE"); return }
         server = srv
-        originalName = runCatching { adapter.name }.getOrNull()
-        runCatching { if (adapter.name != ADVERTISED_NAME) adapter.name = ADVERTISED_NAME }
+        renameAdapter()
     }
 
-    /** Build the mirrored server from the trainer's discovered GATT. Services are added one at a time. */
+    /** Rename the adapter to our advertised name, persisting the ORIGINAL to prefs so a process kill (which
+     *  skips stop()) doesn't lose the user's real Bluetooth name — and so we never capture our own rename. */
+    private fun renameAdapter() {
+        val prefs = context.getSharedPreferences("trainerbridgeble", Context.MODE_PRIVATE)
+        val current = runCatching { adapter.name }.getOrNull()
+        if (prefs.getString(KEY_ORIG_NAME, null) == null && current != null && current != ADVERTISED_NAME)
+            prefs.edit().putString(KEY_ORIG_NAME, current).apply()
+        originalName = prefs.getString(KEY_ORIG_NAME, null)
+        runCatching { if (current != ADVERTISED_NAME) adapter.name = ADVERTISED_NAME }
+    }
+
+    private fun restoreName() {
+        val prefs = context.getSharedPreferences("trainerbridgeble", Context.MODE_PRIVATE)
+        (originalName ?: prefs.getString(KEY_ORIG_NAME, null))?.let { orig -> runCatching { adapter.name = orig } }
+        prefs.edit().remove(KEY_ORIG_NAME).apply()
+        originalName = null
+    }
+
+    /** Build the mirrored server from the trainer's discovered GATT. Services are added one at a time.
+     *  Built ONCE per session: a trainer reconnect re-discovers the SAME GATT, so we keep the existing
+     *  services + characteristics (re-adding them would strand apps still subscribed to the old instances
+     *  and there is no clean live rebuild). */
     fun build(profile: GattProfile) {
         val srv = server ?: return
+        if (built) return
+        built = true
         chars.clear(); pendingServices.clear()
         for (svc in profile.services) {
             if (GattUuids.isStackService(svc.uuid)) continue
@@ -92,7 +115,8 @@ class MirrorServer(
         stopAdvertising()
         runCatching { server?.close() }
         server = null
-        originalName?.let { orig -> runCatching { adapter.name = orig } }; originalName = null
+        restoreName()
+        built = false
         chars.clear(); cache.clear(); subscribers.clear(); clients.clear(); pendingServices.clear()
     }
 
@@ -110,7 +134,8 @@ class MirrorServer(
         handler.post {
             val srv = server ?: return@post
             val indicate = ch.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
-            for (addr in subs.toList()) {
+            val targets = synchronized(subs) { subs.toList() }   // copy under lock — a CCCD write may mutate it concurrently
+            for (addr in targets) {
                 val dev = clients[addr] ?: continue
                 notify(srv, dev, ch, out, indicate)
             }
@@ -205,5 +230,6 @@ class MirrorServer(
 
     private companion object {
         const val ADVERTISED_NAME = "ZycleBike2 TB"
+        const val KEY_ORIG_NAME = "origBtName"
     }
 }
