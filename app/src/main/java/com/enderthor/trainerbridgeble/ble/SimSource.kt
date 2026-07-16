@@ -37,10 +37,13 @@ class SimSource(
         emitResistance()
     }
 
-    /** Report the resistance level to the apps: FTMS Machine Status "Target Resistance Level Changed" (0x07). */
+    /** Report the resistance to the apps two ways, like a real Zycle: FTMS Machine Status (standard) AND the
+     *  Zycle-style proprietary characteristic carrying the raw FE-C Basic Resistance page (buttons). */
     private fun emitResistance() {
         val level = resistance   // sim: level == % (0..100)
         onValue(STATUS, byteArrayOf(0x07, (level and 0xFF).toByte(), ((level shr 8) and 0xFF).toByte()))
+        val units = (resistance * 2).coerceIn(0, 200)   // FE-C 0.5% units
+        onValue(PROP_BUTTON, byteArrayOf(0x30, 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), units.toByte()))
     }
 
     private val ticker = object : Runnable {
@@ -120,6 +123,8 @@ class SimSource(
             CharSpec(CP_FEATURE, R, 0),
             CharSpec(SENSOR_LOC, R, 0),
         )),
+        // Zycle-style proprietary "FE-C over BLE" service — carries the button/resistance page.
+        SvcSpec(PROP_SERVICE, true, listOf(CharSpec(PROP_BUTTON, N, 0, listOf(CCCD)))),
     ))
 
     private companion object {
@@ -132,6 +137,8 @@ class SimSource(
         val RES_RANGE = GattUuids.uuid16(0x2AD6)
         val CP_FEATURE = GattUuids.uuid16(0x2A65)
         val SENSOR_LOC = GattUuids.uuid16(0x2A5D)
+        val PROP_SERVICE: UUID = UUID.fromString("F03EEE01-4910-473C-BE46-960948C2F59C")
+        val PROP_BUTTON: UUID = UUID.fromString("F03EE002-4910-473C-BE46-960948C2F59C")
         val CCCD: UUID = GattUuids.uuid16(0x2902)
         const val R = android.bluetooth.BluetoothGattCharacteristic.PROPERTY_READ
         const val N = android.bluetooth.BluetoothGattCharacteristic.PROPERTY_NOTIFY

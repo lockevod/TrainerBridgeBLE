@@ -7,24 +7,30 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.text.InputType
 import android.view.Gravity
+import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 
-/** Minimal UI: correction (scale % / offset W), Start/Stop, and live status + raw/corrected power. */
+/** Card-based monitor + config UI (same look as the ANT app): live power/resistance/control, correction
+ *  fields, log + simulation toggles, and emulated resistance buttons in test mode. */
 class MonitorActivity : Activity() {
     private lateinit var config: Config
-    private lateinit var status: TextView
-    private lateinit var power: TextView
-    private lateinit var resist: TextView
-    private lateinit var control: TextView
+    private lateinit var statusLine: TextView
+    private lateinit var powerTile: TextView
+    private lateinit var resistTile: TextView
+    private lateinit var controlLine: TextView
     private lateinit var startBtn: Button
     private lateinit var upBtn: Button
     private lateinit var downBtn: Button
@@ -46,35 +52,40 @@ class MonitorActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         config = Config(this)
-        val pad = (16 * resources.displayMetrics.density).toInt()
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad, pad, pad) }
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setBackgroundColor(PAGE_BG); setPadding(dp(16), dp(20), dp(16), dp(20))
+        }
+        body.addView(TextView(this).apply {
+            text = "TrainerBridge BLE"; textSize = 22f; setTextColor(TEXT); typeface = Typeface.DEFAULT_BOLD; setPadding(dp(4), 0, 0, dp(12))
+        })
 
-        root.addView(TextView(this).apply { text = "TrainerBridge BLE"; textSize = 22f })
-        status = TextView(this).apply { text = "parado"; textSize = 16f }; root.addView(status)
-        power = TextView(this).apply { text = "—"; textSize = 28f; gravity = Gravity.CENTER; setPadding(0, pad, 0, pad) }; root.addView(power)
-        resist = TextView(this).apply { text = "Resistencia: —"; textSize = 18f }; root.addView(resist)
-        control = TextView(this).apply { text = "App → trainer: —"; textSize = 16f }; root.addView(control)
-
-        // Emulated trainer buttons (test mode): change the simulated resistance up/down.
+        // ── Monitor card ──
+        val mon = card("Estado")
+        statusLine = line(mon, "parado")
+        val tiles = tileRow(); mon.addView(tiles)
+        powerTile = tile(tiles, "Potencia", ACCENT)
+        resistTile = tile(tiles, "Resistencia", OK)
+        controlLine = line(mon, "App → trainer: —")
         val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        downBtn = Button(this).apply { text = "Resistencia ▼"; setOnClickListener { service?.buttonDown() } }
-        upBtn = Button(this).apply { text = "Resistencia ▲"; setOnClickListener { service?.buttonUp() } }
-        btnRow.addView(downBtn); btnRow.addView(upBtn); root.addView(btnRow)
+        downBtn = plainButton("Resistencia ▼") { service?.buttonDown() }
+        upBtn = plainButton("Resistencia ▲") { service?.buttonUp() }
+        (downBtn.layoutParams as LinearLayout.LayoutParams).apply { weight = 1f; rightMargin = dp(6) }
+        (upBtn.layoutParams as LinearLayout.LayoutParams).apply { weight = 1f }
+        btnRow.addView(downBtn); btnRow.addView(upBtn); mon.addView(btnRow)
+        startBtn = accentButton("Start") { onStartStop() }; mon.addView(startBtn)
+        body.addView(mon)
 
-        root.addView(TextView(this).apply { text = "Ajuste de escala (%, entero)" })
-        scaleField = EditText(this).apply { inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED; setText(config.scaleAdjustPercent.toString()) }
-        root.addView(scaleField)
-        root.addView(TextView(this).apply { text = "Offset (W, entero)" })
-        offsetField = EditText(this).apply { inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED; setText(config.offsetW.toString()) }
-        root.addView(offsetField)
+        // ── Config card ──
+        val cfg = card("Corrección")
+        cfg.addView(fieldLabel("Ajuste de escala (%, entero)"))
+        scaleField = numberField(config.scaleAdjustPercent.toString()); cfg.addView(scaleField)
+        cfg.addView(fieldLabel("Offset (W, entero)"))
+        offsetField = numberField(config.offsetW.toString()); cfg.addView(offsetField)
+        logCheck = check("Guardar log (CSV)", config.loggingEnabled); cfg.addView(logCheck)
+        simCheck = check("Modo simulación (sin bici)", config.simulate); cfg.addView(simCheck)
+        body.addView(cfg)
 
-        logCheck = CheckBox(this).apply { text = "Guardar log (CSV)"; isChecked = config.loggingEnabled }; root.addView(logCheck)
-        simCheck = CheckBox(this).apply { text = "Modo simulación (sin bici)"; isChecked = config.simulate }; root.addView(simCheck)
-
-        startBtn = Button(this).apply { text = "Start"; setOnClickListener { onStartStop() } }
-        root.addView(startBtn)
-
-        setContentView(root)
+        setContentView(ScrollView(this).apply { setBackgroundColor(PAGE_BG); addView(body) })
         ensurePermissions()
     }
 
@@ -83,8 +94,7 @@ class MonitorActivity : Activity() {
 
     private fun onStartStop() {
         saveCorrection()
-        if (service?.isRunning == true) { BridgeService.stop(this) }
-        else { BridgeService.start(this) }
+        if (service?.isRunning == true) BridgeService.stop(this) else BridgeService.start(this)
         render()
     }
 
@@ -99,12 +109,14 @@ class MonitorActivity : Activity() {
         val s = service
         val running = s?.isRunning == true
         startBtn.text = if (running) "Stop" else "Start"
-        status.text = s?.status ?: "parado"
-        power.text = s?.let { if (it.lastCorrectedW != null) "${it.lastRawW} → ${it.lastCorrectedW} W" else "—" } ?: "—"
-        resist.text = "Resistencia: " + (s?.resistance?.let { "$it%" } ?: "—")
-        control.text = "App → trainer: " + (s?.lastControl ?: "—")
+        statusLine.text = s?.status ?: "parado"
+        statusLine.setTextColor(if (s?.zycleConnected == true) OK else MUTED)
+        powerTile.text = s?.let { if (it.lastCorrectedW != null) "${it.lastRawW}→${it.lastCorrectedW} W" else "—" } ?: "—"
+        resistTile.text = s?.resistance?.let { "$it%" } ?: "—"
+        controlLine.text = "App → trainer: " + (s?.lastControl ?: "—")
         val simRunning = running && s?.isSimulating == true
         upBtn.isEnabled = simRunning; downBtn.isEnabled = simRunning
+        upBtn.alpha = if (simRunning) 1f else 0.4f; downBtn.alpha = if (simRunning) 1f else 0.4f
     }
 
     private fun ensurePermissions() {
@@ -113,5 +125,60 @@ class MonitorActivity : Activity() {
         else listOf(Manifest.permission.ACCESS_FINE_LOCATION)
         val missing = needed.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 1)
+    }
+
+    // ── style helpers (mirrors the ANT app) ──
+    private fun card(title: String): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL; background = rounded(CARD_BG); setPadding(dp(18), dp(14), dp(18), dp(16))
+        val lp = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT); lp.setMargins(0, 0, 0, dp(14)); layoutParams = lp
+        addView(TextView(this@MonitorActivity).apply {
+            text = title; textSize = 16f; setTextColor(ACCENT); typeface = Typeface.DEFAULT_BOLD; setPadding(0, 0, 0, dp(8))
+        })
+    }
+
+    private fun line(parent: LinearLayout, text: String): TextView {
+        val tv = TextView(this).apply { this.text = text; textSize = 14f; setTextColor(MUTED); setPadding(0, dp(3), 0, dp(3)) }
+        parent.addView(tv); return tv
+    }
+
+    private fun tileRow() = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(4), 0, dp(8)) }
+
+    private fun tile(row: LinearLayout, label: String, valueColor: Int): TextView {
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; background = rounded(PAGE_BG); setPadding(dp(6), dp(12), dp(6), dp(12)); gravity = Gravity.CENTER
+            val lp = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f); lp.setMargins(dp(3), 0, dp(3), 0); layoutParams = lp
+        }
+        val value = TextView(this).apply { text = "—"; textSize = 24f; setTextColor(valueColor); typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER }
+        col.addView(value)
+        col.addView(TextView(this).apply { text = label; textSize = 12f; setTextColor(MUTED); gravity = Gravity.CENTER })
+        row.addView(col); return value
+    }
+
+    private fun fieldLabel(t: String) = TextView(this).apply { text = t; textSize = 13f; setTextColor(MUTED); setPadding(0, dp(6), 0, dp(2)) }
+    private fun numberField(v: String) = EditText(this).apply {
+        inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED; setText(v); setTextColor(TEXT)
+    }
+    private fun check(t: String, on: Boolean) = CheckBox(this).apply { text = t; isChecked = on; setTextColor(TEXT); setPadding(0, dp(6), 0, 0) }
+
+    private fun accentButton(t: String, onClick: () -> Unit) = Button(this).apply {
+        text = t; setTextColor(0xFFFFFFFF.toInt()); background = rounded(ACCENT); textSize = 16f; setPadding(dp(16), dp(12), dp(16), dp(12))
+        val lp = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT); lp.setMargins(0, dp(10), 0, 0); layoutParams = lp
+        setOnClickListener { onClick() }
+    }
+    private fun plainButton(t: String, onClick: () -> Unit) = Button(this).apply {
+        text = t; setTextColor(ACCENT); background = rounded(PAGE_BG); setPadding(dp(14), dp(10), dp(14), dp(10))
+        layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT); setOnClickListener { onClick() }
+    }
+
+    private fun rounded(color: Int) = GradientDrawable().apply { setColor(color); cornerRadius = dp(12).toFloat() }
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private companion object {
+        const val PAGE_BG = 0xFFEDEFF2.toInt()
+        const val CARD_BG = 0xFFFFFFFF.toInt()
+        val ACCENT = 0xFF1565C0.toInt()
+        const val TEXT = 0xFF1A1A1A.toInt()
+        const val MUTED = 0xFF616161.toInt()
+        const val OK = 0xFF2E7D32.toInt()
     }
 }
