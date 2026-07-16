@@ -12,6 +12,8 @@ import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.ServiceCompat
 import com.enderthor.trainerbridgeble.ble.MirrorServer
+import com.enderthor.trainerbridgeble.ble.SimSource
+import com.enderthor.trainerbridgeble.ble.TrainerSource
 import com.enderthor.trainerbridgeble.ble.ZycleClient
 
 /**
@@ -24,7 +26,7 @@ class BridgeService : Service() {
     inner class LocalBinder : Binder() { val service: BridgeService get() = this@BridgeService }
     private val binder = LocalBinder()
 
-    private var client: ZycleClient? = null
+    private var client: TrainerSource? = null
     private var mirror: MirrorServer? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -52,8 +54,8 @@ class BridgeService : Service() {
         createChannel()
         ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         acquireWakeLock()
-        FileLog.init(this); FileLog.enabled = true
-        FileLog.event("bridge start scaleAdj=${config.scaleAdjustPercent}% offset=${config.offsetW}W prefix=${config.namePrefix}")
+        FileLog.init(this); FileLog.enabled = config.loggingEnabled
+        FileLog.event("bridge start scaleAdj=${config.scaleAdjustPercent}% offset=${config.offsetW}W prefix=${config.namePrefix} sim=${config.simulate}")
 
         val m = MirrorServer(
             context = this,
@@ -61,16 +63,11 @@ class BridgeService : Service() {
             toZycle = { uuid, bytes, withResponse -> client?.write(uuid, bytes, withResponse) },
             onStatus = { s -> status = s; listener?.invoke() },
         )
-        val c = ZycleClient(
-            context = this,
-            namePrefix = config.namePrefix,
-            onProfile = { profile -> m.build(profile) },
-            onValue = { uuid, value ->
-                m.onZycleValue(uuid, value)
-                cachePowerForUi(config, uuid, value)
-            },
-            onState = { connected -> zycleConnected = connected; status = if (connected) "trainer conectado" else "buscando trainer…"; listener?.invoke() },
-        )
+        val onProfile: (com.enderthor.trainerbridgeble.ble.GattProfile) -> Unit = { profile -> m.build(profile) }
+        val onValue: (java.util.UUID, ByteArray) -> Unit = { uuid, value -> m.onZycleValue(uuid, value); cachePowerForUi(config, uuid, value) }
+        val onState: (Boolean) -> Unit = { connected -> zycleConnected = connected; status = if (connected) "trainer conectado" else "buscando trainer…"; listener?.invoke() }
+        val c: TrainerSource = if (config.simulate) SimSource(onProfile, onValue, onState)
+        else ZycleClient(this, config.namePrefix, onProfile, onValue, onState)
         m.start()
         c.start()
         mirror = m; client = c

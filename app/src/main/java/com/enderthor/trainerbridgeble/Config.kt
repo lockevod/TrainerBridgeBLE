@@ -22,6 +22,16 @@ class Config(context: Context) {
         get() = p.getString(KEY_PREFIX, "Zycle") ?: "Zycle"
         set(v) = p.edit().putString(KEY_PREFIX, v).apply()
 
+    /** Write the diagnostic CSV log. */
+    var loggingEnabled: Boolean
+        get() = p.getBoolean(KEY_LOG, false)
+        set(v) = p.edit().putBoolean(KEY_LOG, v).apply()
+
+    /** Test mode: a synthetic trainer feeds the pipeline (no real Zycle needed). */
+    var simulate: Boolean
+        get() = p.getBoolean(KEY_SIM, false)
+        set(v) = p.edit().putBoolean(KEY_SIM, v).apply()
+
     /** LIVE correction from the current scale/offset. */
     fun correction(): PowerCorrection {
         val mult = 1.0 + scaleAdjustPercent / 100.0
@@ -32,5 +42,7 @@ class Config(context: Context) {
         const val KEY_SCALE = "scaleAdjustPct"
         const val KEY_OFFSET = "offsetW"
         const val KEY_PREFIX = "namePrefix"
+        const val KEY_LOG = "loggingEnabled"
+        const val KEY_SIM = "simulate"
     }
 }

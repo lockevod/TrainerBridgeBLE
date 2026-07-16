@@ -35,7 +35,7 @@ class ZycleClient(
     private val onProfile: (GattProfile) -> Unit,
     private val onValue: (charUuid: UUID, value: ByteArray) -> Unit,   // notifications AND initial reads
     private val onState: (connected: Boolean) -> Unit,
-) {
+) : TrainerSource {
     private val tag = "TBB/ZycleClient"
     private val handler = Handler(Looper.getMainLooper())
     private val adapter by lazy { (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter }
@@ -49,12 +49,12 @@ class ZycleClient(
 
     private val cccd: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-    fun start() {
+    override fun start() {
         stopped = false
         startScan()
     }
 
-    fun stop() {
+    override fun stop() {
         stopped = true
         stopScan()
         opQueue.clear(); opBusy.set(false)
@@ -63,7 +63,7 @@ class ZycleClient(
     }
 
     /** Forward a write to the trainer's characteristic [charUuid] (control relay). Queued. */
-    fun write(charUuid: UUID, bytes: ByteArray, withResponse: Boolean) {
+    override fun write(charUuid: UUID, bytes: ByteArray, withResponse: Boolean) {
         FileLog.event("Zycle write $charUuid = ${FileLog.hex(bytes)}")
         val g = gatt ?: return
         val ch = g.services.firstNotNullOfOrNull { s -> s.getCharacteristic(charUuid) } ?: return

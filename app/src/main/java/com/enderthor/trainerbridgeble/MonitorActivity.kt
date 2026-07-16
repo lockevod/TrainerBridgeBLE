@@ -13,6 +13,7 @@ import android.os.IBinder
 import android.text.InputType
 import android.view.Gravity
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -25,6 +26,8 @@ class MonitorActivity : Activity() {
     private lateinit var startBtn: Button
     private lateinit var scaleField: EditText
     private lateinit var offsetField: EditText
+    private lateinit var logCheck: CheckBox
+    private lateinit var simCheck: CheckBox
 
     private var service: BridgeService? = null
     private val conn = object : ServiceConnection {
@@ -53,6 +56,9 @@ class MonitorActivity : Activity() {
         offsetField = EditText(this).apply { inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED; setText(config.offsetW.toString()) }
         root.addView(offsetField)
 
+        logCheck = CheckBox(this).apply { text = "Guardar log (CSV)"; isChecked = config.loggingEnabled }; root.addView(logCheck)
+        simCheck = CheckBox(this).apply { text = "Modo simulación (sin bici)"; isChecked = config.simulate }; root.addView(simCheck)
+
         startBtn = Button(this).apply { text = "Start"; setOnClickListener { onStartStop() } }
         root.addView(startBtn)
 
@@ -73,6 +79,8 @@ class MonitorActivity : Activity() {
     private fun saveCorrection() {
         scaleField.text.toString().toIntOrNull()?.let { if (it > -100) config.scaleAdjustPercent = it }
         offsetField.text.toString().toIntOrNull()?.let { config.offsetW = it }
+        config.loggingEnabled = logCheck.isChecked
+        config.simulate = simCheck.isChecked
     }
 
     private fun render() {
