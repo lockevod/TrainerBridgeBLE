@@ -23,7 +23,11 @@ class MonitorActivity : Activity() {
     private lateinit var config: Config
     private lateinit var status: TextView
     private lateinit var power: TextView
+    private lateinit var resist: TextView
+    private lateinit var control: TextView
     private lateinit var startBtn: Button
+    private lateinit var upBtn: Button
+    private lateinit var downBtn: Button
     private lateinit var scaleField: EditText
     private lateinit var offsetField: EditText
     private lateinit var logCheck: CheckBox
@@ -48,6 +52,14 @@ class MonitorActivity : Activity() {
         root.addView(TextView(this).apply { text = "TrainerBridge BLE"; textSize = 22f })
         status = TextView(this).apply { text = "parado"; textSize = 16f }; root.addView(status)
         power = TextView(this).apply { text = "—"; textSize = 28f; gravity = Gravity.CENTER; setPadding(0, pad, 0, pad) }; root.addView(power)
+        resist = TextView(this).apply { text = "Resistencia: —"; textSize = 18f }; root.addView(resist)
+        control = TextView(this).apply { text = "App → trainer: —"; textSize = 16f }; root.addView(control)
+
+        // Emulated trainer buttons (test mode): change the simulated resistance up/down.
+        val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        downBtn = Button(this).apply { text = "Resistencia ▼"; setOnClickListener { service?.buttonDown() } }
+        upBtn = Button(this).apply { text = "Resistencia ▲"; setOnClickListener { service?.buttonUp() } }
+        btnRow.addView(downBtn); btnRow.addView(upBtn); root.addView(btnRow)
 
         root.addView(TextView(this).apply { text = "Ajuste de escala (%, entero)" })
         scaleField = EditText(this).apply { inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED; setText(config.scaleAdjustPercent.toString()) }
@@ -89,6 +101,10 @@ class MonitorActivity : Activity() {
         startBtn.text = if (running) "Stop" else "Start"
         status.text = s?.status ?: "parado"
         power.text = s?.let { if (it.lastCorrectedW != null) "${it.lastRawW} → ${it.lastCorrectedW} W" else "—" } ?: "—"
+        resist.text = "Resistencia: " + (s?.resistance?.let { "$it%" } ?: "—")
+        control.text = "App → trainer: " + (s?.lastControl ?: "—")
+        val simRunning = running && s?.isSimulating == true
+        upBtn.isEnabled = simRunning; downBtn.isEnabled = simRunning
     }
 
     private fun ensurePermissions() {

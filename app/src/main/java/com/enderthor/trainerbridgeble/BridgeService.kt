@@ -27,6 +27,7 @@ class BridgeService : Service() {
     private val binder = LocalBinder()
 
     private var client: TrainerSource? = null
+    private var simSource: SimSource? = null
     private var mirror: MirrorServer? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -34,8 +35,15 @@ class BridgeService : Service() {
     @Volatile var zycleConnected: Boolean = false; private set
     @Volatile var lastRawW: Int? = null; private set
     @Volatile var lastCorrectedW: Int? = null; private set
+    @Volatile var lastControl: String? = null; private set
     @Volatile var listener: (() -> Unit)? = null
     val isRunning: Boolean get() = mirror != null
+    val isSimulating: Boolean get() = simSource != null
+    val resistance: Int? get() = simSource?.resistance
+
+    /** Emulate the trainer's resistance buttons (test mode only). */
+    fun buttonUp() { simSource?.buttonUp(); listener?.invoke() }
+    fun buttonDown() { simSource?.buttonDown(); listener?.invoke() }
 
     override fun onBind(intent: Intent?): IBinder = binder
     override fun onUnbind(intent: Intent?): Boolean { listener = null; return super.onUnbind(intent) }
@@ -60,17 +68,31 @@ class BridgeService : Service() {
         val m = MirrorServer(
             context = this,
             correction = { config.correction() },
-            toZycle = { uuid, bytes, withResponse -> client?.write(uuid, bytes, withResponse) },
+            toZycle = { uuid, bytes, withResponse ->
+                if (com.enderthor.trainerbridgeble.ble.GattUuids.carriesControl(uuid)) { lastControl = describeControl(bytes); listener?.invoke() }
+                client?.write(uuid, bytes, withResponse)
+            },
             onStatus = { s -> status = s; listener?.invoke() },
         )
         val onProfile: (com.enderthor.trainerbridgeble.ble.GattProfile) -> Unit = { profile -> m.build(profile) }
         val onValue: (java.util.UUID, ByteArray) -> Unit = { uuid, value -> m.onZycleValue(uuid, value); cachePowerForUi(config, uuid, value) }
         val onState: (Boolean) -> Unit = { connected -> zycleConnected = connected; status = if (connected) "trainer conectado" else "buscando trainer…"; listener?.invoke() }
-        val c: TrainerSource = if (config.simulate) SimSource(onProfile, onValue, onState)
+        val c: TrainerSource = if (config.simulate) SimSource(onProfile, onValue, onState).also { simSource = it }
         else ZycleClient(this, config.namePrefix, onProfile, onValue, onState)
         m.start()
         c.start()
         mirror = m; client = c
+    }
+
+    /** Human-readable summary of a control write the app sent (shown in the UI: "app → trainer"). */
+    private fun describeControl(b: ByteArray): String = when {
+        b.isEmpty() -> "?"
+        (b[0].toInt() and 0xFF) == 0x05 && b.size >= 3 -> "ERG ${(b[1].toInt() and 0xFF) or ((b[2].toInt() and 0xFF) shl 8)} W"
+        (b[0].toInt() and 0xFF) == 0x04 && b.size >= 2 -> "Resistencia ${b[1].toInt() and 0xFF}"
+        (b[0].toInt() and 0xFF) == 0x01 -> "Reset"
+        (b[0].toInt() and 0xFF) == 0x07 -> "Start"
+        (b[0].toInt() and 0xFF) == 0x08 -> "Stop"
+        else -> "op 0x%02X".format(b[0].toInt() and 0xFF)
     }
 
     private fun cachePowerForUi(config: Config, uuid: java.util.UUID, value: ByteArray) {
@@ -82,9 +104,9 @@ class BridgeService : Service() {
 
     private fun stopPipeline() {
         if (mirror != null) FileLog.event("bridge stop")
-        client?.stop(); client = null
+        client?.stop(); client = null; simSource = null
         mirror?.stop(); mirror = null
-        zycleConnected = false; lastRawW = null; lastCorrectedW = null; status = "parado"
+        zycleConnected = false; lastRawW = null; lastCorrectedW = null; lastControl = null; status = "parado"
         releaseWakeLock()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
     }

@@ -25,6 +25,23 @@ class SimSource(
     private var target = 170.0
     private var holdTicks = 0
     @Volatile private var ergTarget: Int? = null   // set by a Set Target Power write
+    @Volatile var resistance = 20                   // 0..100 %, changed by the emulated buttons or app control
+        private set
+
+    /** Emulate the trainer's resistance buttons (test mode). Changes the level and notifies the apps. */
+    fun buttonUp() = changeResistance(+5)
+    fun buttonDown() = changeResistance(-5)
+    private fun changeResistance(delta: Int) {
+        resistance = (resistance + delta).coerceIn(0, 100)
+        FileLog.event("SIM button → resistance=$resistance%")
+        emitResistance()
+    }
+
+    /** Report the resistance level to the apps: FTMS Machine Status "Target Resistance Level Changed" (0x07). */
+    private fun emitResistance() {
+        val level = resistance   // sim: level == % (0..100)
+        onValue(STATUS, byteArrayOf(0x07, (level and 0xFF).toByte(), ((level shr 8) and 0xFF).toByte()))
+    }
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -40,7 +57,7 @@ class SimSource(
             val power = (current + (rng.nextInt(11) - 5)).roundToInt().coerceAtLeast(0)
             val cadence = 87 + (rng.nextInt(7) - 3)
             val speedKmh = 18.0 + power * 0.055
-            onValue(IBD, indoorBikeData(power, cadence, speedKmh))
+            onValue(IBD, indoorBikeData(power, cadence, speedKmh, resistance))
             onValue(CPM, cyclingPower(power))
             handler.postDelayed(this, 250)
         }
@@ -56,6 +73,7 @@ class SimSource(
         onValue(RES_RANGE, byteArrayOf(0, 0, 0xC8.toByte(), 0, 1, 0))            // 0..200
         onValue(CP_FEATURE, byteArrayOf(0, 0, 0, 0))
         onValue(SENSOR_LOC, byteArrayOf(0))
+        emitResistance()
         handler.post(ticker)
     }
 
@@ -63,15 +81,19 @@ class SimSource(
 
     override fun write(charUuid: UUID, bytes: ByteArray, withResponse: Boolean) {
         FileLog.event("SIM write ${bytes.joinToString("") { "%02X".format(it) }}")
-        if (charUuid == CONTROL && bytes.size >= 3 && (bytes[0].toInt() and 0xFF) == 0x05)   // Set Target Power
-            ergTarget = (bytes[1].toInt() and 0xFF) or ((bytes[2].toInt() and 0xFF) shl 8)
-        if (charUuid == CONTROL && bytes.isNotEmpty() && (bytes[0].toInt() and 0xFF) == 0x01) ergTarget = null // Reset
+        if (charUuid != CONTROL || bytes.isEmpty()) return
+        when (bytes[0].toInt() and 0xFF) {
+            0x05 -> if (bytes.size >= 3) ergTarget = (bytes[1].toInt() and 0xFF) or ((bytes[2].toInt() and 0xFF) shl 8)  // Set Target Power
+            0x04 -> if (bytes.size >= 2) { resistance = (bytes[1].toInt() and 0xFF).coerceIn(0, 100); emitResistance() }   // Set Target Resistance (app → down)
+            0x01 -> ergTarget = null   // Reset
+        }
     }
 
-    private fun indoorBikeData(power: Int, cadence: Int, speedKmh: Double): ByteArray {
+    private fun indoorBikeData(power: Int, cadence: Int, speedKmh: Double, resistance: Int): ByteArray {
         val speed = (speedKmh * 100).roundToInt().coerceIn(0, 0xFFFF)   // 0.01 km/h
         val cad = (cadence * 2).coerceIn(0, 0xFFFF)                     // 0.5 rpm
-        return byteArrayOf(0x44, 0x00, lo(speed), hi(speed), lo(cad), hi(cad), lo(power), hi(power))
+        // flags 0x0064: inst speed (bit0=0) + inst cadence (bit2) + resistance level (bit5) + inst power (bit6)
+        return byteArrayOf(0x64, 0x00, lo(speed), hi(speed), lo(cad), hi(cad), lo(resistance), hi(resistance), lo(power), hi(power))
     }
 
     private fun cyclingPower(power: Int): ByteArray = byteArrayOf(0x20, 0x00, lo(power), hi(power))
@@ -84,6 +106,7 @@ class SimSource(
             CharSpec(FEATURE, R, 0),
             CharSpec(IBD, N, 0, listOf(CCCD)),
             CharSpec(CONTROL, W or IND, 0, listOf(CCCD)),
+            CharSpec(STATUS, N, 0, listOf(CCCD)),
             CharSpec(POWER_RANGE, R, 0),
             CharSpec(RES_RANGE, R, 0),
         )),
@@ -98,6 +121,7 @@ class SimSource(
         val IBD = GattUuids.uuid16(0x2AD2)
         val CPM = GattUuids.uuid16(0x2A63)
         val CONTROL = GattUuids.uuid16(0x2AD9)
+        val STATUS = GattUuids.uuid16(0x2ADA)
         val FEATURE = GattUuids.uuid16(0x2ACC)
         val POWER_RANGE = GattUuids.uuid16(0x2AD8)
         val RES_RANGE = GattUuids.uuid16(0x2AD6)
