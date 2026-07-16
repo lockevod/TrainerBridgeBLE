@@ -17,10 +17,25 @@ class Config(context: Context) {
         get() = p.getInt(KEY_OFFSET, 0)
         set(v) = p.edit().putInt(KEY_OFFSET, v).apply()
 
-    /** Name prefix used to find the trainer over BLE (the Zycle advertises "Zycle..."). */
+    /** Name prefix used to find the trainer over BLE when no specific device is paired. */
     var namePrefix: String
         get() = p.getString(KEY_PREFIX, "Zycle") ?: "Zycle"
         set(v) = p.edit().putString(KEY_PREFIX, v).apply()
+
+    /** The paired trainer's BLE address (empty = fall back to scanning by [namePrefix]). */
+    var pairedAddress: String
+        get() = p.getString(KEY_ADDR, "") ?: ""
+        set(v) = p.edit().putString(KEY_ADDR, v).apply()
+
+    var pairedName: String
+        get() = p.getString(KEY_NAME, "") ?: ""
+        set(v) = p.edit().putString(KEY_NAME, v).apply()
+
+    /** The name WE advertise to the apps. Default exactly matches the Zycle so an app that keys capabilities
+     *  off the name recognises us (safe: the real Zycle isn't advertising while we're connected to it). */
+    var advertisedName: String
+        get() = p.getString(KEY_ADVNAME, "ZycleBike2") ?: "ZycleBike2"
+        set(v) = p.edit().putString(KEY_ADVNAME, v).apply()
 
     /** Write the diagnostic CSV log. */
     var loggingEnabled: Boolean
@@ -42,6 +57,9 @@ class Config(context: Context) {
         const val KEY_SCALE = "scaleAdjustPct"
         const val KEY_OFFSET = "offsetW"
         const val KEY_PREFIX = "namePrefix"
+        const val KEY_ADDR = "pairedAddress"
+        const val KEY_NAME = "pairedName"
+        const val KEY_ADVNAME = "advertisedName"
         const val KEY_LOG = "loggingEnabled"
         const val KEY_SIM = "simulate"
     }

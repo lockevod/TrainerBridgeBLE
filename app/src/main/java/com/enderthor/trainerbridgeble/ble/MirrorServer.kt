@@ -35,6 +35,7 @@ import java.util.concurrent.ConcurrentHashMap
 @SuppressLint("MissingPermission")
 class MirrorServer(
     private val context: Context,
+    private val advertisedName: String,
     private val correction: () -> PowerCorrection,
     private val toZycle: (charUuid: UUID, bytes: ByteArray, withResponse: Boolean) -> Unit,
     private val onStatus: (String) -> Unit = {},
@@ -68,10 +69,10 @@ class MirrorServer(
     private fun renameAdapter() {
         val prefs = context.getSharedPreferences("trainerbridgeble", Context.MODE_PRIVATE)
         val current = runCatching { adapter.name }.getOrNull()
-        if (prefs.getString(KEY_ORIG_NAME, null) == null && current != null && current != ADVERTISED_NAME)
+        if (prefs.getString(KEY_ORIG_NAME, null) == null && current != null && current != advertisedName)
             prefs.edit().putString(KEY_ORIG_NAME, current).apply()
         originalName = prefs.getString(KEY_ORIG_NAME, null)
-        runCatching { if (current != ADVERTISED_NAME) adapter.name = ADVERTISED_NAME }
+        runCatching { if (current != advertisedName) adapter.name = advertisedName }
     }
 
     private fun restoreName() {
@@ -228,7 +229,7 @@ class MirrorServer(
 
     // ── advertising ──────────────────────────────────────────────────────────────────────────────────
     private val advCallback = object : android.bluetooth.le.AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { advertising = true; onStatus("anunciando $ADVERTISED_NAME"); FileLog.event("advertising as $ADVERTISED_NAME") }
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { advertising = true; onStatus("anunciando $advertisedName"); FileLog.event("advertising as $advertisedName") }
         override fun onStartFailure(errorCode: Int) { advertising = false; onStatus("fallo al anunciar ($errorCode)"); FileLog.event("advertise failed $errorCode") }
     }
 
@@ -268,7 +269,6 @@ class MirrorServer(
     }
 
     private companion object {
-        const val ADVERTISED_NAME = "ZycleBike2 TB"
         const val KEY_ORIG_NAME = "origBtName"
     }
 }

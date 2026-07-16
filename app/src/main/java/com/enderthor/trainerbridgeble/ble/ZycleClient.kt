@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class ZycleClient(
     private val context: Context,
     private val namePrefix: String,
+    private val pairedAddress: String,      // exact device to connect to; empty → match by namePrefix
     private val onProfile: (GattProfile) -> Unit,
     private val onValue: (charUuid: UUID, value: ByteArray) -> Unit,   // notifications AND initial reads
     private val onState: (connected: Boolean) -> Unit,
@@ -83,7 +84,9 @@ class ZycleClient(
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
             val dev = result?.device ?: return
             val name = result.scanRecord?.deviceName ?: dev.name
-            if (name != null && name.startsWith(namePrefix, ignoreCase = true)) {
+            val match = if (pairedAddress.isNotEmpty()) dev.address == pairedAddress
+            else name != null && name.startsWith(namePrefix, ignoreCase = true)
+            if (match) {
                 FileLog.event("Zycle found '$name' ${dev.address} rssi=${result.rssi}"); stopScan(); connect(dev)
             }
         }

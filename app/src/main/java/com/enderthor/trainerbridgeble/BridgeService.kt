@@ -35,6 +35,8 @@ class BridgeService : Service() {
     @Volatile var zycleConnected: Boolean = false; private set
     @Volatile var lastRawW: Int? = null; private set
     @Volatile var lastCorrectedW: Int? = null; private set
+    @Volatile var lastSpeedKmh: Double? = null; private set
+    @Volatile var lastCadence: Int? = null; private set
     @Volatile var lastControl: String? = null; private set
     @Volatile var listener: (() -> Unit)? = null
     val isRunning: Boolean get() = mirror != null
@@ -67,6 +69,7 @@ class BridgeService : Service() {
 
         val m = MirrorServer(
             context = this,
+            advertisedName = config.advertisedName,
             correction = { config.correction() },
             toZycle = { uuid, bytes, withResponse ->
                 if (com.enderthor.trainerbridgeble.ble.GattUuids.carriesControl(uuid)) { lastControl = describeControl(bytes); listener?.invoke() }
@@ -75,10 +78,10 @@ class BridgeService : Service() {
             onStatus = { s -> status = s; listener?.invoke() },
         )
         val onProfile: (com.enderthor.trainerbridgeble.ble.GattProfile) -> Unit = { profile -> m.build(profile) }
-        val onValue: (java.util.UUID, ByteArray) -> Unit = { uuid, value -> m.onZycleValue(uuid, value); cachePowerForUi(config, uuid, value) }
+        val onValue: (java.util.UUID, ByteArray) -> Unit = { uuid, value -> m.onZycleValue(uuid, value); cacheForUi(config, uuid, value) }
         val onState: (Boolean) -> Unit = { connected -> zycleConnected = connected; status = if (connected) "trainer conectado" else "buscando trainer…"; listener?.invoke() }
         val c: TrainerSource = if (config.simulate) SimSource(onProfile, onValue, onState).also { simSource = it }
-        else ZycleClient(this, config.namePrefix, onProfile, onValue, onState)
+        else ZycleClient(this, config.namePrefix, config.pairedAddress, onProfile, onValue, onState)
         m.start()
         c.start()
         mirror = m; client = c
@@ -95,20 +98,42 @@ class BridgeService : Service() {
         else -> "op 0x%02X".format(b[0].toInt() and 0xFF)
     }
 
-    private fun cachePowerForUi(config: Config, uuid: java.util.UUID, value: ByteArray) {
-        if (uuid != com.enderthor.trainerbridgeble.ble.GattUuids.CYCLING_POWER_MEASUREMENT) return
-        if (value.size < 4) return
-        val raw = ((value[2].toInt() and 0xFF) or ((value[3].toInt() and 0xFF) shl 8)).toShort().toInt()
-        lastRawW = raw; lastCorrectedW = config.correction().correct(raw); listener?.invoke()
+    /** Update the monitor tiles from the trainer's data. Indoor Bike Data (0x2AD2) carries speed + cadence
+     *  + power; Cycling Power (0x2A63) is a power-only fallback. Power is the RAW value (we show raw →
+     *  corrected); speed/cadence pass through. */
+    private fun cacheForUi(config: Config, uuid: java.util.UUID, value: ByteArray) {
+        when (uuid) {
+            com.enderthor.trainerbridgeble.ble.GattUuids.INDOOR_BIKE_DATA -> {
+                if (value.size < 2) return
+                val flags = le16(value, 0); var off = 2
+                if (flags and (1 shl 0) == 0) { if (off + 2 <= value.size) lastSpeedKmh = le16(value, off) * 0.01; off += 2 }
+                if (flags and (1 shl 1) != 0) off += 2
+                if (flags and (1 shl 2) != 0) { if (off + 2 <= value.size) lastCadence = le16(value, off) / 2; off += 2 }
+                if (flags and (1 shl 3) != 0) off += 2
+                if (flags and (1 shl 4) != 0) off += 3
+                if (flags and (1 shl 5) != 0) off += 2
+                if (flags and (1 shl 6) != 0 && off + 2 <= value.size) { val raw = le16signed(value, off); lastRawW = raw; lastCorrectedW = config.correction().correct(raw) }
+                listener?.invoke()
+            }
+            com.enderthor.trainerbridgeble.ble.GattUuids.CYCLING_POWER_MEASUREMENT -> {
+                if (lastRawW == null && value.size >= 4) {   // fallback only if no Indoor Bike Data
+                    val raw = le16signed(value, 2); lastRawW = raw; lastCorrectedW = config.correction().correct(raw); listener?.invoke()
+                }
+            }
+        }
     }
+
+    private fun le16(b: ByteArray, i: Int) = (b[i].toInt() and 0xFF) or ((b[i + 1].toInt() and 0xFF) shl 8)
+    private fun le16signed(b: ByteArray, i: Int) = le16(b, i).toShort().toInt()
 
     private fun stopPipeline() {
         if (mirror != null) FileLog.event("bridge stop")
         client?.stop(); client = null; simSource = null
         mirror?.stop(); mirror = null
-        zycleConnected = false; lastRawW = null; lastCorrectedW = null; lastControl = null; status = "parado"
+        zycleConnected = false; lastRawW = null; lastCorrectedW = null; lastSpeedKmh = null; lastCadence = null; lastControl = null; status = "parado"
         releaseWakeLock()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        listener?.invoke()   // let a bound UI re-render (Stop → Start) after the async stop
     }
 
     override fun onDestroy() { stopPipeline(); super.onDestroy() }
