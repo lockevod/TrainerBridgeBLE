@@ -15,6 +15,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import com.enderthor.trainerbridgeble.FileLog
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
@@ -63,6 +64,7 @@ class ZycleClient(
 
     /** Forward a write to the trainer's characteristic [charUuid] (control relay). Queued. */
     fun write(charUuid: UUID, bytes: ByteArray, withResponse: Boolean) {
+        FileLog.event("Zycle write $charUuid = ${FileLog.hex(bytes)}")
         val g = gatt ?: return
         val ch = g.services.firstNotNullOfOrNull { s -> s.getCharacteristic(charUuid) } ?: return
         enqueue {
@@ -108,9 +110,11 @@ class ZycleClient(
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                FileLog.event("Zycle connected status=$status")
                 onState(true)
                 handler.post { runCatching { g.discoverServices() } }
             } else {
+                FileLog.event("Zycle disconnected status=$status")
                 onState(false)
                 opQueue.clear(); opBusy.set(false)
                 runCatching { g.close() }
@@ -121,7 +125,11 @@ class ZycleClient(
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) { Log.w(tag, "discover failed $status"); return }
-            onProfile(buildProfile(g))
+            val profile = buildProfile(g)
+            FileLog.event("Zycle profile: " + profile.services.joinToString("; ") { s ->
+                "${s.uuid}[" + s.chars.joinToString(",") { "${shortUuid(it.uuid)}(p=${it.properties})" } + "]"
+            })
+            onProfile(profile)
             // Subscribe to every notify/indicate char, and read every readable char once — all serialised.
             for (svc in g.services) {
                 if (GattUuids.isStackService(svc.uuid)) continue
@@ -147,8 +155,24 @@ class ZycleClient(
 
         @Deprecated("Deprecated in Java")
         override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
-            @Suppress("DEPRECATION") onValue(ch.uuid, ch.value?.copyOf() ?: ByteArray(0))
+            val value = @Suppress("DEPRECATION") (ch.value?.copyOf() ?: ByteArray(0))
+            // Log non-power notifications (buttons, status, control responses) rate-limited; power is 4 Hz.
+            if (!GattUuids.isPowerChar(ch.uuid)) logNotif(ch.uuid, value)
+            onValue(ch.uuid, value)
         }
+    }
+
+    private val notifLogMs = java.util.concurrent.ConcurrentHashMap<UUID, Long>()
+    private fun logNotif(uuid: UUID, value: ByteArray) {
+        val now = System.currentTimeMillis()
+        if (now - (notifLogMs[uuid] ?: 0L) < 500L) return
+        notifLogMs[uuid] = now
+        FileLog.event("Zycle notif ${shortUuid(uuid)} = ${FileLog.hex(value)}")
+    }
+
+    private fun shortUuid(u: UUID): String {
+        val s = u.toString()
+        return if (s.startsWith("0000") && s.endsWith("-0000-1000-8000-00805f9b34fb")) "0x" + s.substring(4, 8).uppercase() else s
     }
 
     private fun buildProfile(g: BluetoothGatt): GattProfile = GattProfile(

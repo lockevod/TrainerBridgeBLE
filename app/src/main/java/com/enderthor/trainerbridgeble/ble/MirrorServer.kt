@@ -17,6 +17,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
+import com.enderthor.trainerbridgeble.FileLog
 import com.enderthor.trainerbridgeble.correction.PowerCorrection
 import java.util.ArrayDeque
 import java.util.UUID
@@ -157,13 +158,16 @@ class MirrorServer(
             device ?: return
             if (newState == android.bluetooth.BluetoothProfile.STATE_CONNECTED) {
                 clients[device.address] = device; onStatus("app conectada (${clients.size})")
+                FileLog.event("app connected ${device.address}")
             } else {
                 clients.remove(device.address); subscribers.values.forEach { it.remove(device.address) }
                 onStatus("app desconectada (${clients.size})")
+                FileLog.event("app disconnected ${device.address}")
             }
         }
 
         override fun onCharacteristicReadRequest(device: BluetoothDevice?, requestId: Int, offset: Int, ch: BluetoothGattCharacteristic?) {
+            if (offset == 0) FileLog.event("app read ${shortUuid(ch?.uuid)}")   // e.g. does it read our identity/feature?
             val full = ch?.let { cache[it.uuid] } ?: ByteArray(0)
             val value = if (offset in 0..full.size) full.copyOfRange(offset, full.size) else ByteArray(0)
             runCatching { server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value) }
@@ -175,6 +179,7 @@ class MirrorServer(
             if (uuid != null && value != null) {
                 val out = if (GattUuids.carriesControl(uuid)) PowerRewrite.inverseTargetPower(value, correction()) else value
                 val withResponse = ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0
+                FileLog.event("app write ${shortUuid(uuid)} = ${FileLog.hex(value)}" + if (!out.contentEquals(value)) " -> ${FileLog.hex(out)}" else "")
                 toZycle(uuid, out, withResponse)   // relay to the trainer
             }
             if (responseNeeded) runCatching { server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value) }
@@ -188,6 +193,7 @@ class MirrorServer(
                 if (cUuid != null) {
                     val set = subscribers.getOrPut(cUuid) { java.util.Collections.synchronizedSet(HashSet()) }
                     if (enabled) set.add(device.address) else set.remove(device.address)
+                    FileLog.event("app subscribe ${shortUuid(cUuid)} enabled=$enabled")
                 }
             }
             if (responseNeeded) runCatching { server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value) }
@@ -226,6 +232,11 @@ class MirrorServer(
         if (!advertising) return
         advertising = false
         runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(advCallback) }
+    }
+
+    private fun shortUuid(u: UUID?): String {
+        val s = u?.toString() ?: return "?"
+        return if (s.startsWith("0000") && s.endsWith("-0000-1000-8000-00805f9b34fb")) "0x" + s.substring(4, 8).uppercase() else s
     }
 
     private companion object {

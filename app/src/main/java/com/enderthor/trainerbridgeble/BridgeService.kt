@@ -52,6 +52,8 @@ class BridgeService : Service() {
         createChannel()
         ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         acquireWakeLock()
+        FileLog.init(this); FileLog.enabled = true
+        FileLog.event("bridge start scaleAdj=${config.scaleAdjustPercent}% offset=${config.offsetW}W prefix=${config.namePrefix}")
 
         val m = MirrorServer(
             context = this,
@@ -82,6 +84,7 @@ class BridgeService : Service() {
     }
 
     private fun stopPipeline() {
+        if (mirror != null) FileLog.event("bridge stop")
         client?.stop(); client = null
         mirror?.stop(); mirror = null
         zycleConnected = false; lastRawW = null; lastCorrectedW = null; status = "parado"
