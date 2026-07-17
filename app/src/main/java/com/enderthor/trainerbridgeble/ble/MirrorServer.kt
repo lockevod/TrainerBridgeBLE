@@ -178,6 +178,9 @@ class MirrorServer(
             if (newState == android.bluetooth.BluetoothProfile.STATE_CONNECTED) {
                 clients[device.address] = device; onStatus("app conectada (${clients.size})")
                 FileLog.event("app connected ${device.address}")
+                // Android stops connectable advertising once a central connects — restart it so a SECOND
+                // central (e.g. the Garmin) can still discover us.
+                handler.post { restartAdvertising() }
             } else {
                 clients.remove(device.address); subscribers.values.forEach { it.remove(device.address) }
                 onStatus("app desconectada (${clients.size})")
@@ -252,6 +255,14 @@ class MirrorServer(
         if (!advertising) return
         advertising = false
         runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(advCallback) }
+    }
+
+    /** Force a fresh advertise (Android silently stopped it when a central connected, but our flag didn't
+     *  know). Needed so more than one app can find us. */
+    private fun restartAdvertising() {
+        runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(advCallback) }
+        advertising = false
+        startAdvertising()
     }
 
     private val relayLogMs = ConcurrentHashMap<UUID, Long>()
