@@ -46,9 +46,14 @@ class MonitorActivity : Activity() {
         super.onCreate(savedInstanceState)
         config = Config(this)
         val body = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; setBackgroundColor(Palette.PAGE_BG); setPadding(dp(16), dp(20), dp(16), dp(20))
+            orientation = LinearLayout.VERTICAL; setBackgroundColor(Palette.PAGE_BG); setPadding(dp(16), dp(6), dp(16), dp(16))
         }
-        body.addView(title("TrainerBridge BLE"))
+        // Start/Stop at the very top (no in-content title — the system title bar already shows the app
+        // name; a second one just wastes vertical space on the small Karoo screen).
+        startBtn = accentButton("Start") { onStartStop() }.apply {
+            (layoutParams as LinearLayout.LayoutParams).setMargins(0, 0, 0, dp(16))   // up top, gap before the Estado card
+        }
+        body.addView(startBtn)
 
         val mon = card("Estado")
         banner = TextView(this).apply {
@@ -75,7 +80,6 @@ class MonitorActivity : Activity() {
         downBtn = tileButton("Resistencia ▼") { service?.buttonDown() }
         upBtn = tileButton("Resistencia ▲") { service?.buttonUp() }
         btnRow.addView(downBtn); btnRow.addView(upBtn); mon.addView(btnRow)
-        startBtn = accentButton("Start") { onStartStop() }; mon.addView(startBtn)
         body.addView(mon)
 
         body.addView(plainButton("Configuración") { startActivity(Intent(this, ConfigActivity::class.java)) })
