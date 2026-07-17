@@ -242,18 +242,16 @@ class MirrorServer(
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
             .setConnectable(true).setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM).build()
-        // MAIN packet (what a passive scanner like the Garmin reads): name + Cycling Speed & Cadence (0x1816)
-        // + Cycling Power (0x1818). Garmin watches won't detect a power-only (CPS) sensor — they require CSC
-        // (0x1816) advertised too. FTMS (0x1826) goes in the scan response for Bestcycling.
+        // Advertise ALL three standard cycling services in the MAIN packet (they fit in 31 bytes with the
+        // name), so both a passive scanner (Garmin, reading only the main packet) and Bestcycling see us:
+        // CSC (0x1816) + Cycling Power (0x1818) — Garmin watches need CSC, not CPS-only — and FTMS (0x1826).
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(true)
-            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1816)))   // Cycling Speed & Cadence — Garmin needs this
-            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1818)))   // Cycling Power
+            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1816)))
+            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1818)))
+            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1826)))
             .build()
-        val scanResp = AdvertiseData.Builder()
-            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1826)))   // FTMS — Bestcycling
-            .build()
-        runCatching { advertiser.startAdvertising(settings, data, scanResp, advCallback) }
+        runCatching { advertiser.startAdvertising(settings, data, advCallback) }
     }
 
     private fun stopAdvertising() {
