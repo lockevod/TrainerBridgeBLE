@@ -27,6 +27,7 @@ class ConfigActivity : Activity() {
     private lateinit var foundList: LinearLayout
     private lateinit var logCheck: android.widget.CheckBox
     private lateinit var simCheck: android.widget.CheckBox
+    private lateinit var antCheck: android.widget.CheckBox
 
     private val adapter by lazy { (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter }
     private var scanning = false
@@ -62,13 +63,17 @@ class ConfigActivity : Activity() {
         // Advertised identity
         val idc = card("Identidad anunciada")
         idc.addView(bodyText("Nombre con el que nos ven las apps (por defecto igual que el Zycle para que reconozca sus capacidades).", 12f))
-        nameField = textField(config.advertisedName); idc.addView(nameField)
+        nameField = textField(config.advertisedName).apply {
+            filters = arrayOf(android.text.InputFilter.LengthFilter(14))   // >14 chars overflows the 31-byte advert with the cloned UUIDs+mfr data
+        }
+        idc.addView(nameField)
         body.addView(idc)
 
         // Toggles
         val opt = card("Opciones")
         logCheck = check("Guardar log (CSV)", config.loggingEnabled); opt.addView(logCheck)
         simCheck = check("Modo simulación (sin bici)", config.simulate); opt.addView(simCheck)
+        antCheck = check("Salida ANT+ al Garmin (necesita dongle)", config.antOutputEnabled); opt.addView(antCheck)
         body.addView(opt)
 
         body.addView(accentButton("Guardar y volver") { save(); finish() })
@@ -87,6 +92,7 @@ class ConfigActivity : Activity() {
         nameField.text.toString().trim().takeIf { it.isNotEmpty() }?.let { config.advertisedName = it }
         config.loggingEnabled = logCheck.isChecked
         config.simulate = simCheck.isChecked
+        config.antOutputEnabled = antCheck.isChecked
     }
 
     // ── BLE scan ──

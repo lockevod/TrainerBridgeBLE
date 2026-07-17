@@ -20,6 +20,7 @@ import android.widget.TextView
  *  resistance buttons (test mode), and a link to Configuración. */
 class MonitorActivity : Activity() {
     private lateinit var config: Config
+    private lateinit var banner: TextView
     private lateinit var statusLine: TextView
     private lateinit var controlLine: TextView
     private lateinit var powerTile: TextView
@@ -50,6 +51,14 @@ class MonitorActivity : Activity() {
         body.addView(title("TrainerBridge BLE"))
 
         val mon = card("Estado")
+        banner = TextView(this).apply {
+            text = "Detenido"; setTextColor(0xFFFFFFFF.toInt()); typeface = android.graphics.Typeface.DEFAULT_BOLD
+            gravity = android.view.Gravity.CENTER; background = rounded(Palette.MUTED); setPadding(dp(12), dp(12), dp(12), dp(12))
+            maxLines = 1   // never wrap — autosize shrinks a long alert to fit one line, so it stays aligned
+            setAutoSizeTextTypeUniformWithConfiguration(12, 18, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
+            val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, WRAP_CONTENT); lp.setMargins(0, 0, 0, dp(8)); layoutParams = lp
+        }
+        mon.addView(banner)
         statusLine = bodyText("parado", 14f); mon.addView(statusLine)
         val row1 = tileRow(); mon.addView(row1)
         powerTile = tile(row1, "Potencia (W)", Palette.TEXT)
@@ -73,13 +82,31 @@ class MonitorActivity : Activity() {
 
         setContentView(ScrollView(this).apply { setBackgroundColor(Palette.PAGE_BG); addView(body) })
         ensurePermissions()
+        requestBatteryExemption()
     }
+
+    /** Doze kills the pipeline a few minutes after the screen turns off unless we're whitelisted. Ask once. */
+    private fun requestBatteryExemption() {
+        val pm = getSystemService(POWER_SERVICE) as android.os.PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        val prefs = getSharedPreferences("trainerbridgeble", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("batteryAsked", false)) return   // ask once, not on every recreate/rotation
+        prefs.edit().putBoolean("batteryAsked", true).apply()
+        runCatching {
+            startActivity(Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                android.net.Uri.parse("package:$packageName")))
+        }
+    }
+
+    private val poller = android.os.Handler(android.os.Looper.getMainLooper())
+    private val pollTick = object : Runnable { override fun run() { render(); poller.postDelayed(this, 1000) } }
 
     override fun onStart() {
         super.onStart()
         bindService(Intent(this, BridgeService::class.java), conn, Context.BIND_AUTO_CREATE)
+        poller.post(pollTick)   // 1 Hz refresh so tiles go stale ("—") even when the trainer stops notifying
     }
-    override fun onStop() { super.onStop(); service?.listener = null; runCatching { unbindService(conn) } }
+    override fun onStop() { super.onStop(); poller.removeCallbacks(pollTick); service?.listener = null; runCatching { unbindService(conn) } }
 
     private fun onStartStop() {
         if (service?.isRunning == true) BridgeService.stop(this) else BridgeService.start(this)
@@ -90,17 +117,30 @@ class MonitorActivity : Activity() {
         val s = service
         val running = s?.isRunning == true
         startBtn.text = if (running) "Stop" else "Start"
+        // Fresh = a sample arrived within the last 3s. A brief (<3s) blip keeps showing the last value
+        // (the mirror is re-emitting it too); a longer gap blanks the tiles to "—".
+        val fresh = s != null && s.lastSampleMs != 0L && System.currentTimeMillis() - s.lastSampleMs <= STALE_MS
+        val alert = s?.alert
+        val (bText, bColor) = when {
+            !running -> "Detenido" to Palette.MUTED
+            alert != null -> "⚠ $alert" to Palette.DANGER
+            s?.zycleConnected != true -> "Buscando bici…" to Palette.ACCENT
+            !fresh -> "Sin datos…" to Palette.DANGER
+            else -> "Conectado" to Palette.OK
+        }
+        banner.text = bText + (if (config.antOutputEnabled) "   ·   ANT+ Garmin" else "") + (if (s?.isSimulating == true) "   ·   SIM" else "")
+        banner.background = rounded(bColor)
         statusLine.text = s?.status ?: "parado"
         statusLine.setTextColor(if (s?.zycleConnected == true) Palette.OK else Palette.MUTED)
-        powerTile.text = s?.lastRawW?.toString() ?: "—"
-        correctedTile.text = s?.lastCorrectedW?.toString() ?: "—"
-        speedTile.text = s?.lastSpeedKmh?.let { String.format("%.1f", it) } ?: "—"
-        cadenceTile.text = s?.lastCadence?.toString() ?: "—"
-        resistTile.text = s?.resistance?.toString() ?: "—"
+        val show = running && fresh
+        powerTile.text = if (show) s?.lastRawW?.toString() ?: "—" else "—"
+        correctedTile.text = if (show) s?.lastCorrectedW?.toString() ?: "—" else "—"
+        speedTile.text = if (show) s?.lastSpeedKmh?.let { String.format("%.1f", it) } ?: "—" else "—"
+        cadenceTile.text = if (show) s?.lastCadence?.toString() ?: "—" else "—"
+        resistTile.text = if (running) s?.resistance?.toString() ?: "—" else "—"
         controlLine.text = "App → trainer: " + (s?.lastControl ?: "—")
-        val simRunning = running && s?.isSimulating == true
-        upBtn.isEnabled = simRunning; downBtn.isEnabled = simRunning
-        upBtn.alpha = if (simRunning) 1f else 0.4f; downBtn.alpha = if (simRunning) 1f else 0.4f
+        upBtn.isEnabled = running; downBtn.isEnabled = running
+        upBtn.alpha = if (running) 1f else 0.4f; downBtn.alpha = if (running) 1f else 0.4f
     }
 
     private fun tileButton(text: String, onClick: () -> Unit) = Button(this).apply {
@@ -108,6 +148,8 @@ class MonitorActivity : Activity() {
         val lp = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f); lp.setMargins(dp(3), dp(8), dp(3), 0); layoutParams = lp
         setOnClickListener { onClick() }
     }
+
+    private companion object { const val STALE_MS = 3000L }
 
     private fun ensurePermissions() {
         val needed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)

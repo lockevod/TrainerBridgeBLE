@@ -36,45 +36,89 @@ class ZycleClient(
     private val onProfile: (GattProfile) -> Unit,
     private val onValue: (charUuid: UUID, value: ByteArray) -> Unit,   // notifications AND initial reads
     private val onState: (connected: Boolean) -> Unit,
+    private val onAdv: (AdvBlueprint) -> Unit = {},   // the trainer's own advertising, for the mirror to clone
 ) : TrainerSource {
     private val tag = "TBB/ZycleClient"
     private val handler = Handler(Looper.getMainLooper())
     private val adapter by lazy { (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter }
 
     @Volatile private var gatt: BluetoothGatt? = null
+    @Volatile private var connecting = false
     @Volatile private var stopped = false
     @Volatile private var scanning = false
+    @Volatile private var lastMessageMs = 0L   // wall-clock of the last notification, for the silent-link watchdog
+    private val reconnectPending = AtomicBoolean(false)
 
     private val opQueue = ConcurrentLinkedQueue<() -> Unit>()
     private val opBusy = AtomicBoolean(false)
+
+    private class WriteReq(val uuid: UUID, val bytes: ByteArray, val withResponse: Boolean, val retriesLeft: Int, val seq: Int)
+    @Volatile private var inFlightWrite: WriteReq? = null   // the write currently on the wire, for retry on failure
+    private var writeSeq = 0                                // bumps per write; a retry is dropped if superseded
 
     private val cccd: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     override fun start() {
         stopped = false
         startScan()
+        handler.removeCallbacks(heartbeat)   // never stack a second heartbeat
+        handler.postDelayed(heartbeat, HEARTBEAT_CHECK_MS)
     }
 
     override fun stop() {
         stopped = true
+        connecting = false
         stopScan()
+        handler.removeCallbacks(heartbeat)
         opQueue.clear(); opBusy.set(false)
         gatt?.let { runCatching { it.disconnect() }; runCatching { it.close() } }
         gatt = null
     }
 
+    /** ANT-learned: a GATT link can stay "connected" while notifications silently stop (no disconnect
+     *  callback fires), so nothing else recovers it. Poll, and if the trainer has been silent past the
+     *  timeout, tear the link down and re-scan. Masters/notifications refresh [lastMessageMs] constantly,
+     *  so this only trips on a genuinely stuck link. */
+    private val heartbeat = object : Runnable {
+        override fun run() {
+            if (stopped) return
+            val g = gatt
+            if (g != null && lastMessageMs != 0L && System.currentTimeMillis() - lastMessageMs > HEARTBEAT_TIMEOUT_MS) {
+                FileLog.event("Zycle watchdog: silent ${System.currentTimeMillis() - lastMessageMs}ms -> reconnect")
+                gatt = null; lastMessageMs = 0L
+                onState(false)
+                opQueue.clear(); opBusy.set(false)
+                runCatching { g.disconnect() }; runCatching { g.close() }
+                scheduleReconnect()
+            }
+            handler.postDelayed(this, HEARTBEAT_CHECK_MS)
+        }
+    }
+
+    /** Idempotent re-scan scheduler — a self-induced teardown and the disconnect callback can both ask. */
+    private fun scheduleReconnect() {
+        if (stopped) return
+        if (reconnectPending.compareAndSet(false, true))
+            handler.postDelayed({ reconnectPending.set(false); startScan() }, RECONNECT_DELAY_MS)
+    }
+
     /** Forward a write to the trainer's characteristic [charUuid] (control relay). Queued. */
-    override fun write(charUuid: UUID, bytes: ByteArray, withResponse: Boolean) {
+    override fun write(charUuid: UUID, bytes: ByteArray, withResponse: Boolean) =
+        writeInternal(charUuid, bytes, withResponse, CONTROL_WRITE_RETRIES)
+
+    private fun writeInternal(charUuid: UUID, bytes: ByteArray, withResponse: Boolean, retriesLeft: Int) {
         FileLog.event("Zycle write $charUuid = ${FileLog.hex(bytes)}")
         val g = gatt ?: return
         val ch = g.services.firstNotNullOfOrNull { s -> s.getCharacteristic(charUuid) } ?: return
+        val seq = ++writeSeq
         enqueue {
             @Suppress("DEPRECATION")
             run {
+                inFlightWrite = WriteReq(charUuid, bytes, withResponse, retriesLeft, seq)
                 ch.writeType = if (withResponse) BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
                 else BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
                 ch.value = bytes
-                if (g.writeCharacteristic(ch) != true) opDone()   // couldn't start → free the queue
+                if (g.writeCharacteristic(ch) != true) { inFlightWrite = null; opDone() }   // couldn't start → free the queue
             }
         }
     }
@@ -87,10 +131,25 @@ class ZycleClient(
             val match = if (pairedAddress.isNotEmpty()) dev.address == pairedAddress
             else name != null && name.startsWith(namePrefix, ignoreCase = true)
             if (match) {
-                FileLog.event("Zycle found '$name' ${dev.address} rssi=${result.rssi}"); stopScan(); connect(dev)
+                if (gatt != null || connecting) return   // already connecting/connected — ignore duplicate adverts
+                connecting = true
+                FileLog.event("Zycle found '$name' ${dev.address} rssi=${result.rssi}")
+                captureAdv(result)
+                stopScan(); connect(dev)
             }
         }
         override fun onScanFailed(errorCode: Int) { Log.w(tag, "scan failed $errorCode"); if (!stopped) handler.postDelayed({ startScan() }, 2000) }
+    }
+
+    /** Snapshot the trainer's advertised service UUIDs + manufacturer data so the mirror re-advertises an
+     *  identical packet (see [AdvBlueprint]). */
+    private fun captureAdv(result: ScanResult) {
+        val rec = result.scanRecord ?: return
+        val uuids = rec.serviceUuids ?: emptyList()
+        val mfr = mutableListOf<Pair<Int, ByteArray>>()
+        rec.manufacturerSpecificData?.let { sa -> for (i in 0 until sa.size()) mfr.add(sa.keyAt(i) to sa.valueAt(i)) }
+        FileLog.event("Zycle adv: uuids=${uuids.joinToString { it.toString() }} mfr=${mfr.joinToString { "0x%04X:${FileLog.hex(it.second)}".format(it.first) }}")
+        onAdv(AdvBlueprint(uuids, mfr))
     }
 
     private fun startScan() {
@@ -115,16 +174,20 @@ class ZycleClient(
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                if (gatt !== g) { runCatching { g.close() }; return }   // orphaned handle — drop it
                 FileLog.event("Zycle connected status=$status")
+                connecting = false
+                lastMessageMs = System.currentTimeMillis()   // start the silent-link window at connect
                 onState(true)
                 handler.post { runCatching { g.discoverServices() } }
             } else {
                 FileLog.event("Zycle disconnected status=$status")
+                runCatching { g.close() }
+                if (gatt !== g) return   // a stale/superseded handle — don't touch the live connection's state
                 onState(false)
                 opQueue.clear(); opBusy.set(false)
-                runCatching { g.close() }
-                if (gatt === g) gatt = null
-                if (!stopped) handler.postDelayed({ startScan() }, 2000)   // reconnect
+                gatt = null; connecting = false; lastMessageMs = 0L
+                scheduleReconnect()
             }
         }
 
@@ -161,13 +224,21 @@ class ZycleClient(
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) FileLog.event("Zycle write ${shortUuid(ch.uuid)} status=$status")
+            val w = inFlightWrite; inFlightWrite = null
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                // Retry a failed CONTROL write (the trainer occasionally NAKs with status 133), but only if a
+                // newer control write hasn't superseded it (w.seq == writeSeq) — never re-send a stale target.
+                val retry = w != null && w.retriesLeft > 0 && GattUuids.carriesControl(w.uuid) && w.seq == writeSeq && !stopped
+                FileLog.event("Zycle write ${shortUuid(ch.uuid)} status=$status" + if (retry) " — retry ${w!!.retriesLeft}" else "")
+                if (retry) handler.postDelayed({ writeInternal(w!!.uuid, w.bytes, w.withResponse, w.retriesLeft - 1) }, CONTROL_RETRY_DELAY_MS)
+            }
             opDone()
         }
 
         @Deprecated("Deprecated in Java")
         override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
             val value = @Suppress("DEPRECATION") (ch.value?.copyOf() ?: ByteArray(0))
+            lastMessageMs = System.currentTimeMillis()   // feed the silent-link watchdog
             logNotif(ch.uuid, value)   // all notifications (power included), rate-limited per char
             onValue(ch.uuid, value)
         }
@@ -215,4 +286,12 @@ class ZycleClient(
     private fun enqueue(op: () -> Unit) { opQueue.add(op); pump() }
     private fun pump() { if (opBusy.compareAndSet(false, true)) { val op = opQueue.poll(); if (op == null) opBusy.set(false) else runCatching { op() }.onFailure { opDone() } } }
     private fun opDone() { opBusy.set(false); pump() }
+
+    private companion object {
+        const val RECONNECT_DELAY_MS = 2000L
+        const val HEARTBEAT_CHECK_MS = 7000L
+        const val HEARTBEAT_TIMEOUT_MS = 15000L   // silent this long while "connected" → recycle the link (~15s, ANT-learned)
+        const val CONTROL_WRITE_RETRIES = 2       // resend a control write that NAKs (status 133) up to twice
+        const val CONTROL_RETRY_DELAY_MS = 250L
+    }
 }

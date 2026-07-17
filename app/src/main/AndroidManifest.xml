@@ -1,6 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- ANT+ output to a head unit (Garmin) — corrected power re-broadcast over ANT+ -->
+    <uses-permission android:name="com.dsi.ant.permission.ANT" />
+    <!-- Keep transmitting with the screen off: exempt from Doze/battery optimisation -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- Android 11+ package visibility: we bind the ANT Radio Service by explicit package. -->
+    <queries>
+        <package android:name="com.dsi.ant.service" />
+    </queries>
+
     <!-- BLE central (scan/connect) + peripheral (advertise) -->
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
@@ -12,6 +22,7 @@
 
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
@@ -19,6 +30,8 @@
 
     <application
         android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:label="TrainerBridge BLE"
         android:supportsRtl="true">
 
@@ -36,6 +49,6 @@
         <service
             android:name=".BridgeService"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice" />
+            android:foregroundServiceType="connectedDevice|dataSync" />
     </application>
 </manifest>

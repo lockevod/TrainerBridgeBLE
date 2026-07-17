@@ -39,6 +39,8 @@ class MirrorServer(
     private val correction: () -> PowerCorrection,
     private val toZycle: (charUuid: UUID, bytes: ByteArray, withResponse: Boolean) -> Unit,
     private val onStatus: (String) -> Unit = {},
+    /** Health report to the UI: true once we're actually advertising; false if the server/advertising fails. */
+    private val onAdvState: (Boolean) -> Unit = {},
 ) {
     private val tag = "TBB/MirrorServer"
     private val handler = Handler(Looper.getMainLooper())
@@ -56,10 +58,19 @@ class MirrorServer(
     private var originalName: String? = null
     @Volatile private var advertising = false
     @Volatile private var built = false   // build the mirrored GATT once; a trainer reconnect keeps it
+    @Volatile private var advBlueprint: AdvBlueprint? = null   // the trainer's real advertising, to clone
+
+    /** Adopt the trainer's own advertised service UUIDs + manufacturer data (captured by the client) so we
+     *  advertise an identical packet. If we're already advertising, restart to apply it. */
+    fun setAdvBlueprint(bp: AdvBlueprint) {
+        advBlueprint = bp
+        FileLog.event("mirror adv blueprint: ${bp.serviceUuids.size} uuids, ${bp.manufacturerData.size} mfr")
+        handler.post { if (advertising) restartAdvertising() }   // serialise onto the advertising thread
+    }
 
     fun start() {
         val srv = runCatching { mgr.openGattServer(context, serverCallback) }.getOrNull()
-        if (srv == null) { onStatus("no se pudo abrir el servidor BLE"); return }
+        if (srv == null) { onStatus("no se pudo abrir el servidor BLE"); onAdvState(false); return }
         server = srv
         renameAdapter()
     }
@@ -131,11 +142,14 @@ class MirrorServer(
     private fun addNextService() { pendingServices.poll()?.let { s -> runCatching { server?.addService(s) } } }
 
     fun stop() {
-        stopAdvertising()
+        // Stop the advertiser UNCONDITIONALLY: the `advertising` flag is transiently false mid-restart, so
+        // trusting it here can leave the phone broadcasting with a closed GATT server.
+        advertising = false
+        runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(advCallback) }
         runCatching { server?.close() }
         server = null
         restoreName()
-        built = false
+        built = false; advBlueprint = null
         chars.clear(); cache.clear(); subscribers.clear(); clients.clear(); pendingServices.clear()
     }
 
@@ -171,7 +185,7 @@ class MirrorServer(
     }
 
     private val serverCallback = object : BluetoothGattServerCallback() {
-        override fun onServiceAdded(status: Int, service: BluetoothGattService?) { addNextService() ; if (pendingServices.isEmpty()) startAdvertising() }
+        override fun onServiceAdded(status: Int, service: BluetoothGattService?) { addNextService(); if (pendingServices.isEmpty()) handler.post { startAdvertising() } }
 
         override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
             device ?: return
@@ -232,26 +246,30 @@ class MirrorServer(
 
     // ── advertising ──────────────────────────────────────────────────────────────────────────────────
     private val advCallback = object : android.bluetooth.le.AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { advertising = true; onStatus("anunciando $advertisedName"); FileLog.event("advertising as $advertisedName") }
-        override fun onStartFailure(errorCode: Int) { advertising = false; onStatus("fallo al anunciar ($errorCode)"); FileLog.event("advertise failed $errorCode") }
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { advertising = true; onAdvState(true); onStatus("anunciando $advertisedName"); FileLog.event("advertising as $advertisedName") }
+        override fun onStartFailure(errorCode: Int) { advertising = false; onAdvState(false); onStatus("fallo al anunciar ($errorCode)"); FileLog.event("advertise failed $errorCode") }
     }
 
     private fun startAdvertising() {
         if (advertising) return
-        val advertiser = adapter.bluetoothLeAdvertiser ?: run { onStatus("este móvil no soporta anunciar BLE"); return }
+        val advertiser = adapter.bluetoothLeAdvertiser ?: run { onStatus("este móvil no soporta anunciar BLE"); onAdvState(false); return }
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
             .setConnectable(true).setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM).build()
-        // Advertise ALL three standard cycling services in the MAIN packet (they fit in 31 bytes with the
-        // name), so both a passive scanner (Garmin, reading only the main packet) and Bestcycling see us:
-        // CSC (0x1816) + Cycling Power (0x1818) — Garmin watches need CSC, not CPS-only — and FTMS (0x1826).
-        val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(true)
-            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1816)))
-            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1818)))
-            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1826)))
-            .build()
-        runCatching { advertiser.startAdvertising(settings, data, advCallback) }
+        // Clone the trainer's own advertising when we have it (same service UUIDs + manufacturer data), so a
+        // head unit that filters on them sees us exactly like the real trainer. Fallback (sim / not yet
+        // captured): the three standard cycling services.
+        val builder = AdvertiseData.Builder().setIncludeDeviceName(true)
+        val bp = advBlueprint
+        if (bp != null && bp.serviceUuids.isNotEmpty()) {
+            bp.serviceUuids.forEach { builder.addServiceUuid(it) }
+            bp.manufacturerData.forEach { (id, d) -> runCatching { builder.addManufacturerData(id, d) } }
+        } else {
+            builder.addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1816)))
+                .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1818)))
+                .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1826)))
+        }
+        runCatching { advertiser.startAdvertising(settings, builder.build(), advCallback) }
     }
 
     private fun stopAdvertising() {

@@ -31,7 +31,10 @@ android {
 }
 
 dependencies {
-    // BLE-only: no ANT library. Phone is BLE central (to the trainer) + peripheral (to the apps).
+    // Raw ANT channel API — used ONLY for the corrected-power ANT+ output to a head unit (Garmin), which
+    // reads a smart trainer over ANT+. The trainer itself is read over BLE (central); this is TX-only.
+    implementation(files("libs/android_antlib_4-16-0.aar"))
+
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.core:core-ktx:1.13.1")
 

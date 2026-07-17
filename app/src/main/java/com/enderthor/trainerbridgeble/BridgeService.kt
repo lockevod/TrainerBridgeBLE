@@ -11,6 +11,8 @@ import android.os.Binder
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.ServiceCompat
+import com.enderthor.trainerbridgeble.ant.AntFecTx
+import com.enderthor.trainerbridgeble.ant.PowerSample
 import com.enderthor.trainerbridgeble.ble.MirrorServer
 import com.enderthor.trainerbridgeble.ble.SimSource
 import com.enderthor.trainerbridgeble.ble.TrainerSource
@@ -29,6 +31,7 @@ class BridgeService : Service() {
     private var client: TrainerSource? = null
     private var simSource: SimSource? = null
     private var mirror: MirrorServer? = null
+    private var antTx: AntFecTx? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
     @Volatile var status: String = "parado"; private set
@@ -38,14 +41,41 @@ class BridgeService : Service() {
     @Volatile var lastSpeedKmh: Double? = null; private set
     @Volatile var lastCadence: Int? = null; private set
     @Volatile var lastControl: String? = null; private set
+    @Volatile var lastSampleMs: Long = 0L; private set   // wall-clock of the last trainer sample, for UI staleness
+    @Volatile private var lastResistance: Int? = null
+    @Volatile private var antEnabled = false
+    @Volatile var antOk = false; private set
+    @Volatile var antStatus: String = ""; private set
+    @Volatile var bleAdvOk = true; private set   // optimistic: only a real advertise FAILURE flips it false
     @Volatile var listener: (() -> Unit)? = null
     val isRunning: Boolean get() = mirror != null
     val isSimulating: Boolean get() = simSource != null
-    val resistance: Int? get() = simSource?.resistance
+    val resistance: Int? get() = simSource?.resistance ?: lastResistance
 
-    /** Emulate the trainer's resistance buttons (test mode only). */
-    fun buttonUp() { simSource?.buttonUp(); listener?.invoke() }
-    fun buttonDown() { simSource?.buttonDown(); listener?.invoke() }
+    /** The single most important warning to surface, or null if healthy. Checked by the UI so a green
+     *  "Conectado" can never hide a dead ANT dongle or a BLE that isn't actually advertising. */
+    val alert: String? get() = when {
+        !isRunning -> null
+        !bleAdvOk -> "BLE no anuncia"
+        antEnabled && !antOk -> "ANT+ sin señal (¿dongle?)"
+        else -> null
+    }
+
+    /** Nudge the resistance from the on-screen buttons: the synthetic trainer in test mode, or the real
+     *  Zycle over BLE (Set Target Resistance, the same op the apps use — stays transparent). */
+    fun buttonUp() = nudgeResistance(+5)
+    fun buttonDown() = nudgeResistance(-5)
+    private fun nudgeResistance(delta: Int) {
+        val sim = simSource
+        if (sim != null) { if (delta > 0) sim.buttonUp() else sim.buttonDown() }
+        else {
+            val target = ((lastResistance ?: 0) + delta).coerceIn(0, 200)   // 0..200 per the Zycle's 0x2AD6 range
+            // ponytail: 0x04+level% Set Target Resistance, no Request Control first — shares the FTMS control point with the app
+            client?.write(com.enderthor.trainerbridgeble.ble.GattUuids.FTMS_CONTROL_POINT, byteArrayOf(0x04, target.toByte()), true)
+            lastControl = "Resistencia → $target%"; FileLog.event("UI button → resistance target=$target%")
+        }
+        listener?.invoke()
+    }
 
     override fun onBind(intent: Intent?): IBinder = binder
     override fun onUnbind(intent: Intent?): Boolean { listener = null; return super.onUnbind(intent) }
@@ -62,7 +92,14 @@ class BridgeService : Service() {
         if (mirror != null) return
         val config = Config(this)
         createChannel()
-        ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        try {
+            ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } catch (e: Exception) {
+            // Android 14+ rejects a connectedDevice FGS if no Bluetooth permission is granted yet → don't crash.
+            FileLog.init(this); FileLog.event("startForeground failed: ${e.message}")
+            status = "falta permiso Bluetooth"; listener?.invoke(); stopSelf(); return
+        }
         acquireWakeLock()
         FileLog.init(this); FileLog.enabled = config.loggingEnabled
         FileLog.event("bridge start scaleAdj=${config.scaleAdjustPercent}% offset=${config.offsetW}W prefix=${config.namePrefix} sim=${config.simulate}")
@@ -76,14 +113,21 @@ class BridgeService : Service() {
                 client?.write(uuid, bytes, withResponse)
             },
             onStatus = { s -> status = s; listener?.invoke() },
+            onAdvState = { ok -> bleAdvOk = ok; listener?.invoke() },
         )
         val onProfile: (com.enderthor.trainerbridgeble.ble.GattProfile) -> Unit = { profile -> m.build(profile) }
         val onValue: (java.util.UUID, ByteArray) -> Unit = { uuid, value -> m.onZycleValue(uuid, value); cacheForUi(config, uuid, value) }
         val onState: (Boolean) -> Unit = { connected -> zycleConnected = connected; status = if (connected) "trainer conectado" else "buscando trainer…"; listener?.invoke() }
         val c: TrainerSource = if (config.simulate) SimSource(onProfile, onValue, onState).also { simSource = it }
-        else ZycleClient(this, config.namePrefix, config.pairedAddress, onProfile, onValue, onState)
+        else ZycleClient(this, config.namePrefix, config.pairedAddress, onProfile, onValue, onState,
+            onAdv = { bp -> m.setAdvBlueprint(bp) })   // clone the trainer's real advertising
         m.start()
         c.start()
+        if (config.antOutputEnabled) {
+            antEnabled = true; antOk = false; antStatus = "iniciando…"
+            antTx = AntFecTx(this, onState = { ok, detail -> antOk = ok; antStatus = detail; listener?.invoke() })
+                .also { it.start(); FileLog.event("ANT+ output enabled") }
+        }
         mirror = m; client = c
     }
 
@@ -102,6 +146,8 @@ class BridgeService : Service() {
      *  + power; Cycling Power (0x2A63) is a power-only fallback. Power is the RAW value (we show raw →
      *  corrected); speed/cadence pass through. */
     private fun cacheForUi(config: Config, uuid: java.util.UUID, value: ByteArray) {
+        if (uuid == com.enderthor.trainerbridgeble.ble.GattUuids.INDOOR_BIKE_DATA ||
+            uuid == com.enderthor.trainerbridgeble.ble.GattUuids.CYCLING_POWER_MEASUREMENT) lastSampleMs = System.currentTimeMillis()
         when (uuid) {
             com.enderthor.trainerbridgeble.ble.GattUuids.INDOOR_BIKE_DATA -> {
                 if (value.size < 2) return
@@ -111,8 +157,9 @@ class BridgeService : Service() {
                 if (flags and (1 shl 2) != 0) { if (off + 2 <= value.size) lastCadence = le16(value, off) / 2; off += 2 }
                 if (flags and (1 shl 3) != 0) off += 2
                 if (flags and (1 shl 4) != 0) off += 3
-                if (flags and (1 shl 5) != 0) off += 2
+                if (flags and (1 shl 5) != 0) { if (off + 2 <= value.size) lastResistance = le16(value, off); off += 2 }
                 if (flags and (1 shl 6) != 0 && off + 2 <= value.size) { val raw = le16signed(value, off); lastRawW = raw; lastCorrectedW = config.correction().correct(raw) }
+                antTx?.setLatest(PowerSample(lastCorrectedW, lastCadence, lastSpeedKmh?.let { it / 3.6 }))   // corrected → Garmin over ANT+
                 listener?.invoke()
             }
             com.enderthor.trainerbridgeble.ble.GattUuids.CYCLING_POWER_MEASUREMENT -> {
@@ -129,8 +176,10 @@ class BridgeService : Service() {
     private fun stopPipeline() {
         if (mirror != null) FileLog.event("bridge stop")
         client?.stop(); client = null; simSource = null
+        antTx?.stop(); antTx = null
         mirror?.stop(); mirror = null
-        zycleConnected = false; lastRawW = null; lastCorrectedW = null; lastSpeedKmh = null; lastCadence = null; lastControl = null; status = "parado"
+        zycleConnected = false; lastRawW = null; lastCorrectedW = null; lastSpeedKmh = null; lastCadence = null; lastResistance = null; lastControl = null; lastSampleMs = 0L; status = "parado"
+        antEnabled = false; antOk = false; antStatus = ""; bleAdvOk = true
         releaseWakeLock()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         listener?.invoke()   // let a bound UI re-render (Stop → Start) after the async stop

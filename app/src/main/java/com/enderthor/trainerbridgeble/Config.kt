@@ -47,6 +47,12 @@ class Config(context: Context) {
         get() = p.getBoolean(KEY_SIM, false)
         set(v) = p.edit().putBoolean(KEY_SIM, v).apply()
 
+    /** Re-broadcast the corrected power over ANT+ (needs an ANT USB dongle) so a Garmin head unit that
+     *  pairs sensors over ANT+ gets the corrected value. */
+    var antOutputEnabled: Boolean
+        get() = p.getBoolean(KEY_ANT, false)
+        set(v) = p.edit().putBoolean(KEY_ANT, v).apply()
+
     /** LIVE correction from the current scale/offset. */
     fun correction(): PowerCorrection {
         val mult = 1.0 + scaleAdjustPercent / 100.0
@@ -62,5 +68,6 @@ class Config(context: Context) {
         const val KEY_ADVNAME = "advertisedName"
         const val KEY_LOG = "loggingEnabled"
         const val KEY_SIM = "simulate"
+        const val KEY_ANT = "antOutput"
     }
 }

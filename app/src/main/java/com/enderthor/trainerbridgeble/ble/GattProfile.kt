@@ -1,6 +1,16 @@
 package com.enderthor.trainerbridgeble.ble
 
+import android.os.ParcelUuid
 import java.util.UUID
+
+/** The trainer's own advertising, captured during the scan so the mirror can re-advertise an IDENTICAL
+ *  packet (same service UUIDs + manufacturer data) instead of a hand-built one — a head unit that filters
+ *  on these then sees us exactly as it sees the real trainer. (Appearance/AD type 0x19 is NOT clonable on
+ *  Android — no API — but head units discover by service UUID, not appearance.) */
+data class AdvBlueprint(
+    val serviceUuids: List<ParcelUuid>,
+    val manufacturerData: List<Pair<Int, ByteArray>>,   // company id → payload
+)
 
 /** A discovered GATT characteristic to mirror: same UUID, properties, permissions, and CCCD/descriptors. */
 data class CharSpec(
