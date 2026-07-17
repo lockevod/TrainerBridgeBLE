@@ -125,8 +125,8 @@ class BridgeService : Service() {
         c.start()
         if (config.antOutputEnabled) {
             antEnabled = true; antOk = false; antStatus = "iniciando…"
-            antTx = AntFecTx(this, onState = { ok, detail -> antOk = ok; antStatus = detail; listener?.invoke() })
-                .also { it.start(); FileLog.event("ANT+ output enabled") }
+            antTx = AntFecTx(this, deviceNumber = config.antDeviceId, onState = { ok, detail -> antOk = ok; antStatus = detail; listener?.invoke() })
+                .also { it.start(); FileLog.event("ANT+ output enabled id=${config.antDeviceId}") }
         }
         mirror = m; client = c
     }

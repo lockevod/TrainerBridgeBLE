@@ -85,6 +85,10 @@ class AntFecTx(
      */
     private fun nextPage(): ByteArray = synchronized(lock) {
         val c = pageCounter++
+        // Diagnostic (~every 25 s): proves the master is actually transmitting on-air (a TX event fires
+        // each channel period). If this never climbs, the channel opened but the shared ANT radio isn't
+        // putting it on-air.
+        if (c % 100 == 0) com.enderthor.trainerbridgeble.FileLog.event("FecTx tx pages=$c")
         when (c % 32) {
             30 -> FecPages.buildManufacturer()
             31 -> FecPages.buildProduct()

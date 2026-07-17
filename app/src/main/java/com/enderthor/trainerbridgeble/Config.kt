@@ -53,6 +53,12 @@ class Config(context: Context) {
         get() = p.getBoolean(KEY_ANT, false)
         set(v) = p.edit().putBoolean(KEY_ANT, v).apply()
 
+    /** ANT+ device number our FE-C broadcasts on (what the head unit pairs). Configurable so the phone and
+     *  the Karoo build don't collide on the same id — set a different one per device. 1..65535. */
+    var antDeviceId: Int
+        get() = p.getInt(KEY_ANT_ID, 0xACDC)
+        set(v) = p.edit().putInt(KEY_ANT_ID, v.coerceIn(1, 65535)).apply()
+
     /** LIVE correction from the current scale/offset. */
     fun correction(): PowerCorrection {
         val mult = 1.0 + scaleAdjustPercent / 100.0
@@ -69,5 +75,6 @@ class Config(context: Context) {
         const val KEY_LOG = "loggingEnabled"
         const val KEY_SIM = "simulate"
         const val KEY_ANT = "antOutput"
+        const val KEY_ANT_ID = "antDeviceId"
     }
 }

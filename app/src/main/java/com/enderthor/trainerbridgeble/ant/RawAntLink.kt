@@ -234,8 +234,12 @@ class RawAntLink(
             if (!released.add(ch)) return
             if (released.size > 32) { released.clear(); released.add(ch) }
         }
+        // Clear the event handler before release() — matches KPower's proven Karoo teardown order. Leaving
+        // it set makes the ANT service keep a reference and NOT reclaim the channel, so the next session
+        // gets "no channel available" (the Karoo leak we saw). Harmless on a phone/dongle.
         runCatching { ch.close() }
         runCatching { ch.unassign() }
+        runCatching { ch.clearChannelEventHandler() }
         runCatching { ch.release() }
     }
 

@@ -28,6 +28,7 @@ class ConfigActivity : Activity() {
     private lateinit var logCheck: android.widget.CheckBox
     private lateinit var simCheck: android.widget.CheckBox
     private lateinit var antCheck: android.widget.CheckBox
+    private lateinit var antIdField: EditText
 
     private val adapter by lazy { (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter }
     private var scanning = false
@@ -74,6 +75,8 @@ class ConfigActivity : Activity() {
         logCheck = check("Guardar log (CSV)", config.loggingEnabled); opt.addView(logCheck)
         simCheck = check("Modo simulación (sin bici)", config.simulate); opt.addView(simCheck)
         antCheck = check("Salida ANT+ al Garmin (necesita dongle)", config.antOutputEnabled); opt.addView(antCheck)
+        opt.addView(bodyText("ID ANT+ (1–65535, distinto en móvil y Karoo para no chocar)", 13f))
+        antIdField = intField(config.antDeviceId.toString()); opt.addView(antIdField)
         body.addView(opt)
 
         body.addView(accentButton("Guardar y volver") { save(); finish() })
@@ -93,6 +96,7 @@ class ConfigActivity : Activity() {
         config.loggingEnabled = logCheck.isChecked
         config.simulate = simCheck.isChecked
         config.antOutputEnabled = antCheck.isChecked
+        antIdField.text.toString().toIntOrNull()?.let { if (it in 1..65535) config.antDeviceId = it }
     }
 
     // ── BLE scan ──
