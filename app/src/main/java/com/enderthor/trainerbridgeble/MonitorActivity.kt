@@ -51,11 +51,11 @@ class MonitorActivity : Activity() {
         // Start/Stop at the very top (no in-content title — the system title bar already shows the app
         // name; a second one just wastes vertical space on the small Karoo screen).
         startBtn = accentButton("Start") { onStartStop() }.apply {
-            (layoutParams as LinearLayout.LayoutParams).setMargins(0, 0, 0, dp(16))   // up top, gap before the Estado card
+            (layoutParams as LinearLayout.LayoutParams).setMargins(0, 0, 0, dp(10))   // up top, gap before the status card
         }
         body.addView(startBtn)
 
-        val mon = card("Estado")
+        val mon = card("")   // no title — the data sits at the top of the card
         banner = TextView(this).apply {
             text = "Detenido"; setTextColor(0xFFFFFFFF.toInt()); typeface = android.graphics.Typeface.DEFAULT_BOLD
             gravity = android.view.Gravity.CENTER; background = rounded(Palette.MUTED); setPadding(dp(12), dp(12), dp(12), dp(12))
@@ -128,9 +128,9 @@ class MonitorActivity : Activity() {
         val (bText, bColor) = when {
             !running -> "Detenido" to Palette.MUTED
             alert != null -> "⚠ $alert" to Palette.DANGER
-            s?.zycleConnected != true -> "Buscando bici…" to Palette.ACCENT
-            !fresh -> "Sin datos…" to Palette.DANGER
-            else -> "Conectado" to Palette.OK
+            s?.zycleConnected != true -> "Buscando trainer…" to Palette.ACCENT
+            !fresh -> "Trainer conectado · sin datos" to Palette.DANGER
+            else -> "Trainer conectado ✓" to Palette.OK
         }
         banner.text = bText + (if (config.antOutputEnabled) "   ·   ANT+ Garmin" else "") + (if (s?.isSimulating == true) "   ·   SIM" else "")
         banner.background = rounded(bColor)

@@ -30,7 +30,7 @@ fun Activity.rounded(color: Int) = GradientDrawable().apply { setColor(color); c
 fun Activity.card(title: String): LinearLayout = LinearLayout(this).apply {
     orientation = LinearLayout.VERTICAL; background = rounded(Palette.CARD_BG); setPadding(dp(18), dp(14), dp(18), dp(16))
     val lp = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT); lp.setMargins(0, 0, 0, dp(14)); layoutParams = lp
-    addView(TextView(this@card).apply {
+    if (title.isNotEmpty()) addView(TextView(this@card).apply {
         text = title; textSize = 16f; setTextColor(Palette.ACCENT); typeface = Typeface.DEFAULT_BOLD; setPadding(0, 0, 0, dp(8))
     })
 }
