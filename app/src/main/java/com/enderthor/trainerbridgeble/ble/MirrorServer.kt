@@ -242,12 +242,16 @@ class MirrorServer(
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
             .setConnectable(true).setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM).build()
+        // Name in the MAIN packet (not just scan response) so a passive scanner like the Garmin gets it,
+        // plus Cycling Power (0x1818) — how a head unit pairs a power sensor. FTMS + CSC in the scan response.
         val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(false)
-            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1826)))   // FTMS — Bestcycling scans for this
-            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1818)))   // Cycling Power — the Garmin pairs power here
+            .setIncludeDeviceName(true)
+            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1818)))   // Cycling Power — Garmin power pairing
             .build()
-        val scanResp = AdvertiseData.Builder().setIncludeDeviceName(true).build()   // carries the renamed name
+        val scanResp = AdvertiseData.Builder()
+            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1826)))   // FTMS — Bestcycling
+            .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1816)))   // Cycling Speed & Cadence
+            .build()
         runCatching { advertiser.startAdvertising(settings, data, scanResp, advCallback) }
     }
 
