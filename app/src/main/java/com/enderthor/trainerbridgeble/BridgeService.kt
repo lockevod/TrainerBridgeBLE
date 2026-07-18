@@ -34,7 +34,7 @@ class BridgeService : Service() {
     private var antTx: AntFecTx? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
-    @Volatile var status: String = "parado"; private set
+    @Volatile var status: String = ""; private set
     @Volatile var zycleConnected: Boolean = false; private set
     @Volatile var lastRawW: Int? = null; private set
     @Volatile var lastCorrectedW: Int? = null; private set
@@ -56,8 +56,8 @@ class BridgeService : Service() {
      *  "Conectado" can never hide a dead ANT dongle or a BLE that isn't actually advertising. */
     val alert: String? get() = when {
         !isRunning -> null
-        !bleAdvOk -> "BLE no anuncia"
-        antEnabled && !antOk -> "ANT+ sin canal" + (if (antStatus.isNotBlank()) " ($antStatus)" else "")
+        !bleAdvOk -> getString(R.string.alert_ble_not_advertising)
+        antEnabled && !antOk -> getString(R.string.alert_ant_no_channel) + (if (antStatus.isNotBlank()) " ($antStatus)" else "")
         else -> null
     }
 
@@ -72,10 +72,12 @@ class BridgeService : Service() {
             val target = ((lastResistance ?: 0) + delta).coerceIn(0, 200)   // 0..200 per the Zycle's 0x2AD6 range
             // ponytail: 0x04+level% Set Target Resistance, no Request Control first — shares the FTMS control point with the app
             client?.write(com.enderthor.trainerbridgeble.ble.GattUuids.FTMS_CONTROL_POINT, byteArrayOf(0x04, target.toByte()), true)
-            lastControl = "Resistencia → $target%"; FileLog.event("UI button → resistance target=$target%")
+            lastControl = getString(R.string.control_resistance_target, target); FileLog.event("UI button → resistance target=$target%")
         }
         listener?.invoke()
     }
+
+    override fun onCreate() { super.onCreate(); status = getString(R.string.status_stopped) }
 
     override fun onBind(intent: Intent?): IBinder = binder
     override fun onUnbind(intent: Intent?): Boolean { listener = null; return super.onUnbind(intent) }
@@ -98,7 +100,7 @@ class BridgeService : Service() {
         } catch (e: Exception) {
             // Android 14+ rejects a connectedDevice FGS if no Bluetooth permission is granted yet → don't crash.
             FileLog.init(this); FileLog.event("startForeground failed: ${e.message}")
-            status = "falta permiso Bluetooth"; listener?.invoke(); stopSelf(); return
+            status = getString(R.string.status_missing_bt_permission); listener?.invoke(); stopSelf(); return
         }
         acquireWakeLock()
         FileLog.init(this); FileLog.enabled = config.loggingEnabled
@@ -117,14 +119,14 @@ class BridgeService : Service() {
         )
         val onProfile: (com.enderthor.trainerbridgeble.ble.GattProfile) -> Unit = { profile -> m.build(profile) }
         val onValue: (java.util.UUID, ByteArray) -> Unit = { uuid, value -> m.onZycleValue(uuid, value); cacheForUi(config, uuid, value) }
-        val onState: (Boolean) -> Unit = { connected -> zycleConnected = connected; status = if (connected) "trainer conectado" else "buscando trainer…"; listener?.invoke() }
+        val onState: (Boolean) -> Unit = { connected -> zycleConnected = connected; status = if (connected) getString(R.string.status_trainer_connected) else getString(R.string.status_searching_trainer); listener?.invoke() }
         val c: TrainerSource = if (config.simulate) SimSource(onProfile, onValue, onState).also { simSource = it }
         else ZycleClient(this, config.namePrefix, config.pairedAddress, onProfile, onValue, onState,
             onAdv = { bp -> m.setAdvBlueprint(bp) })   // clone the trainer's real advertising
         m.start()
         c.start()
         if (config.antOutputEnabled) {
-            antEnabled = true; antOk = false; antStatus = "iniciando…"
+            antEnabled = true; antOk = false; antStatus = getString(R.string.status_starting)
             antTx = AntFecTx(this, deviceNumber = config.antDeviceId, onState = { ok, detail -> antOk = ok; antStatus = detail; listener?.invoke() })
                 .also { it.start(); FileLog.event("ANT+ output enabled id=${config.antDeviceId}") }
         }
@@ -134,12 +136,12 @@ class BridgeService : Service() {
     /** Human-readable summary of a control write the app sent (shown in the UI: "app → trainer"). */
     private fun describeControl(b: ByteArray): String = when {
         b.isEmpty() -> "?"
-        (b[0].toInt() and 0xFF) == 0x05 && b.size >= 3 -> "ERG ${(b[1].toInt() and 0xFF) or ((b[2].toInt() and 0xFF) shl 8)} W"
-        (b[0].toInt() and 0xFF) == 0x04 && b.size >= 2 -> "Resistencia ${b[1].toInt() and 0xFF}"
-        (b[0].toInt() and 0xFF) == 0x01 -> "Reset"
-        (b[0].toInt() and 0xFF) == 0x07 -> "Start"
-        (b[0].toInt() and 0xFF) == 0x08 -> "Stop"
-        else -> "op 0x%02X".format(b[0].toInt() and 0xFF)
+        (b[0].toInt() and 0xFF) == 0x05 && b.size >= 3 -> getString(R.string.control_erg, (b[1].toInt() and 0xFF) or ((b[2].toInt() and 0xFF) shl 8))
+        (b[0].toInt() and 0xFF) == 0x04 && b.size >= 2 -> getString(R.string.control_resistance, b[1].toInt() and 0xFF)
+        (b[0].toInt() and 0xFF) == 0x01 -> getString(R.string.control_reset)
+        (b[0].toInt() and 0xFF) == 0x07 -> getString(R.string.monitor_start)
+        (b[0].toInt() and 0xFF) == 0x08 -> getString(R.string.monitor_stop)
+        else -> getString(R.string.control_op, b[0].toInt() and 0xFF)
     }
 
     /** Update the monitor tiles from the trainer's data. Indoor Bike Data (0x2AD2) carries speed + cadence
@@ -178,7 +180,7 @@ class BridgeService : Service() {
         client?.stop(); client = null; simSource = null
         antTx?.stop(); antTx = null
         mirror?.stop(); mirror = null
-        zycleConnected = false; lastRawW = null; lastCorrectedW = null; lastSpeedKmh = null; lastCadence = null; lastResistance = null; lastControl = null; lastSampleMs = 0L; status = "parado"
+        zycleConnected = false; lastRawW = null; lastCorrectedW = null; lastSpeedKmh = null; lastCadence = null; lastResistance = null; lastControl = null; lastSampleMs = 0L; status = getString(R.string.status_stopped)
         antEnabled = false; antOk = false; antStatus = ""; bleAdvOk = true
         releaseWakeLock()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
@@ -199,15 +201,15 @@ class BridgeService : Service() {
     private fun createChannel() {
         val mgr = getSystemService(NotificationManager::class.java)
         if (mgr.getNotificationChannel(CHANNEL_ID) == null)
-            mgr.createNotificationChannel(NotificationChannel(CHANNEL_ID, "TrainerBridge BLE", NotificationManager.IMPORTANCE_LOW))
+            mgr.createNotificationChannel(NotificationChannel(CHANNEL_ID, getString(R.string.app_name), NotificationManager.IMPORTANCE_LOW))
     }
 
     private fun buildNotification(): Notification {
         val open = PendingIntent.getActivity(this, 0, Intent(this, MonitorActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("TrainerBridge BLE")
-            .setContentText("Proxy BLE activo")
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText(getString(R.string.notif_text))
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setOngoing(true).setContentIntent(open).build()
     }

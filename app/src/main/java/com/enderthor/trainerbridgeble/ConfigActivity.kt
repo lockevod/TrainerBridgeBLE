@@ -40,30 +40,30 @@ class ConfigActivity : Activity() {
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(Palette.PAGE_BG); setPadding(dp(16), dp(20), dp(16), dp(20))
         }
-        body.addView(title("Configuración"))
+        body.addView(title(getString(R.string.config_title)))
 
         // Correction
-        val corr = card("Corrección")
-        corr.addView(bodyText("corregida = cruda × (1 + escala%/100) + offset   ·   cruda 0 → 0", 12f))
-        corr.addView(bodyText("Ajuste de escala (%, entero)", 13f))
+        val corr = card(getString(R.string.config_correction))
+        corr.addView(bodyText(getString(R.string.config_formula), 12f))
+        corr.addView(bodyText(getString(R.string.config_scale_label), 13f))
         scaleField = intField(config.scaleAdjustPercent.toString()); corr.addView(scaleField)
-        corr.addView(bodyText("Offset (W, entero)", 13f))
+        corr.addView(bodyText(getString(R.string.config_offset_label), 13f))
         offsetField = intField(config.offsetW.toString()); corr.addView(offsetField)
-        corr.addView(accentButton("Guardar corrección") { save(); toast("Guardado") })
+        corr.addView(accentButton(getString(R.string.config_save_correction)) { save(); toast(getString(R.string.config_saved)) })
         body.addView(corr)
 
         // Trainer pairing
-        val src = card("Bicicleta (BLE)")
+        val src = card(getString(R.string.config_bike))
         pairedLine = bodyText(pairedText(), 14f, Palette.TEXT); src.addView(pairedLine)
         foundList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        scanBtn = accentButton("Buscar bicicleta") { toggleScan() }
+        scanBtn = accentButton(getString(R.string.config_scan_start)) { toggleScan() }
         src.addView(scanBtn); src.addView(foundList)
-        src.addView(plainButton("Olvidar dispositivo") { config.pairedAddress = ""; config.pairedName = ""; pairedLine.text = pairedText() })
+        src.addView(plainButton(getString(R.string.config_forget)) { config.pairedAddress = ""; config.pairedName = ""; pairedLine.text = pairedText() })
         body.addView(src)
 
         // Advertised identity
-        val idc = card("Identidad anunciada")
-        idc.addView(bodyText("Nombre con el que nos ven las apps (por defecto igual que el Zycle para que reconozca sus capacidades).", 12f))
+        val idc = card(getString(R.string.config_identity))
+        idc.addView(bodyText(getString(R.string.config_name_hint), 12f))
         nameField = textField(config.advertisedName).apply {
             filters = arrayOf(android.text.InputFilter.LengthFilter(14))   // >14 chars overflows the 31-byte advert with the cloned UUIDs+mfr data
         }
@@ -71,23 +71,23 @@ class ConfigActivity : Activity() {
         body.addView(idc)
 
         // Toggles
-        val opt = card("Opciones")
-        logCheck = check("Guardar log (CSV)", config.loggingEnabled); opt.addView(logCheck)
-        simCheck = check("Modo simulación (sin bici)", config.simulate); opt.addView(simCheck)
-        antCheck = check("Salida ANT+ al Garmin (necesita dongle)", config.antOutputEnabled); opt.addView(antCheck)
-        opt.addView(bodyText("ID ANT+ (1–65535, distinto en móvil y Karoo para no chocar)", 13f))
+        val opt = card(getString(R.string.config_options))
+        logCheck = check(getString(R.string.config_log), config.loggingEnabled); opt.addView(logCheck)
+        simCheck = check(getString(R.string.config_sim), config.simulate); opt.addView(simCheck)
+        antCheck = check(getString(R.string.config_ant_output), config.antOutputEnabled); opt.addView(antCheck)
+        opt.addView(bodyText(getString(R.string.config_ant_id), 13f))
         antIdField = intField(config.antDeviceId.toString()); opt.addView(antIdField)
         body.addView(opt)
 
-        body.addView(accentButton("Guardar y volver") { save(); finish() })
+        body.addView(accentButton(getString(R.string.config_save_back)) { save(); finish() })
 
         setContentView(ScrollView(this).apply { setBackgroundColor(Palette.PAGE_BG); addView(body) })
     }
 
     override fun onStop() { super.onStop(); stopScan(); save() }
 
-    private fun pairedText() = if (config.pairedAddress.isEmpty()) "Ninguna emparejada (se buscará por nombre \"${config.namePrefix}\")"
-    else "Emparejada: ${config.pairedName.ifEmpty { config.pairedAddress }}"
+    private fun pairedText() = if (config.pairedAddress.isEmpty()) getString(R.string.config_none_paired, config.namePrefix)
+    else getString(R.string.config_paired, config.pairedName.ifEmpty { config.pairedAddress })
 
     private fun save() {
         scaleField.text.toString().toIntOrNull()?.let { if (it > -100) config.scaleAdjustPercent = it }
@@ -111,14 +111,14 @@ class ConfigActivity : Activity() {
     private fun toggleScan() {
         if (scanning) { stopScan(); return }
         found.clear(); rebuildFound()
-        val scanner = adapter?.bluetoothLeScanner ?: run { toast("BLE no disponible"); return }
-        scanning = true; scanBtn.text = "Parar búsqueda"
+        val scanner = adapter?.bluetoothLeScanner ?: run { toast(getString(R.string.config_ble_unavailable)); return }
+        scanning = true; scanBtn.text = getString(R.string.config_scan_stop)
         runCatching { scanner.startScan(scanCallback) }
     }
 
     private fun stopScan() {
         if (!scanning) return
-        scanning = false; scanBtn.text = "Buscar bicicleta"
+        scanning = false; scanBtn.text = getString(R.string.config_scan_start)
         runCatching { adapter?.bluetoothLeScanner?.stopScan(scanCallback) }
     }
 
@@ -130,7 +130,7 @@ class ConfigActivity : Activity() {
                 setPadding(0, dp(8), 0, dp(8))
                 setOnClickListener {
                     config.pairedAddress = addr; config.pairedName = name
-                    pairedLine.text = pairedText(); stopScan(); toast("Emparejada: $name")
+                    pairedLine.text = pairedText(); stopScan(); toast(getString(R.string.config_paired, name))
                 }
             })
         }

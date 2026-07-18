@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TrainerBridge BLE</string>
+
+    <!-- Monitor -->
+    <string name="monitor_start">Start</string>
+    <string name="monitor_stop">Stop</string>
+    <string name="monitor_banner_stopped">Stopped</string>
+    <string name="monitor_banner_searching">Searching trainer…</string>
+    <string name="monitor_banner_no_data">Trainer connected · no data</string>
+    <string name="monitor_banner_connected">Trainer connected ✓</string>
+    <string name="monitor_tile_power">Power (W)</string>
+    <string name="monitor_tile_corrected">Corrected (W)</string>
+    <string name="monitor_tile_speed">Speed (km/h)</string>
+    <string name="monitor_tile_cadence">Cadence (rpm)</string>
+    <string name="monitor_tile_resistance">Resistance</string>
+    <string name="monitor_tile_control">App → trainer</string>
+    <string name="monitor_resistance_down">Resistance ▼</string>
+    <string name="monitor_resistance_up">Resistance ▲</string>
+    <string name="alert_prefix">⚠ %s</string>
+
+    <!-- Config -->
+    <string name="config_title">Settings</string>
+    <string name="config_correction">Correction</string>
+    <string name="config_formula">corrected = raw × (1 + scale%/100) + offset   ·   raw 0 → 0</string>
+    <string name="config_scale_label">Scale adjustment (%, integer)</string>
+    <string name="config_offset_label">Offset (W, integer)</string>
+    <string name="config_save_correction">Save correction</string>
+    <string name="config_saved">Saved</string>
+    <string name="config_bike">Bike (BLE)</string>
+    <string name="config_scan_start">Search bike</string>
+    <string name="config_scan_stop">Stop search</string>
+    <string name="config_forget">Forget device</string>
+    <string name="config_none_paired">None paired (will search by name \"%s\")</string>
+    <string name="config_paired">Paired: %s</string>
+    <string name="config_identity">Advertised identity</string>
+    <string name="config_name_hint">Name the apps see us as (by default the same as the Zycle so it recognizes its capabilities).</string>
+    <string name="config_options">Options</string>
+    <string name="config_log">Save log (CSV)</string>
+    <string name="config_sim">Simulation mode (no bike)</string>
+    <string name="config_ant_output">ANT+ output (corrected power to watch/bike computer)</string>
+    <string name="config_ant_id">ANT+ ID (1–65535, different on phone and Karoo to avoid clashing)</string>
+    <string name="config_save_back">Save and go back</string>
+    <string name="config_ble_unavailable">BLE unavailable</string>
+
+    <!-- Status -->
+    <string name="status_stopped">stopped</string>
+    <string name="status_missing_bt_permission">missing Bluetooth permission</string>
+    <string name="status_trainer_connected">trainer connected</string>
+    <string name="status_searching_trainer">searching trainer…</string>
+    <string name="status_starting">starting…</string>
+    <string name="status_app_connected">app connected (%d)</string>
+    <string name="status_app_disconnected">app disconnected (%d)</string>
+    <string name="status_advertising">advertising %s</string>
+    <string name="status_advertise_failed">advertise failed (%d)</string>
+    <string name="status_ble_server_failed">could not open the BLE server</string>
+    <string name="status_ble_adv_unsupported">this phone cannot advertise BLE</string>
+
+    <!-- Alerts -->
+    <string name="alert_ble_not_advertising">BLE not advertising</string>
+    <string name="alert_ant_no_channel">ANT+ no channel</string>
+
+    <!-- Control labels -->
+    <string name="control_reset">Reset</string>
+    <string name="control_erg">ERG %d W</string>
+    <string name="control_resistance">Resistance %d</string>
+    <string name="control_op">op 0x%02X</string>
+    <string name="control_resistance_target">Resistance → %1$d%%</string>
+
+    <!-- Notification -->
+    <string name="notif_text">BLE proxy active</string>
+
+    <!-- ANT link -->
+    <string name="ant_service_disconnected">ANT service disconnected</string>
+    <string name="ant_bind_failed">could not bind the ANT Radio Service</string>
+    <string name="ant_transmitting">transmitting</string>
+    <string name="ant_no_free_channel">no free ANT channel</string>
+    <string name="ant_failure">ANT failure</string>
+</resources>

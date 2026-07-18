@@ -17,6 +17,7 @@ import com.dsi.ant.channel.ChannelNotAvailableException
 import com.dsi.ant.channel.IAntChannelEventHandler
 import com.dsi.ant.channel.PredefinedNetwork
 import com.enderthor.trainerbridgeble.FileLog
+import com.enderthor.trainerbridgeble.R
 import com.dsi.ant.message.EventCode
 import com.dsi.ant.message.fromant.ChannelEventMessage
 import com.dsi.ant.message.fromant.MessageFromAntType
@@ -104,7 +105,7 @@ class RawAntLink(
         override fun onServiceDisconnected(name: ComponentName?) {
             antService = null
             val dead = channel; channel = null; releaseChannel(dead)
-            onState(false, "servicio ANT desconectado")
+            onState(false, context.getString(R.string.ant_service_disconnected))
             if (!stopped) scheduleReopen("ant service disconnected")
         }
     }
@@ -117,7 +118,7 @@ class RawAntLink(
             providerRegistered = true
         }
         val ok = runCatching { AntService.bindService(context, conn) }.getOrDefault(false)
-        if (!ok) { onState(false, "no se pudo enlazar el ANT Radio Service"); scheduleReopen("bindService returned false") }
+        if (!ok) { onState(false, context.getString(R.string.ant_bind_failed)); scheduleReopen("bindService returned false") }
     }
 
     /** Recycle a channel that is nominally open but has gone silent (tracking-but-no-data firmware
@@ -187,7 +188,7 @@ class RawAntLink(
                 ch.open()
                 Log.d(tag, "channel open")
                 FileLog.event("$tag opened")   // diagnostic: which channels actually acquire+open
-                onState(true, "transmitiendo")
+                onState(true, context.getString(R.string.ant_transmitting))
                 onOpened(ch)
             }.onFailure { e ->
                 // Release the LOCAL half-open handle and only null the field if it still points here
@@ -201,10 +202,10 @@ class RawAntLink(
                         // providerReceiver retries the instant one does, plus a long backstop here. (KPower
                         // model — the only thing that behaves on the Karoo.)
                         Log.w(tag, "no ANT channel available; awaiting a free channel")
-                        onState(false, "sin canal ANT libre")
+                        onState(false, context.getString(R.string.ant_no_free_channel))
                         scope.launch { delay(NO_CHANNEL_RETRY_MS); if (!stopped && channel == null && !opening.get()) open() }
                     }
-                    else -> { Log.e(tag, "open failed: ${e.message}"); onState(false, e.message ?: "fallo ANT"); scheduleReopen(e.message ?: "open failure") }
+                    else -> { Log.e(tag, "open failed: ${e.message}"); onState(false, e.message ?: context.getString(R.string.ant_failure)); scheduleReopen(e.message ?: "open failure") }
                 }
             }
         } finally {

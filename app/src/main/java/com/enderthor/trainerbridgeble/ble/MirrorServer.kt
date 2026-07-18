@@ -18,6 +18,7 @@ import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
 import com.enderthor.trainerbridgeble.FileLog
+import com.enderthor.trainerbridgeble.R
 import com.enderthor.trainerbridgeble.correction.PowerCorrection
 import java.util.ArrayDeque
 import java.util.UUID
@@ -70,7 +71,7 @@ class MirrorServer(
 
     fun start() {
         val srv = runCatching { mgr.openGattServer(context, serverCallback) }.getOrNull()
-        if (srv == null) { onStatus("no se pudo abrir el servidor BLE"); onAdvState(false); return }
+        if (srv == null) { onStatus(context.getString(R.string.status_ble_server_failed)); onAdvState(false); return }
         server = srv
         renameAdapter()
     }
@@ -190,14 +191,14 @@ class MirrorServer(
         override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
             device ?: return
             if (newState == android.bluetooth.BluetoothProfile.STATE_CONNECTED) {
-                clients[device.address] = device; onStatus("app conectada (${clients.size})")
+                clients[device.address] = device; onStatus(context.getString(R.string.status_app_connected, clients.size))
                 FileLog.event("app connected ${device.address}")
                 // Android stops connectable advertising once a central connects — restart it so a SECOND
                 // central (e.g. the Garmin) can still discover us.
                 handler.post { restartAdvertising() }
             } else {
                 clients.remove(device.address); subscribers.values.forEach { it.remove(device.address) }
-                onStatus("app desconectada (${clients.size})")
+                onStatus(context.getString(R.string.status_app_disconnected, clients.size))
                 FileLog.event("app disconnected ${device.address}")
             }
         }
@@ -246,13 +247,13 @@ class MirrorServer(
 
     // ── advertising ──────────────────────────────────────────────────────────────────────────────────
     private val advCallback = object : android.bluetooth.le.AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { advertising = true; onAdvState(true); onStatus("anunciando $advertisedName"); FileLog.event("advertising as $advertisedName") }
-        override fun onStartFailure(errorCode: Int) { advertising = false; onAdvState(false); onStatus("fallo al anunciar ($errorCode)"); FileLog.event("advertise failed $errorCode") }
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { advertising = true; onAdvState(true); onStatus(context.getString(R.string.status_advertising, advertisedName)); FileLog.event("advertising as $advertisedName") }
+        override fun onStartFailure(errorCode: Int) { advertising = false; onAdvState(false); onStatus(context.getString(R.string.status_advertise_failed, errorCode)); FileLog.event("advertise failed $errorCode") }
     }
 
     private fun startAdvertising() {
         if (advertising) return
-        val advertiser = adapter.bluetoothLeAdvertiser ?: run { onStatus("este móvil no soporta anunciar BLE"); onAdvState(false); return }
+        val advertiser = adapter.bluetoothLeAdvertiser ?: run { onStatus(context.getString(R.string.status_ble_adv_unsupported)); onAdvState(false); return }
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
             .setConnectable(true).setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM).build()
