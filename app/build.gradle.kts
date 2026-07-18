@@ -37,6 +37,7 @@ dependencies {
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.core:core-ktx:1.13.1")
+    implementation("io.hammerhead:karoo-ext:1.1.9")
 
     testImplementation("junit:junit:4.13.2")
 }

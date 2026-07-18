@@ -12,6 +12,7 @@ import android.os.Bundle
 import android.os.IBinder
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -29,6 +30,8 @@ class MonitorActivity : Activity() {
     private lateinit var speedTile: TextView
     private lateinit var cadenceTile: TextView
     private lateinit var resistTile: TextView
+    private lateinit var masterSwitch: CheckBox
+    private lateinit var trainerSwitch: CheckBox
     private lateinit var startBtn: Button
     private lateinit var upBtn: Button
     private lateinit var downBtn: Button
@@ -49,10 +52,18 @@ class MonitorActivity : Activity() {
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(Palette.PAGE_BG); setPadding(dp(16), dp(6), dp(16), dp(16))
         }
-        // Start/Stop at the very top (no in-content title — the system title bar already shows the app
-        // name; a second one just wastes vertical space on the small Karoo screen).
-        startBtn = accentButton(getString(R.string.monitor_start)) { onStartStop() }.apply {
-            (layoutParams as LinearLayout.LayoutParams).setMargins(0, 0, 0, dp(10))   // up top, gap before the status card
+        // Master switch at the very top — gates everything. Below it the trainer-enable toggle (receive side)
+        // and the Broadcast button (emit side). No in-content title: the system title bar already names the app.
+        masterSwitch = check(getString(R.string.monitor_master), config.masterEnabled).apply {
+            setOnCheckedChangeListener { _, isChecked -> config.masterEnabled = isChecked; BridgeService.setMaster(this@MonitorActivity, isChecked); render() }
+        }
+        body.addView(masterSwitch)
+        trainerSwitch = check(getString(R.string.monitor_trainer_enabled), config.trainerEnabled).apply {
+            setOnCheckedChangeListener { _, isChecked -> config.trainerEnabled = isChecked; BridgeService.setTrainerEnabled(this@MonitorActivity, isChecked) }
+        }
+        body.addView(trainerSwitch)
+        startBtn = accentButton(getString(R.string.monitor_emit_start)) { onStartStop() }.apply {
+            (layoutParams as LinearLayout.LayoutParams).setMargins(0, dp(10), 0, dp(10))   // gap above and before the status card
         }
         body.addView(startBtn)
 
@@ -112,47 +123,56 @@ class MonitorActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        // Re-assert the master state: a cold open (bind-only, no START_STICKY restart) would otherwise leave
+        // the service bound but not foregrounded/receiving even though master is persisted on. Idempotent.
+        if (config.masterEnabled) BridgeService.setMaster(this, true)
         bindService(Intent(this, BridgeService::class.java), conn, Context.BIND_AUTO_CREATE)
         poller.post(pollTick)   // 1 Hz refresh so tiles go stale ("—") even when the trainer stops notifying
     }
     override fun onStop() { super.onStop(); poller.removeCallbacks(pollTick); service?.listener = null; runCatching { unbindService(conn) } }
 
-    private fun onStartStop() {
-        if (service?.isRunning == true) BridgeService.stop(this) else BridgeService.start(this)
+    private fun onStartStop() {   // the button now toggles the EMIT (broadcast) half
+        if (service?.emitting == true) BridgeService.stopEmit(this) else BridgeService.startEmit(this)
         render()
     }
 
     private fun render() {
         val s = service
-        val running = s?.isRunning == true
-        startBtn.text = if (running) getString(R.string.monitor_stop) else getString(R.string.monitor_start)
+        val master = config.masterEnabled
+        val emitting = s?.emitting == true
+        // Broadcast button: label off emit state, enabled only while the master switch is on.
+        startBtn.text = if (emitting) getString(R.string.monitor_emit_stop) else getString(R.string.monitor_emit_start)
+        val canEmit = master && s?.receiving == true   // broadcasting an un-fed mirror is pointless
+        startBtn.isEnabled = canEmit; startBtn.alpha = if (canEmit) 1f else 0.4f
+        trainerSwitch.isEnabled = master; trainerSwitch.alpha = if (master) 1f else 0.4f   // per-trainer toggle only matters when the app is on
         // Fresh = a sample arrived within the last 3s. A brief (<3s) blip keeps showing the last value
         // (the mirror is re-emitting it too); a longer gap blanks the tiles to "—".
         val fresh = s != null && s.lastSampleMs != 0L && System.currentTimeMillis() - s.lastSampleMs <= STALE_MS
-        // Banner shows the TRAINER link, always — never hidden by an ANT/BLE problem.
+        // Banner shows the TRAINER (receive) link when master is on; "Off" when master is off.
         val (bText, bColor) = when {
-            !running -> getString(R.string.monitor_banner_stopped) to Palette.MUTED
+            !master -> getString(R.string.monitor_off) to Palette.MUTED
             s?.zycleConnected != true -> getString(R.string.monitor_banner_searching) to Palette.ACCENT
             !fresh -> getString(R.string.monitor_banner_no_data) to Palette.DANGER
             else -> getString(R.string.monitor_banner_connected) to Palette.OK
         }
-        banner.text = bText + (if (s?.isSimulating == true) "   ·   SIM" else "")
+        banner.text = bText + (if (master && s?.isSimulating == true) "   ·   SIM" else "")
         banner.background = rounded(bColor)
         // ANT/BLE problems go on their OWN line, so they don't mask the trainer state.
-        val alert = if (running) s?.alert else null
+        val alert = s?.alert   // getter already returns null unless emitting
         if (alert != null) { alertLine.visibility = TextView.VISIBLE; alertLine.text = getString(R.string.alert_prefix, alert) }
         else alertLine.visibility = TextView.GONE
-        statusLine.text = s?.status ?: getString(R.string.status_stopped)
-        statusLine.setTextColor(if (s?.zycleConnected == true) Palette.OK else Palette.MUTED)
-        val show = running && fresh
+        statusLine.text = if (master) s?.status ?: getString(R.string.status_stopped) else getString(R.string.status_stopped)
+        statusLine.setTextColor(if (master && s?.zycleConnected == true) Palette.OK else Palette.MUTED)
+        val show = master && fresh
         powerTile.text = if (show) s?.lastRawW?.toString() ?: "—" else "—"
         correctedTile.text = if (show) s?.lastCorrectedW?.toString() ?: "—" else "—"
         speedTile.text = if (show) s?.lastSpeedKmh?.let { String.format("%.1f", it) } ?: "—" else "—"
         cadenceTile.text = if (show) s?.lastCadence?.toString() ?: "—" else "—"
-        resistTile.text = if (running) s?.resistance?.toString() ?: "—" else "—"
-        controlTile.text = s?.lastControl ?: "—"
-        upBtn.isEnabled = running; downBtn.isEnabled = running
-        upBtn.alpha = if (running) 1f else 0.4f; downBtn.alpha = if (running) 1f else 0.4f
+        resistTile.text = if (master) s?.resistance?.toString() ?: "—" else "—"
+        controlTile.text = if (master) s?.lastControl ?: "—" else "—"
+        val nudgeable = master && s?.receiving == true
+        upBtn.isEnabled = nudgeable; downBtn.isEnabled = nudgeable
+        upBtn.alpha = if (nudgeable) 1f else 0.4f; downBtn.alpha = if (nudgeable) 1f else 0.4f
     }
 
     private fun tileButton(text: String, onClick: () -> Unit) = Button(this).apply {

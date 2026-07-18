@@ -59,6 +59,17 @@ class Config(context: Context) {
         get() = p.getInt(KEY_ANT_ID, 0xACDC)
         set(v) = p.edit().putInt(KEY_ANT_ID, v.coerceIn(1, 65535)).apply()
 
+    /** Master switch: the whole app on/off. false = fully shut down, zero consumption. */
+    var masterEnabled: Boolean
+        get() = p.getBoolean(KEY_MASTER, false)
+        set(v) = p.edit().putBoolean(KEY_MASTER, v).apply()
+
+    /** Whether to connect to the paired trainer (the receive side). Default on (BLE connects). Ignored in
+     *  simulation, where the synthetic source always feeds. */
+    var trainerEnabled: Boolean
+        get() = p.getBoolean(KEY_TRAINER_EN, true)
+        set(v) = p.edit().putBoolean(KEY_TRAINER_EN, v).apply()
+
     /** LIVE correction from the current scale/offset. */
     fun correction(): PowerCorrection {
         val mult = 1.0 + scaleAdjustPercent / 100.0
@@ -76,5 +87,7 @@ class Config(context: Context) {
         const val KEY_SIM = "simulate"
         const val KEY_ANT = "antOutput"
         const val KEY_ANT_ID = "antDeviceId"
+        const val KEY_MASTER = "masterEnabled"
+        const val KEY_TRAINER_EN = "trainerEnabled"
     }
 }

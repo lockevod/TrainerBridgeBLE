@@ -1,10 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- ANT+ output to a head unit (Garmin) — corrected power re-broadcast over ANT+ -->
     <uses-permission android:name="com.dsi.ant.permission.ANT" />
     <!-- Keep transmitting with the screen off: exempt from Doze/battery optimisation -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- Resume the master state after a reboot -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- Android 11+ package visibility: we bind the ANT Radio Service by explicit package. -->
     <queries>
@@ -47,9 +50,30 @@
 
         <activity android:name=".ConfigActivity" android:exported="false" />
 
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
         <service
             android:name=".BridgeService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice|dataSync" />
+
+        <service
+            android:name=".karoo.TrainerBridgeExtension"
+            android:exported="true"
+            tools:ignore="ExportedService">
+            <intent-filter>
+                <action android:name="io.hammerhead.karooext.KAROO_EXTENSION" />
+            </intent-filter>
+            <meta-data
+                android:name="io.hammerhead.karooext.EXTENSION_INFO"
+                android:resource="@xml/extension_info" />
+        </service>
     </application>
 </manifest>

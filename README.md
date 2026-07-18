@@ -1,86 +1,96 @@
 # TrainerBridge BLE
 
-A transparent Bluetooth Low Energy proxy for a Zycle smart trainer. The app sits **between the trainer
-and your training apps**: it connects to the trainer as a BLE *central*, mirrors the trainer's entire GATT
-as a BLE *peripheral*, and re-broadcasts everything **byte-for-byte** — changing only two things:
+Corrects the power your Zycle smart trainer reports and makes the **corrected** value available to your
+apps and head units. It sits between the trainer and everything else, applies a linear calibration to
+power, and passes everything else through untouched.
 
-1. the **advertised name** (so an app that keys capabilities off the name still recognises it), and
-2. the **power** value, which is corrected with a linear calibration.
+It runs the same on a **phone** and on a **Hammerhead Karoo** — the difference is only in how you use it,
+described below.
 
-Everything else — control writes (ERG / resistance), the proprietary button/telemetry channels, speed,
-cadence, resistance — passes through untouched, so the training app behaves exactly as if it were talking
-to the trainer directly, but records **corrected** power. Optionally it also re-broadcasts the corrected
-power over **ANT+** (FE-C smart trainer) for a head unit that pairs sensors over ANT+.
+---
 
-## How it works
+## What it does
 
-```
-        BLE central                         BLE peripheral (mirror)
-Zycle ────────────────►  TrainerBridge BLE  ────────────────►  Training app (e.g. Bestcycling)
-  ▲   notifications          │  corrects power                     │
-  └──────────────────────────┘  relays control writes back         │
-        control (ERG/resistance)                                   │
-                                   │  ANT+ FE-C (optional)          ▼
-                                   └──────────────────────────►  Head unit (Garmin, …)
-```
+The app connects to your trainer over Bluetooth (as the "receiver") and can then make the corrected data
+available three ways:
 
-- **Central**: scans for the trainer (by paired address, else by name prefix), connects, discovers the
-  full GATT, subscribes to every notify/indicate characteristic and reads every readable one.
-- **Peripheral (mirror)**: rebuilds an identical GATT server, re-advertises the trainer's own service
-  UUIDs + manufacturer data, corrects the power field in Indoor Bike Data (0x2AD2) and Cycling Power
-  (0x2A63), and inverse-corrects ERG target-power writes so the delivered power matches what the app asked.
-- **ANT+ output (optional)**: a raw ANT+ FE-C master broadcasting the corrected power + cadence + speed.
+1. **To training apps over Bluetooth** (e.g. Bestcycling): it mirrors the trainer 1:1 — same name, same
+   controls (ERG / resistance, buttons) — but reports corrected power. The app behaves exactly as if
+   talking to the trainer directly, and records corrected watts.
+2. **To a head unit over ANT+** (e.g. a Garmin): it broadcasts an ANT+ smart trainer with corrected power.
+3. **To a Karoo, natively**: it publishes a **virtual sensor** called *TrainerBridge* that the Karoo pairs
+   like any other sensor and records for indoor training — no ANT, no cables, no second device.
 
-### Power correction
+---
 
-```
-corrected = raw × scale + offset        (raw 0 → 0, no phantom watts when coasting)
-ergTarget = (target − offset) / scale   (inverse, so a commanded ERG target lands correct after correction)
-```
+## The three controls
 
-`scale` is entered as a percentage adjustment (e.g. +6 → ×1.06) and `offset` in watts, both in the config.
+The Monitor screen has three independent switches — this is the key to understanding the app:
 
-## Two deployment cases
+| Control | What it does |
+|---|---|
+| **App active** (master) | The on/off of the whole app. **Off = nothing runs, zero battery.** Turn it on to use the app. |
+| **Trainer enabled** | Connect to your trainer (the "receiving" side). On by default. While on, the app is connected and the tiles show live power/cadence/speed/resistance — **you do not need to press Broadcast for this**. |
+| **Broadcast** (the big button) | Start/stop **emitting to the outside**: the Bluetooth mirror for training apps + the ANT+ output. |
 
-The same APK runs on a **phone** and on a **Hammerhead Karoo**; the only difference is where ANT+ comes from.
+**Receiving is always available** (whenever *App active* + *Trainer enabled* are on). **Broadcast is only
+for sending to external apps / ANT+.** So the Karoo virtual sensor works without ever pressing Broadcast.
 
-### Phone (e.g. Samsung Galaxy)
+---
 
-- **BLE proxy**: works out of the box — the phone is BLE central to the trainer and BLE peripheral to the app.
-- **ANT+ output**: needs an **ANT USB dongle** (OTG) plus the *ANT Radio Service* / *ANT USB Service* apps
-  installed. Without a dongle the BLE proxy still works; the ANT output just reports "sin canal ANT".
-- Keep the app exempt from battery optimisation (it asks once) so it keeps running with the screen off.
+## Using it on a Karoo (indoor training)
 
-### Karoo (Karoo 2 / Karoo 3)
+This is where it's most useful: **indoor training on the Karoo**. Indoors you have no GPS and rely on the
+trainer for power, speed and cadence — so recording the *corrected* power matters. The Karoo runs the app
+**and** records the ride from it, all on the one device, with no ANT dongle.
 
-- **BLE proxy**: works — the Karoo supports BLE peripheral advertising.
-- **ANT+ output**: uses the Karoo's **native ANT radio — no dongle**. The ANT channels are shared with the
-  Karoo's own sensor system, so:
-  - If all channels are busy the app **waits** for one to free (it listens for the channel-available
-    broadcast and grabs one the instant it frees) instead of fighting the shared service.
-  - If ANT gets stuck after many app restarts, **reboot the Karoo** once to clear any leaked channels.
-- Install via adb: `adb install -r app-debug.apk`, launch `com.enderthor.trainerbridgeble/.MonitorActivity`.
+1. Install the app and open it. Turn **App active** on. Make sure **Trainer enabled** is on.
+2. The app connects to your trainer; the Monitor tiles show corrected power/cadence/speed.
+3. On the Karoo, go to **Sensors → Add sensor** and pair **"TrainerBridge"**. The Karoo now records the
+   **corrected** power, cadence and speed for your indoor ride.
+4. That's it — you don't need to press Broadcast. Turn **App active** off when you're done so it stops
+   consuming battery.
 
-### ANT+ device id — set a different one per device
+> The Karoo shows speed in km/h or mph according to your profile automatically.
+>
+> Note: Karoo extensions auto-start, so the app is always loaded on the Karoo — the **App active** switch
+> is how you make sure it isn't consuming anything when you're not using it.
 
-Both builds default to ANT+ device number **44252 (0xACDC)**. If you run the phone and the Karoo at the
-same time, give each a **different ANT+ id** in the config (e.g. Karoo 44253) so a head unit lists them as
-two separate trainers instead of colliding.
+---
 
-## Screens
+## Using it on a phone
 
-**Monitor** — Start/Stop, a status banner that states the trainer link plainly (`Buscando trainer…` /
-`Trainer conectado ✓` / `Trainer conectado · sin datos`), a separate alert line for ANT/BLE problems, and
-live tiles: power, corrected power, speed, cadence, resistance, and the last app→trainer control command.
-Resistance ▲/▼ buttons emulate the trainer's buttons (send a Set Target Resistance to the trainer).
+The phone acts as the bridge between the trainer and your training app (and, optionally, a Garmin).
 
-**Config** — pair the trainer over BLE (scan + pick), the correction (scale % / offset W), the advertised
-name, and toggles: save log (CSV), simulation mode (a synthetic trainer, no hardware), ANT+ output + its
-device id.
+1. Install and open the app. Turn **App active** on; keep **Trainer enabled** on — it connects to the
+   trainer and the tiles show corrected power.
+2. Press **Broadcast**. The phone now advertises the mirrored trainer over Bluetooth. In your training app
+   (e.g. Bestcycling) pair the trainer as usual — it works exactly as before, but records corrected power,
+   and you can control it (ERG / resistance) normally.
+3. **For a Garmin over ANT+** (optional): plug in an ANT USB dongle (with the ANT Radio Service installed),
+   enable **ANT+ output** in Config, and pair the trainer on the Garmin. Give the phone and a Karoo
+   different ANT+ ids (in Config) if you run both, so they don't collide.
+4. Keep the phone exempt from battery optimisation (the app asks once) so it keeps running screen-off.
 
-## Building
+---
 
-Requires **JDK 17** (Gradle itself must run on 17):
+## Configuration
+
+Open **Configuración** from the Monitor:
+
+- **Correction** — `corrected = raw × (1 + scale%/100) + offset`. Enter the scale (%) and offset (W) from
+  your calibration.
+- **Trainer (BLE)** — scan and pick your trainer to pair it.
+- **Advertised name** — the name apps see (defaults to match the trainer so it's recognised).
+- **Options** — save diagnostic log (CSV), simulation mode (a fake trainer for testing with no hardware),
+  ANT+ output + its device id.
+
+---
+
+## Building (developers)
+
+Requires **JDK 17**, and a GitHub token to fetch `karoo-ext` from GitHub Packages (put `gpr.user` /
+`gpr.key` — a PAT with `read:packages` — in `local.properties`).
 
 ```bash
 export JAVA_HOME="$(/usr/libexec/java_home -v 17)"
@@ -88,25 +98,18 @@ export JAVA_HOME="$(/usr/libexec/java_home -v 17)"
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-The raw ANT channel API comes from `app/libs/android_antlib_4-16-0.aar` (TX-only; the trainer itself is
-read over BLE).
+The single APK runs on both a phone and a Karoo. On a phone the Karoo virtual sensor is simply inert (the
+Karoo system never binds the extension). Diagnostics: enable the log toggle, then
+`adb pull /sdcard/Android/data/com.enderthor.trainerbridgeble/files/trainerbridgeble.csv`.
 
-## Diagnostics
-
-Enable the log toggle in Config to write `trainerbridgeble.csv` to the app's external files dir:
-
-```bash
-adb pull /sdcard/Android/data/com.enderthor.trainerbridgeble/files/trainerbridgeble.csv
-```
-
-It records the advertising blueprint, GATT profile, notifications/relays (power corrected), control writes,
-ANT open/transmit state, and reconnection events.
+---
 
 ## Notes & limitations
 
-- **Simulation mode** feeds a synthetic trainer through the whole pipeline so the UI, correction, mirror and
-  ANT output can be exercised with no hardware.
-- **BLE to a Garmin watch**: a Fenix discovers sensors by service UUID (which the mirror advertises), but
-  Android cannot set the advertising *Appearance* and uses a rotating random address — either can stop a
-  picky watch from listing the BLE mirror. The reliable path to a Garmin is the **ANT+ FE-C** output.
-- The app is currently Spanish-only in the UI.
+- **Simulation mode** feeds a synthetic trainer through the whole pipeline (UI, correction, mirror, ANT+,
+  virtual sensor) with no hardware — useful for testing.
+- **A Garmin watch over Bluetooth**: watches discover sensors by service UUID (which the mirror
+  advertises), but Android can't set the advertising *Appearance* and uses a rotating random address —
+  either can stop a picky watch from listing the Bluetooth mirror. The reliable path to a Garmin is the
+  **ANT+** output; on a Karoo, the native **virtual sensor**.
+- The UI is bilingual (English / Spanish), following the device language.
