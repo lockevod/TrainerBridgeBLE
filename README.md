@@ -87,23 +87,6 @@ Open **Configuración** from the Monitor:
 
 ---
 
-## Building (developers)
-
-Requires **JDK 17**, and a GitHub token to fetch `karoo-ext` from GitHub Packages (put `gpr.user` /
-`gpr.key` — a PAT with `read:packages` — in `local.properties`).
-
-```bash
-export JAVA_HOME="$(/usr/libexec/java_home -v 17)"
-./gradlew :app:assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
-```
-
-The single APK runs on both a phone and a Karoo. On a phone the Karoo virtual sensor is simply inert (the
-Karoo system never binds the extension). Diagnostics: enable the log toggle, then
-`adb pull /sdcard/Android/data/com.enderthor.trainerbridgeble/files/trainerbridgeble.csv`.
-
----
-
 ## Notes & limitations
 
 - **Simulation mode** feeds a synthetic trainer through the whole pipeline (UI, correction, mirror, ANT+,
