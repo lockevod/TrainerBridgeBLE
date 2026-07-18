@@ -23,7 +23,7 @@ class MonitorActivity : Activity() {
     private lateinit var banner: TextView
     private lateinit var alertLine: TextView
     private lateinit var statusLine: TextView
-    private lateinit var controlLine: TextView
+    private lateinit var controlTile: TextView
     private lateinit var powerTile: TextView
     private lateinit var correctedTile: TextView
     private lateinit var speedTile: TextView
@@ -57,6 +57,7 @@ class MonitorActivity : Activity() {
         body.addView(startBtn)
 
         val mon = card("")   // no title — the data sits at the top of the card
+        mon.setPadding(dp(18), dp(8), dp(18), dp(16))   // less top padding so the status banner sits up top
         banner = TextView(this).apply {
             text = "Detenido"; setTextColor(0xFFFFFFFF.toInt()); typeface = android.graphics.Typeface.DEFAULT_BOLD
             gravity = android.view.Gravity.CENTER; background = rounded(Palette.MUTED); setPadding(dp(12), dp(12), dp(12), dp(12))
@@ -75,8 +76,9 @@ class MonitorActivity : Activity() {
         cadenceTile = tile(row2, "Cadencia (rpm)", Palette.TEXT)
         val row3 = tileRow(); mon.addView(row3)
         resistTile = tile(row3, "Resistencia", Palette.OK)
-        tile(row3, "", Palette.MUTED).apply { visibility = TextView.INVISIBLE }   // spacer to keep width
-        controlLine = bodyText("App → trainer: —", 14f); mon.addView(controlLine)
+        controlTile = tile(row3, "App → trainer", Palette.MUTED).apply {   // fills the box right of resistance
+            maxLines = 1; setAutoSizeTextTypeUniformWithConfiguration(10, 20, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
+        }
 
         val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         downBtn = tileButton("Resistencia ▼") { service?.buttonDown() }
@@ -84,7 +86,8 @@ class MonitorActivity : Activity() {
         btnRow.addView(downBtn); btnRow.addView(upBtn); mon.addView(btnRow)
         body.addView(mon)
 
-        body.addView(plainButton("Configuración") { startActivity(Intent(this, ConfigActivity::class.java)) })
+        body.addView(plainButton("Configuración") { startActivity(Intent(this, ConfigActivity::class.java)) }
+            .apply { background = rounded(Palette.CARD_BG) })   // white so it stands out from the page bg
 
         setContentView(ScrollView(this).apply { setBackgroundColor(Palette.PAGE_BG); addView(body) })
         ensurePermissions()
@@ -147,7 +150,7 @@ class MonitorActivity : Activity() {
         speedTile.text = if (show) s?.lastSpeedKmh?.let { String.format("%.1f", it) } ?: "—" else "—"
         cadenceTile.text = if (show) s?.lastCadence?.toString() ?: "—" else "—"
         resistTile.text = if (running) s?.resistance?.toString() ?: "—" else "—"
-        controlLine.text = "App → trainer: " + (s?.lastControl ?: "—")
+        controlTile.text = s?.lastControl ?: "—"
         upBtn.isEnabled = running; downBtn.isEnabled = running
         upBtn.alpha = if (running) 1f else 0.4f; downBtn.alpha = if (running) 1f else 0.4f
     }

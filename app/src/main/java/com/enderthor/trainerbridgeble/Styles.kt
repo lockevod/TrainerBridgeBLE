@@ -72,7 +72,7 @@ fun Activity.tileRow() = LinearLayout(this).apply { orientation = LinearLayout.H
 /** A value/label tile inside a [tileRow]; returns the value TextView to update. */
 fun Activity.tile(row: LinearLayout, label: String, valueColor: Int): TextView {
     val col = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL; background = rounded(Palette.PAGE_BG); setPadding(dp(6), dp(12), dp(6), dp(12)); gravity = Gravity.CENTER
+        orientation = LinearLayout.VERTICAL; background = rounded(Palette.PAGE_BG); setPadding(dp(6), dp(8), dp(6), dp(8)); gravity = Gravity.CENTER
         val lp = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f); lp.setMargins(dp(3), 0, dp(3), 0); layoutParams = lp
     }
     val value = TextView(this).apply { text = "—"; textSize = 22f; setTextColor(valueColor); typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER }
