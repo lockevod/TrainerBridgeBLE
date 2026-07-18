@@ -1,10 +1,14 @@
 package com.enderthor.trainerbridgeble.ant
 
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.os.IBinder
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.dsi.ant.AntService
 import com.dsi.ant.channel.AntChannel
 import com.dsi.ant.channel.AntChannelProvider
@@ -62,7 +66,18 @@ class RawAntLink(
     @Volatile private var antService: AntService? = null
     @Volatile private var channel: AntChannel? = null
     @Volatile private var stopped = false
-    @Volatile private var noChannelStreak = 0   // consecutive "no channel available" acquires → trigger a rebind
+
+    /** The ANT Radio Service broadcasts this when its free-channel count changes. When a channel frees up
+     *  and we have none, retry open() at once — the correct way to wait out a busy pool on the Karoo
+     *  (whose ANT channels are shared with its own sensors), instead of rebinding the shared service. */
+    private val providerReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, intent: Intent?) {
+            if (intent?.action != AntChannelProvider.ACTION_CHANNEL_PROVIDER_STATE_CHANGED) return
+            val n = intent.getIntExtra(AntChannelProvider.NUM_CHANNELS_AVAILABLE, 0)
+            if (n > 0 && !stopped && channel == null && !opening.get()) scope.launch { open() }
+        }
+    }
+    @Volatile private var providerRegistered = false
 
     /** The current open channel, or null if none (mid-reopen / not started). Read-only, for a
      *  bidirectional slave to send acknowledged control data from its own thread; tolerates null. */
@@ -96,6 +111,11 @@ class RawAntLink(
 
     fun start() {
         startHeartbeat()
+        runCatching {
+            ContextCompat.registerReceiver(context, providerReceiver,
+                IntentFilter(AntChannelProvider.ACTION_CHANNEL_PROVIDER_STATE_CHANGED), ContextCompat.RECEIVER_EXPORTED)
+            providerRegistered = true
+        }
         val ok = runCatching { AntService.bindService(context, conn) }.getOrDefault(false)
         if (!ok) { onState(false, "no se pudo enlazar el ANT Radio Service"); scheduleReopen("bindService returned false") }
     }
@@ -124,6 +144,10 @@ class RawAntLink(
         if (stopped) return
         if (!opening.compareAndSet(false, true)) return
         try {
+            // Already have a healthy channel — never acquire a duplicate. The pre-launch channel==null
+            // check in the callers (providerReceiver, backstop) is stale by the time this coroutine runs;
+            // two rapid provider broadcasts could otherwise both pass it and orphan the first channel.
+            if (channel != null) return
             runCatching {
                 val provider: AntChannelProvider = antService?.channelProvider
                     ?: throw IllegalStateException("ANT channelProvider not ready")
@@ -161,7 +185,6 @@ class RawAntLink(
                 configure(ch)
                 if (stopped) { if (channel === ch) channel = null; releaseChannel(ch); return }
                 ch.open()
-                noChannelStreak = 0
                 Log.d(tag, "channel open")
                 FileLog.event("$tag opened")   // diagnostic: which channels actually acquire+open
                 onState(true, "transmitiendo")
@@ -172,13 +195,14 @@ class RawAntLink(
                 val dead = channel; channel = null; releaseChannel(dead)
                 when (e) {
                     is ChannelNotAvailableException -> {
-                        // getNumChannelsAvailable can report free channels while acquire still fails — a
-                        // sign the ANT service is holding stale/leaked channels for us. After a few such
-                        // failures, REBIND the service: unbinding makes it reclaim this client's channels.
-                        Log.w(tag, "no ANT channel available; retrying")
-                        onState(false, "sin canal ANT (¿dongle conectado?)")
-                        if (++noChannelStreak >= REBIND_AFTER_NO_CHANNEL) { noChannelStreak = 0; forceRebind("reclaim stuck channels") }
-                        else scheduleReopen("no channel available")
+                        // All ANT channels busy (on the Karoo: its own paired sensors + others). Do NOT
+                        // rebind the ANT service — it's a shared SYSTEM service there, and unbinding it just
+                        // wedges ("rebind connect timeout") and makes it worse. Wait for a channel to free:
+                        // providerReceiver retries the instant one does, plus a long backstop here. (KPower
+                        // model — the only thing that behaves on the Karoo.)
+                        Log.w(tag, "no ANT channel available; awaiting a free channel")
+                        onState(false, "sin canal ANT libre")
+                        scope.launch { delay(NO_CHANNEL_RETRY_MS); if (!stopped && channel == null && !opening.get()) open() }
                     }
                     else -> { Log.e(tag, "open failed: ${e.message}"); onState(false, e.message ?: "fallo ANT"); scheduleReopen(e.message ?: "open failure") }
                 }
@@ -205,27 +229,6 @@ class RawAntLink(
         }
     }
 
-    /** Unbind + rebind the ANT service so it reclaims channels this client leaked/holds, then re-acquire.
-     *  This is what a physical dongle replug did by hand. onServiceConnected re-runs open() after rebind. */
-    private fun forceRebind(reason: String) {
-        if (stopped) return
-        Log.w(tag, "force rebind: $reason")
-        FileLog.event("$tag rebind: $reason")
-        scope.launch {
-            val dead = channel; channel = null; antService = null   // release any live channel before unbinding
-            releaseChannel(dead)                                     // (else unbinding orphans the handle)
-            runCatching { context.unbindService(conn) }
-            delay(REOPEN_DELAY_MS)
-            if (stopped) return@launch
-            val ok = runCatching { AntService.bindService(context, conn) }.getOrDefault(false)
-            if (!ok) { scheduleReopen("rebind failed"); return@launch }
-            // Safety net: onServiceConnected drives re-open. If it never fires (service wedged), don't stall
-            // forever — fall back to the retry loop, whose antService==null branch keeps rebinding on a timer.
-            delay(REBIND_CONNECT_TIMEOUT_MS)
-            if (!stopped && antService == null) scheduleReopen("rebind connect timeout")
-        }
-    }
-
     /** Idempotent: close/unassign/release [ch] at most once, ever (a stop()/configure() race would
      *  otherwise double-release the same handle and corrupt the provider's free-channel accounting). */
     private fun releaseChannel(ch: AntChannel?) {
@@ -245,6 +248,7 @@ class RawAntLink(
 
     fun stop() {
         stopped = true
+        if (providerRegistered) { runCatching { context.unregisterReceiver(providerReceiver) }; providerRegistered = false }
         scope.launch {
             val ch = channel; channel = null
             releaseChannel(ch)
@@ -257,7 +261,6 @@ class RawAntLink(
         const val HEARTBEAT_CHECK_MS = 7_000L
         const val HEARTBEAT_TIMEOUT_MS = 15_000L // recycle a tracking-but-silent channel this long (RF loss);
                                                  // lower than before so a lost trainer recovers in ~15s not ~30s
-        const val REBIND_AFTER_NO_CHANNEL = 3    // consecutive acquire failures before rebinding the service
-        const val REBIND_CONNECT_TIMEOUT_MS = 5000L // after a rebind, fall back to the retry loop if not reconnected
+        const val NO_CHANNEL_RETRY_MS = 15_000L  // backstop retry when all ANT channels are busy (providerReceiver retries sooner)
     }
 }

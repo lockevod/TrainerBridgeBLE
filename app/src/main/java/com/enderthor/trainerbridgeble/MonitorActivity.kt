@@ -21,6 +21,7 @@ import android.widget.TextView
 class MonitorActivity : Activity() {
     private lateinit var config: Config
     private lateinit var banner: TextView
+    private lateinit var alertLine: TextView
     private lateinit var statusLine: TextView
     private lateinit var controlLine: TextView
     private lateinit var powerTile: TextView
@@ -64,6 +65,7 @@ class MonitorActivity : Activity() {
             val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, WRAP_CONTENT); lp.setMargins(0, 0, 0, dp(8)); layoutParams = lp
         }
         mon.addView(banner)
+        alertLine = bodyText("", 13f, Palette.DANGER).apply { visibility = TextView.GONE }; mon.addView(alertLine)
         statusLine = bodyText("parado", 14f); mon.addView(statusLine)
         val row1 = tileRow(); mon.addView(row1)
         powerTile = tile(row1, "Potencia (W)", Palette.TEXT)
@@ -72,7 +74,7 @@ class MonitorActivity : Activity() {
         speedTile = tile(row2, "Velocidad (km/h)", Palette.TEXT)
         cadenceTile = tile(row2, "Cadencia (rpm)", Palette.TEXT)
         val row3 = tileRow(); mon.addView(row3)
-        resistTile = tile(row3, "Resistencia (%)", Palette.OK)
+        resistTile = tile(row3, "Resistencia", Palette.OK)
         tile(row3, "", Palette.MUTED).apply { visibility = TextView.INVISIBLE }   // spacer to keep width
         controlLine = bodyText("App → trainer: —", 14f); mon.addView(controlLine)
 
@@ -124,16 +126,19 @@ class MonitorActivity : Activity() {
         // Fresh = a sample arrived within the last 3s. A brief (<3s) blip keeps showing the last value
         // (the mirror is re-emitting it too); a longer gap blanks the tiles to "—".
         val fresh = s != null && s.lastSampleMs != 0L && System.currentTimeMillis() - s.lastSampleMs <= STALE_MS
-        val alert = s?.alert
+        // Banner shows the TRAINER link, always — never hidden by an ANT/BLE problem.
         val (bText, bColor) = when {
             !running -> "Detenido" to Palette.MUTED
-            alert != null -> "⚠ $alert" to Palette.DANGER
             s?.zycleConnected != true -> "Buscando trainer…" to Palette.ACCENT
             !fresh -> "Trainer conectado · sin datos" to Palette.DANGER
             else -> "Trainer conectado ✓" to Palette.OK
         }
-        banner.text = bText + (if (config.antOutputEnabled) "   ·   ANT+ Garmin" else "") + (if (s?.isSimulating == true) "   ·   SIM" else "")
+        banner.text = bText + (if (s?.isSimulating == true) "   ·   SIM" else "")
         banner.background = rounded(bColor)
+        // ANT/BLE problems go on their OWN line, so they don't mask the trainer state.
+        val alert = if (running) s?.alert else null
+        if (alert != null) { alertLine.visibility = TextView.VISIBLE; alertLine.text = "⚠ $alert" }
+        else alertLine.visibility = TextView.GONE
         statusLine.text = s?.status ?: "parado"
         statusLine.setTextColor(if (s?.zycleConnected == true) Palette.OK else Palette.MUTED)
         val show = running && fresh

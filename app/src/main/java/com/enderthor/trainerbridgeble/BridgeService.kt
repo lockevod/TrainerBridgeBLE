@@ -57,7 +57,7 @@ class BridgeService : Service() {
     val alert: String? get() = when {
         !isRunning -> null
         !bleAdvOk -> "BLE no anuncia"
-        antEnabled && !antOk -> "ANT+ sin señal (¿dongle?)"
+        antEnabled && !antOk -> "ANT+ sin canal" + (if (antStatus.isNotBlank()) " ($antStatus)" else "")
         else -> null
     }
 
