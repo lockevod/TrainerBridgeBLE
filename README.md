@@ -1,6 +1,6 @@
 # TrainerBridge BLE
 
-Corrects the power your Zycle smart trainer reports and makes the **corrected** value available to your
+Corrects the power your smart trainer (or bike) reports and makes the **corrected** value available to your
 apps and head units. It sits between the trainer and everything else, applies a linear calibration to
 power, and passes everything else through untouched.
 
