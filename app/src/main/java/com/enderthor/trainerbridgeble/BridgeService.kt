@@ -22,7 +22,7 @@ import com.enderthor.trainerbridgeble.ble.ZycleClient
 
 /**
  * Foreground service split into two independently-controlled halves under a master switch:
- *  - RECEIVE (always-on while master && (trainerEnabled || simulate)): a [ZycleClient]/[SimSource] central
+ *  - RECEIVE (always-on while master): a [ZycleClient]/[SimSource] central
  *    to the trainer, feeding [CorrectedFeed] + the monitor tiles + optional ANT output.
  *  - EMIT (Start-gated): a [MirrorServer] peripheral to the apps (Bestcycling + Garmin) that clones the
  *    trainer's GATT and corrects power; app control writes relay back to the trainer via the receive central.
@@ -101,8 +101,6 @@ class BridgeService : Service() {
                 foreground = false
                 ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf()
             }
-            ACTION_TRAINER_ENABLE -> maybeStartReceive()
-            ACTION_TRAINER_DISABLE -> { if (!Config(this).simulate) stopReceive() }   // sim always receives
             ACTION_EMIT_START -> { if (foreground) startEmit() }   // never emit from a non-foreground (master-off) service
             ACTION_EMIT_STOP -> stopEmit()
             else -> {
@@ -134,7 +132,7 @@ class BridgeService : Service() {
 
     private fun maybeStartReceive() {
         val config = Config(this)
-        if (config.masterEnabled && (config.trainerEnabled || config.simulate) && client == null && simSource == null) startReceive()
+        if (config.masterEnabled && client == null && simSource == null) startReceive()
     }
 
     // ── receive half (trainer link → CorrectedFeed + tiles + ANT) ─────────────────────────────────────
@@ -290,8 +288,6 @@ class BridgeService : Service() {
         private const val NOTIF_ID = 1
         const val ACTION_MASTER_ON = "com.enderthor.trainerbridgeble.MASTER_ON"
         const val ACTION_MASTER_OFF = "com.enderthor.trainerbridgeble.MASTER_OFF"
-        const val ACTION_TRAINER_ENABLE = "com.enderthor.trainerbridgeble.TRAINER_ENABLE"
-        const val ACTION_TRAINER_DISABLE = "com.enderthor.trainerbridgeble.TRAINER_DISABLE"
         const val ACTION_EMIT_START = "com.enderthor.trainerbridgeble.EMIT_START"
         const val ACTION_EMIT_STOP = "com.enderthor.trainerbridgeble.EMIT_STOP"
 
@@ -302,10 +298,6 @@ class BridgeService : Service() {
         fun setMaster(context: android.content.Context, on: Boolean) =
             if (on) { context.startForegroundService(intent(context, ACTION_MASTER_ON)); Unit }
             else { context.startService(intent(context, ACTION_MASTER_OFF)); Unit }
-
-        fun setTrainerEnabled(context: android.content.Context, on: Boolean) {
-            context.startService(intent(context, if (on) ACTION_TRAINER_ENABLE else ACTION_TRAINER_DISABLE))
-        }
 
         fun startEmit(context: android.content.Context) { context.startService(intent(context, ACTION_EMIT_START)) }
         fun stopEmit(context: android.content.Context) { context.startService(intent(context, ACTION_EMIT_STOP)) }

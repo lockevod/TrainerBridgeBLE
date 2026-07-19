@@ -7,7 +7,6 @@
     <string name="monitor_start">Start</string>
     <string name="monitor_stop">Stop</string>
     <string name="monitor_master">App active</string>
-    <string name="monitor_trainer_enabled">Trainer enabled</string>
     <string name="monitor_emit_start">Broadcast</string>
     <string name="monitor_emit_stop">Stop broadcast</string>
     <string name="monitor_off">Off</string>
@@ -18,11 +17,11 @@
     <string name="monitor_tile_power">Power (W)</string>
     <string name="monitor_tile_corrected">Corrected (W)</string>
     <string name="monitor_tile_speed">Speed (km/h)</string>
-    <string name="monitor_tile_cadence">Cadence (rpm)</string>
+    <string name="monitor_tile_cadence">Cadence</string>
     <string name="monitor_tile_resistance">Resistance</string>
     <string name="monitor_tile_control">App → trainer</string>
-    <string name="monitor_resistance_down">Resistance ▼</string>
-    <string name="monitor_resistance_up">Resistance ▲</string>
+    <string name="monitor_resistance_down">▼</string>
+    <string name="monitor_resistance_up">▲</string>
     <string name="alert_prefix">⚠ %s</string>
 
     <!-- Config -->

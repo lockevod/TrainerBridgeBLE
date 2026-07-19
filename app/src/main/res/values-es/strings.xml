@@ -7,7 +7,6 @@
     <string name="monitor_start">Start</string>
     <string name="monitor_stop">Stop</string>
     <string name="monitor_master">App activa</string>
-    <string name="monitor_trainer_enabled">Bici habilitada</string>
     <string name="monitor_emit_start">Emitir</string>
     <string name="monitor_emit_stop">Dejar de emitir</string>
     <string name="monitor_off">Apagada</string>
@@ -18,11 +17,11 @@
     <string name="monitor_tile_power">Potencia (W)</string>
     <string name="monitor_tile_corrected">Corregida (W)</string>
     <string name="monitor_tile_speed">Velocidad (km/h)</string>
-    <string name="monitor_tile_cadence">Cadencia (rpm)</string>
+    <string name="monitor_tile_cadence">Cadencia</string>
     <string name="monitor_tile_resistance">Resistencia</string>
     <string name="monitor_tile_control">App → trainer</string>
-    <string name="monitor_resistance_down">Resistencia ▼</string>
-    <string name="monitor_resistance_up">Resistencia ▲</string>
+    <string name="monitor_resistance_down">▼</string>
+    <string name="monitor_resistance_up">▲</string>
     <string name="alert_prefix">⚠ %s</string>
 
     <!-- Config -->

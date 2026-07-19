@@ -12,7 +12,6 @@ import android.os.Bundle
 import android.os.IBinder
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.Button
-import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -30,8 +29,7 @@ class MonitorActivity : Activity() {
     private lateinit var speedTile: TextView
     private lateinit var cadenceTile: TextView
     private lateinit var resistTile: TextView
-    private lateinit var masterSwitch: CheckBox
-    private lateinit var trainerSwitch: CheckBox
+    private lateinit var masterSwitch: android.widget.Switch
     private lateinit var startBtn: Button
     private lateinit var upBtn: Button
     private lateinit var downBtn: Button
@@ -52,16 +50,10 @@ class MonitorActivity : Activity() {
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(Palette.PAGE_BG); setPadding(dp(16), dp(6), dp(16), dp(16))
         }
-        // Master switch at the very top — gates everything. Below it the trainer-enable toggle (receive side)
-        // and the Broadcast button (emit side). No in-content title: the system title bar already names the app.
-        masterSwitch = check(getString(R.string.monitor_master), config.masterEnabled).apply {
+        // Master switch (created here, added near the bottom above Configuration to keep the 6 tiles visible).
+        masterSwitch = switchRow(getString(R.string.monitor_master), config.masterEnabled).apply {
             setOnCheckedChangeListener { _, isChecked -> config.masterEnabled = isChecked; BridgeService.setMaster(this@MonitorActivity, isChecked); render() }
         }
-        body.addView(masterSwitch)
-        trainerSwitch = check(getString(R.string.monitor_trainer_enabled), config.trainerEnabled).apply {
-            setOnCheckedChangeListener { _, isChecked -> config.trainerEnabled = isChecked; BridgeService.setTrainerEnabled(this@MonitorActivity, isChecked) }
-        }
-        body.addView(trainerSwitch)
         startBtn = accentButton(getString(R.string.monitor_emit_start)) { onStartStop() }.apply {
             (layoutParams as LinearLayout.LayoutParams).setMargins(0, dp(10), 0, dp(10))   // gap above and before the status card
         }
@@ -86,17 +78,21 @@ class MonitorActivity : Activity() {
         speedTile = tile(row2, getString(R.string.monitor_tile_speed), Palette.TEXT)
         cadenceTile = tile(row2, getString(R.string.monitor_tile_cadence), Palette.TEXT)
         val row3 = tileRow(); mon.addView(row3)
-        resistTile = tile(row3, getString(R.string.monitor_tile_resistance), Palette.OK)
+        resistTile = tile(row3, "", Palette.OK)   // label lives in the caption above the ▼▲ arrows
         controlTile = tile(row3, getString(R.string.monitor_tile_control), Palette.MUTED).apply {   // fills the box right of resistance
             maxLines = 1; setAutoSizeTextTypeUniformWithConfiguration(10, 20, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
         }
 
+        mon.addView(bodyText(getString(R.string.monitor_tile_resistance), 12f, Palette.MUTED).apply {
+            gravity = android.view.Gravity.CENTER; setPadding(0, dp(2), 0, 0)   // caption above the ▼▲ arrows
+        })
         val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         downBtn = tileButton(getString(R.string.monitor_resistance_down)) { service?.buttonDown() }
         upBtn = tileButton(getString(R.string.monitor_resistance_up)) { service?.buttonUp() }
         btnRow.addView(downBtn); btnRow.addView(upBtn); mon.addView(btnRow)
         body.addView(mon)
 
+        body.addView(masterSwitch.tag as android.view.View)
         body.addView(plainButton(getString(R.string.config_title)) { startActivity(Intent(this, ConfigActivity::class.java)) }
             .apply { background = rounded(Palette.CARD_BG) })   // white so it stands out from the page bg
 
@@ -144,7 +140,6 @@ class MonitorActivity : Activity() {
         startBtn.text = if (emitting) getString(R.string.monitor_emit_stop) else getString(R.string.monitor_emit_start)
         val canEmit = master && s?.receiving == true   // broadcasting an un-fed mirror is pointless
         startBtn.isEnabled = canEmit; startBtn.alpha = if (canEmit) 1f else 0.4f
-        trainerSwitch.isEnabled = master; trainerSwitch.alpha = if (master) 1f else 0.4f   // per-trainer toggle only matters when the app is on
         // Fresh = a sample arrived within the last 3s. A brief (<3s) blip keeps showing the last value
         // (the mirror is re-emitting it too); a longer gap blanks the tiles to "—".
         val fresh = s != null && s.lastSampleMs != 0L && System.currentTimeMillis() - s.lastSampleMs <= STALE_MS
@@ -176,7 +171,7 @@ class MonitorActivity : Activity() {
     }
 
     private fun tileButton(text: String, onClick: () -> Unit) = Button(this).apply {
-        this.text = text; setTextColor(Palette.ACCENT); background = rounded(Palette.PAGE_BG); setPadding(dp(10), dp(10), dp(10), dp(10))
+        this.text = text; setTextColor(Palette.ACCENT); background = rounded(Palette.PAGE_BG); textSize = 18f; setPadding(dp(10), dp(8), dp(10), dp(8))
         val lp = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f); lp.setMargins(dp(3), dp(8), dp(3), 0); layoutParams = lp
         setOnClickListener { onClick() }
     }

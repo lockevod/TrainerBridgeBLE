@@ -11,6 +11,7 @@ import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.Switch
 import android.widget.TextView
 
 /** Shared card-based UI palette + view helpers (same look as the ANT app), used by both activities. */
@@ -53,6 +54,23 @@ fun Activity.textField(value: String) = EditText(this).apply {
 
 fun Activity.check(text: String, on: Boolean) = CheckBox(this).apply {
     this.text = text; isChecked = on; setTextColor(Palette.TEXT); setPadding(0, dp(6), 0, 0)
+}
+
+/** A card-styled on/off row: bold label left, [Switch] right, on a rounded white card. Returns the Switch. */
+fun Activity.switchRow(label: String, on: Boolean): Switch {
+    val sw = Switch(this).apply { isChecked = on }
+    val row = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+        background = rounded(Palette.CARD_BG); setPadding(dp(18), dp(12), dp(14), dp(12))
+        val lp = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT); lp.setMargins(0, dp(8), 0, 0); layoutParams = lp
+        addView(TextView(this@switchRow).apply {
+            text = label; textSize = 16f; setTextColor(Palette.TEXT); typeface = Typeface.DEFAULT_BOLD
+            layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+        })
+        addView(sw)
+    }
+    sw.setTag(row)   // caller adds the row (sw.tag) to the layout; the Switch stays the state/listener handle
+    return sw
 }
 
 fun Activity.accentButton(text: String, onClick: () -> Unit) = Button(this).apply {
