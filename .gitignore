@@ -8,7 +8,3 @@
 .externalNativeBuild
 .cxx
 /app/build/
-/graphify-out/
-/.serena/
-/.neuralmind/
-/CLAUDE.md
