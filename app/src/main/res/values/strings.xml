@@ -30,6 +30,7 @@
     <string name="config_formula">corrected = raw × (1 + scale%/100) + offset   ·   raw 0 → 0</string>
     <string name="config_scale_label">Scale adjustment (%, integer)</string>
     <string name="config_offset_label">Offset (W, integer)</string>
+    <string name="config_floor_label">ERG floor (W, 0 = off): below this target, don\'t drop the command lower</string>
     <string name="config_save_correction">Save correction</string>
     <string name="config_saved">Saved</string>
     <string name="config_bike">Bike (BLE)</string>

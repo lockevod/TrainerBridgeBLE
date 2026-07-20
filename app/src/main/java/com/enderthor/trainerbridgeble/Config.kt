@@ -17,6 +17,12 @@ class Config(context: Context) {
         get() = p.getInt(KEY_OFFSET, 0)
         set(v) = p.edit().putInt(KEY_OFFSET, v).apply()
 
+    /** ERG floor: below this target (W) the inverse correction is skipped and the target passes through
+     *  unchanged. 0 = always invert. Avoids over-correcting low recovery/warmup targets. */
+    var invertFloorW: Int
+        get() = p.getInt(KEY_INVERT_FLOOR, 50)
+        set(v) = p.edit().putInt(KEY_INVERT_FLOOR, v).apply()
+
     /** Name prefix used to find the trainer over BLE when no specific device is paired. */
     var namePrefix: String
         get() = p.getString(KEY_PREFIX, "Zycle") ?: "Zycle"
@@ -67,12 +73,13 @@ class Config(context: Context) {
     /** LIVE correction from the current scale/offset. */
     fun correction(): PowerCorrection {
         val mult = 1.0 + scaleAdjustPercent / 100.0
-        return PowerCorrection(if (mult > 0.0) mult else 1.0, offsetW.toDouble())
+        return PowerCorrection(if (mult > 0.0) mult else 1.0, offsetW.toDouble(), invertFloorW)
     }
 
     private companion object {
         const val KEY_SCALE = "scaleAdjustPct"
         const val KEY_OFFSET = "offsetW"
+        const val KEY_INVERT_FLOOR = "invertFloorW"
         const val KEY_PREFIX = "namePrefix"
         const val KEY_ADDR = "pairedAddress"
         const val KEY_NAME = "pairedName"

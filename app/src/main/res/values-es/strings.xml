@@ -30,6 +30,7 @@
     <string name="config_formula">corregida = cruda × (1 + escala%/100) + offset   ·   cruda 0 → 0</string>
     <string name="config_scale_label">Ajuste de escala (%, entero)</string>
     <string name="config_offset_label">Offset (W, entero)</string>
+    <string name="config_floor_label">Suelo ERG (W, 0 = off): por debajo de este target, no bajar más el comando</string>
     <string name="config_save_correction">Guardar corrección</string>
     <string name="config_saved">Guardado</string>
     <string name="config_bike">Bicicleta (BLE)</string>

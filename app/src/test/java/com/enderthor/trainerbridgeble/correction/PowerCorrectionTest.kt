@@ -41,6 +41,26 @@ class PowerCorrectionTest {
         assertEquals(200, c.correct(rawTarget)) // 0.95*205 + 5 = 199.75 -> 200
     }
 
+    @Test fun invertFloorHoldsRawTargetBelowFloor() {
+        val c = PowerCorrection(scale = 1.06, offset = 15.0, invertFloorW = 50)
+        val atFloor = c.invert(50)          // (50-15)/1.06 = 33.0 -> 33
+        assertEquals(33, atFloor)
+        assertEquals(atFloor, c.invert(30)) // below floor but real power -> lifted to the floor's raw target
+        assertEquals(80, c.invert(100))     // above floor -> normal inverse: (100-15)/1.06 = 80.2 -> 80
+    }
+
+    @Test fun invertNearZeroStaysZeroDespiteFloor() {
+        val c = PowerCorrection(scale = 1.06, offset = 15.0, invertFloorW = 50)
+        assertEquals(0, c.invert(0))        // stop
+        assertEquals(0, c.invert(10))       // within offset -> honest inverse <= 0 -> real 0, not lifted to floor
+        assertEquals(0, c.invert(15))       // exactly offset -> 0
+    }
+
+    @Test fun invertFloorZeroDisablesTheFloor() {
+        val c = PowerCorrection(scale = 0.95, offset = 5.0, invertFloorW = 0)
+        assertEquals(5, c.invert(10)) // (10-5)/0.95 = 5.26 -> 5, no floor applied
+    }
+
     @Test fun rejectsNonPositiveScale() {
         assertThrows(IllegalArgumentException::class.java) { PowerCorrection(scale = 0.0, offset = 0.0) }
     }

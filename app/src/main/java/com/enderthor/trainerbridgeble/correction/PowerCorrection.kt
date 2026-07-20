@@ -11,7 +11,7 @@ import kotlin.math.roundToInt
  *
  * Both clamp to >= 0 (a bike computer never records negative watts).
  */
-class PowerCorrection(private val scale: Double, private val offset: Double) {
+class PowerCorrection(private val scale: Double, private val offset: Double, private val invertFloorW: Int = 0) {
 
     init {
         require(scale > 0.0) { "scale must be > 0 (got $scale) — inverse would divide by zero / flip sign" }
@@ -34,6 +34,13 @@ class PowerCorrection(private val scale: Double, private val offset: Double) {
      */
     fun invert(targetWatts: Int): Int {
         if (targetWatts <= 0) return 0
-        return ((targetWatts - offset) / scale).roundToInt().coerceAtLeast(0)
+        val raw = ((targetWatts - offset) / scale).roundToInt()
+        // Near zero (target within the offset → honest inverse ≤ 0): the app is asking for ~nothing / a stop,
+        // so command a real 0 — never fabricate resistance here.
+        if (raw <= 0) return 0
+        // Above that, low ERG targets (recovery/warmup) over-correct downward: lift to the floor's own raw
+        // target so the command never drops below what the floor would hold. floorW = 0 → floorRaw ≤ 0 → no-op.
+        val floorRaw = ((invertFloorW - offset) / scale).roundToInt().coerceAtLeast(0)
+        return raw.coerceAtLeast(floorRaw)
     }
 }

@@ -21,6 +21,7 @@ class ConfigActivity : Activity() {
     private lateinit var config: Config
     private lateinit var scaleField: EditText
     private lateinit var offsetField: EditText
+    private lateinit var floorField: EditText
     private lateinit var nameField: EditText
     private lateinit var pairedLine: TextView
     private lateinit var scanBtn: TextView
@@ -49,6 +50,8 @@ class ConfigActivity : Activity() {
         scaleField = intField(config.scaleAdjustPercent.toString()); corr.addView(scaleField)
         corr.addView(bodyText(getString(R.string.config_offset_label), 13f))
         offsetField = intField(config.offsetW.toString()); corr.addView(offsetField)
+        corr.addView(bodyText(getString(R.string.config_floor_label), 13f))
+        floorField = intField(config.invertFloorW.toString()); corr.addView(floorField)
         corr.addView(accentButton(getString(R.string.config_save_correction)) { save(); toast(getString(R.string.config_saved)) })
         body.addView(corr)
 
@@ -92,6 +95,7 @@ class ConfigActivity : Activity() {
     private fun save() {
         scaleField.text.toString().toIntOrNull()?.let { if (it > -100) config.scaleAdjustPercent = it }
         offsetField.text.toString().toIntOrNull()?.let { config.offsetW = it }
+        floorField.text.toString().toIntOrNull()?.let { if (it >= 0) config.invertFloorW = it }
         nameField.text.toString().trim().takeIf { it.isNotEmpty() }?.let { config.advertisedName = it }
         config.loggingEnabled = logCheck.isChecked
         config.simulate = simCheck.isChecked

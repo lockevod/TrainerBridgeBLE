@@ -80,6 +80,9 @@ Open **Configuración** from the Monitor:
 
 - **Correction** — `corrected = raw × (1 + scale%/100) + offset`. Enter the scale (%) and offset (W) from
   your calibration.
+- **ERG floor (W, 0 = off)** — below this ERG target the inverse correction over-corrects downward, so the
+  command is held at the floor's raw target instead. Targets within the offset (≈ a stop) still command 0.
+  Default 50 W.
 - **Trainer (BLE)** — scan and pick your trainer to pair it.
 - **Advertised name** — the name apps see (defaults to match the trainer so it's recognised).
 - **Options** — save diagnostic log (CSV), simulation mode (a fake trainer for testing with no hardware),
