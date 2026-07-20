@@ -9,6 +9,21 @@ described below.
 
 ---
 
+## ⚠️ About the "Location" permission (it does NOT track you)
+
+> On **Android 11 and older — which includes the Karoo** — the app asks for **Location** permission. This is
+> **not** to know where you are and there is **no GPS, no tracking, and no data leaves the device**.
+>
+> It is a rule imposed by Android itself: on those versions, an app is not allowed to **scan for Bluetooth
+> devices** without the Location permission (a BLE scan could in theory reveal position from nearby beacons).
+> TrainerBridge scans for exactly one thing — **your trainer** — so it can connect to it. Nothing else.
+>
+> On **Android 12+ phones** the prompt is different: there the app asks for the **Bluetooth** permissions
+> instead (it declares `neverForLocation`), and Location is never requested. So the Location prompt only
+> appears on the Karoo and older phones, and it is safe to grant.
+
+---
+
 ## What it does
 
 The app connects to your trainer over Bluetooth (as the "receiver") and can then make the corrected data
