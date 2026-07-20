@@ -61,6 +61,16 @@ class PowerCorrectionTest {
         assertEquals(5, c.invert(10)) // (10-5)/0.95 = 5.26 -> 5, no floor applied
     }
 
+    @Test fun invertFloorInertWithoutOffset() {
+        // Fresh install / no correction: identity map, the floor must NOT fabricate resistance.
+        val c = PowerCorrection(scale = 1.0, offset = 0.0, invertFloorW = 50)
+        assertEquals(40, c.invert(40))
+        assertEquals(10, c.invert(10))
+        // Even a scale-only correction (offset 0) has no collapse to protect against -> floor stays inert.
+        val s = PowerCorrection(scale = 1.06, offset = 0.0, invertFloorW = 50)
+        assertEquals(38, s.invert(40)) // 40/1.06 = 37.7 -> 38, not lifted to invert(50)=47
+    }
+
     @Test fun rejectsNonPositiveScale() {
         assertThrows(IllegalArgumentException::class.java) { PowerCorrection(scale = 0.0, offset = 0.0) }
     }

@@ -38,9 +38,11 @@ class PowerCorrection(private val scale: Double, private val offset: Double, pri
         // Near zero (target within the offset → honest inverse ≤ 0): the app is asking for ~nothing / a stop,
         // so command a real 0 — never fabricate resistance here.
         if (raw <= 0) return 0
-        // Above that, low ERG targets (recovery/warmup) over-correct downward: lift to the floor's own raw
-        // target so the command never drops below what the floor would hold. floorW = 0 → floorRaw ≤ 0 → no-op.
-        val floorRaw = ((invertFloorW - offset) / scale).roundToInt().coerceAtLeast(0)
+        // Above that, hold a minimum: lift low ERG targets to the floor's own raw target. This only makes
+        // sense when a POSITIVE offset pulls low targets down — with offset ≤ 0 the inverse is already a clean
+        // proportional map (no collapse), so a floor would just fabricate resistance (e.g. a fresh install with
+        // no correction must NOT turn a 40 W target into 50 W). offset ≤ 0 → floorRaw 0 → no-op.
+        val floorRaw = if (offset > 0) ((invertFloorW - offset) / scale).roundToInt().coerceAtLeast(0) else 0
         return raw.coerceAtLeast(floorRaw)
     }
 }
