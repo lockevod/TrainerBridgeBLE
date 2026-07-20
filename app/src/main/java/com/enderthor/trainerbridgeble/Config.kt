@@ -57,7 +57,7 @@ class Config(context: Context) {
     /** Re-broadcast the corrected power over ANT+ (needs an ANT USB dongle) so a Garmin head unit that
      *  pairs sensors over ANT+ gets the corrected value. */
     var antOutputEnabled: Boolean
-        get() = p.getBoolean(KEY_ANT, false)
+        get() = p.getBoolean(KEY_ANT, true)
         set(v) = p.edit().putBoolean(KEY_ANT, v).apply()
 
     /** ANT+ device number our FE-C broadcasts on (what the head unit pairs). Configurable so the phone and
@@ -68,7 +68,7 @@ class Config(context: Context) {
 
     /** Master switch: the whole app on/off. false = fully shut down, zero consumption. */
     var masterEnabled: Boolean
-        get() = p.getBoolean(KEY_MASTER, false)
+        get() = p.getBoolean(KEY_MASTER, true)
         set(v) = p.edit().putBoolean(KEY_MASTER, v).apply()
 
     /** LIVE correction from the current scale/offset. */

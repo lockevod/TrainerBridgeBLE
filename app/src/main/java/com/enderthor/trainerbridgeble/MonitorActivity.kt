@@ -185,4 +185,15 @@ class MonitorActivity : Activity() {
         val missing = needed.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 1)
     }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        // Fresh install: master defaults ON, but onStart's setMaster ran before these were granted (the BLE
+        // scan silently no-op'd on SecurityException). Re-assert once granted so it starts receiving without
+        // needing an app reopen.
+        if (requestCode == 1 && grantResults.isNotEmpty() &&
+            grantResults.all { it == PackageManager.PERMISSION_GRANTED } && config.masterEnabled) {
+            BridgeService.setMaster(this, true); render()
+        }
+    }
 }
