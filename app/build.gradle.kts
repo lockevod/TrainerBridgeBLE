@@ -11,13 +11,16 @@ android {
         applicationId = "com.enderthor.trainerbridgeble"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 20260720
+        versionName = "0.9"
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            // Sign with the debug key so sideload/OTA installs on the Karoo aren't rejected as unsigned.
+            // ponytail: fine for a community sideload; swap for a real release key if it ever ships to a store.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 

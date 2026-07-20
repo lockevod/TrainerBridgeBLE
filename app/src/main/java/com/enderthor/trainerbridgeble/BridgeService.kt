@@ -118,8 +118,10 @@ class BridgeService : Service() {
         createChannel()
         FileLog.init(this); FileLog.enabled = Config(this).loggingEnabled
         try {
+            // connectedDevice only: dataSync would add a ~6h/24h cumulative FGS timeout on Android 14+ that
+            // could kill the bridge mid-ride, and the BLE companion link doesn't need it.
             ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         } catch (e: Exception) {
             // Android 14+ rejects a connectedDevice FGS if no Bluetooth permission is granted yet → don't crash.
             FileLog.event("startForeground failed: ${e.message}")

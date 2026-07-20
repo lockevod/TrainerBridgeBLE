@@ -58,7 +58,7 @@ class MirrorServer(
     private val cccd: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     private var originalName: String? = null
     @Volatile private var advertising = false
-    @Volatile private var built = false   // build the mirrored GATT once; a trainer reconnect keeps it
+    private val built = java.util.concurrent.atomic.AtomicBoolean(false)   // build the mirrored GATT once; a trainer reconnect keeps it
     @Volatile private var advBlueprint: AdvBlueprint? = null   // the trainer's real advertising, to clone
 
     /** Adopt the trainer's own advertised service UUIDs + manufacturer data (captured by the client) so we
@@ -100,8 +100,9 @@ class MirrorServer(
      *  and there is no clean live rebuild). */
     fun build(profile: GattProfile) {
         val srv = server ?: return
-        if (built) return
-        built = true
+        // Atomic gate: build() is called from both the GATT binder thread (onServicesDiscovered) and the main
+        // thread (Start) — a plain check-then-set could let both through and double-add the services.
+        if (!built.compareAndSet(false, true)) return
         chars.clear(); pendingServices.clear()
         for (svc in profile.services) {
             if (GattUuids.isStackService(svc.uuid)) continue
@@ -150,7 +151,7 @@ class MirrorServer(
         runCatching { server?.close() }
         server = null
         restoreName()
-        built = false; advBlueprint = null
+        built.set(false); advBlueprint = null
         chars.clear(); cache.clear(); subscribers.clear(); clients.clear(); pendingServices.clear()
     }
 

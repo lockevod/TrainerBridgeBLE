@@ -17,8 +17,9 @@ class Config(context: Context) {
         get() = p.getInt(KEY_OFFSET, 0)
         set(v) = p.edit().putInt(KEY_OFFSET, v).apply()
 
-    /** ERG floor: below this target (W) the inverse correction is skipped and the target passes through
-     *  unchanged. 0 = always invert. Avoids over-correcting low recovery/warmup targets. */
+    /** ERG floor: below this target (W) the inverse holds the floor's own raw target instead of dropping
+     *  lower (targets within the offset still command 0). 0 = always invert. Avoids the inverse collapsing
+     *  toward 0 at low recovery/warmup targets and breaking the app's ERG loop. */
     var invertFloorW: Int
         get() = p.getInt(KEY_INVERT_FLOOR, 50)
         set(v) = p.edit().putInt(KEY_INVERT_FLOOR, v).apply()

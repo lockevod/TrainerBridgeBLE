@@ -51,10 +51,11 @@ class ZycleClient(
 
     private val opQueue = ConcurrentLinkedQueue<() -> Unit>()
     private val opBusy = AtomicBoolean(false)
+    private val opToken = java.util.concurrent.atomic.AtomicInteger(0)   // guards the per-op watchdog vs a stale timeout
 
     private class WriteReq(val uuid: UUID, val bytes: ByteArray, val withResponse: Boolean, val retriesLeft: Int, val seq: Int)
     @Volatile private var inFlightWrite: WriteReq? = null   // the write currently on the wire, for retry on failure
-    private var writeSeq = 0                                // bumps per write; a retry is dropped if superseded
+    private val writeSeq = java.util.concurrent.atomic.AtomicInteger(0)  // bumps per write; a retry is dropped if superseded
 
     private val cccd: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
@@ -110,7 +111,7 @@ class ZycleClient(
         FileLog.event("Zycle write $charUuid = ${FileLog.hex(bytes)}")
         val g = gatt ?: return
         val ch = g.services.firstNotNullOfOrNull { s -> s.getCharacteristic(charUuid) } ?: return
-        val seq = ++writeSeq
+        val seq = writeSeq.incrementAndGet()
         enqueue {
             @Suppress("DEPRECATION")
             run {
@@ -228,7 +229,7 @@ class ZycleClient(
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 // Retry a failed CONTROL write (the trainer occasionally NAKs with status 133), but only if a
                 // newer control write hasn't superseded it (w.seq == writeSeq) — never re-send a stale target.
-                val retry = w != null && w.retriesLeft > 0 && GattUuids.carriesControl(w.uuid) && w.seq == writeSeq && !stopped
+                val retry = w != null && w.retriesLeft > 0 && GattUuids.carriesControl(w.uuid) && w.seq == writeSeq.get() && !stopped
                 FileLog.event("Zycle write ${shortUuid(ch.uuid)} status=$status" + if (retry) " — retry ${w!!.retriesLeft}" else "")
                 if (retry) handler.postDelayed({ writeInternal(w!!.uuid, w.bytes, w.withResponse, w.retriesLeft - 1) }, CONTROL_RETRY_DELAY_MS)
             }
@@ -284,8 +285,27 @@ class ZycleClient(
 
     // ── GATT op serialisation ────────────────────────────────────────────────────────────────────────
     private fun enqueue(op: () -> Unit) { opQueue.add(op); pump() }
-    private fun pump() { if (opBusy.compareAndSet(false, true)) { val op = opQueue.poll(); if (op == null) opBusy.set(false) else runCatching { op() }.onFailure { opDone() } } }
-    private fun opDone() { opBusy.set(false); pump() }
+    private fun pump() {
+        if (opBusy.compareAndSet(false, true)) {
+            val op = opQueue.poll()
+            if (op == null) { opBusy.set(false); return }
+            // Per-op watchdog: a lost GATT callback (flaky link) would otherwise latch opBusy forever and every
+            // later control/ERG write would sit undispatched while power keeps streaming (invisible failure).
+            // Token-guarded so a late-firing timeout can't advance a newer op. ponytail: a real callback landing
+            // in the tiny window right after the timeout could double-advance; acceptable vs a permanent wedge —
+            // bump OP_TIMEOUT_MS if it's ever observed.
+            val token = opToken.incrementAndGet()
+            handler.postDelayed({
+                if (opBusy.get() && opToken.get() == token) {
+                    FileLog.event("Zycle GATT op timeout ${OP_TIMEOUT_MS}ms -> unstick queue")
+                    inFlightWrite = null
+                    opDone()
+                }
+            }, OP_TIMEOUT_MS)
+            runCatching { op() }.onFailure { opDone() }
+        }
+    }
+    private fun opDone() { opToken.incrementAndGet(); opBusy.set(false); pump() }
 
     private companion object {
         const val RECONNECT_DELAY_MS = 2000L
@@ -293,5 +313,6 @@ class ZycleClient(
         const val HEARTBEAT_TIMEOUT_MS = 15000L   // silent this long while "connected" → recycle the link (~15s, ANT-learned)
         const val CONTROL_WRITE_RETRIES = 2       // resend a control write that NAKs (status 133) up to twice
         const val CONTROL_RETRY_DELAY_MS = 250L
+        const val OP_TIMEOUT_MS = 4000L           // unstick the GATT queue if a callback is ever lost (flaky link)
     }
 }
