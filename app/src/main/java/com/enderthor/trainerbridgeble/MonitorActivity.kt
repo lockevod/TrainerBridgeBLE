@@ -84,7 +84,7 @@ class MonitorActivity : Activity() {
         }
 
         mon.addView(bodyText(getString(R.string.monitor_tile_resistance), 12f, Palette.MUTED).apply {
-            gravity = android.view.Gravity.CENTER; setPadding(0, dp(2), 0, 0)   // caption above the ▼▲ arrows
+            gravity = android.view.Gravity.CENTER; setPadding(0, dp(12), 0, 0)   // caption above the ▼▲ arrows
         })
         val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         downBtn = tileButton(getString(R.string.monitor_resistance_down)) { service?.buttonDown() }

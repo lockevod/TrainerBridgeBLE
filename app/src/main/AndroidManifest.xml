@@ -75,5 +75,10 @@
                 android:name="io.hammerhead.karooext.EXTENSION_INFO"
                 android:resource="@xml/extension_info" />
         </service>
+
+        <!-- OTA: the Karoo reads this to check for updates against the release's manifest.json asset. -->
+        <meta-data
+            android:name="io.hammerhead.karooext.MANIFEST_URL"
+            android:value="https://github.com/lockevod/TrainerBridgeBLE/releases/latest/download/manifest.json" />
     </application>
 </manifest>

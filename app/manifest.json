@@ -1,0 +1,12 @@
+{
+  "label": "TrainerBridge BLE",
+  "packageName": "com.enderthor.trainerbridgeble",
+  "latestApkUrl": "https://github.com/lockevod/TrainerBridgeBLE/releases/latest/download/trainerbridge.apk",
+  "iconUrl": "https://github.com/lockevod/TrainerBridgeBLE/releases/latest/download/trainerbridge.png",
+  "latestVersion": "0.9",
+  "latestVersionCode": 20260720,
+  "developer": "Enderthor",
+  "description": "Bridges your indoor trainer (Zycle) to your apps (Bestcycling/Garmin/Karoo), correcting the reported power on the fly and inverting the ERG target, and re-exposes it as a virtual power/cadence/speed sensor to the Karoo.",
+  "releaseNotes": "ERG floor (avoid over-correcting low targets). Virtual Karoo sensor for corrected power.",
+  "tags": ["health","performance"]
+}
