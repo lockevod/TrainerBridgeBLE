@@ -285,27 +285,31 @@ class ZycleClient(
 
     // ── GATT op serialisation ────────────────────────────────────────────────────────────────────────
     private fun enqueue(op: () -> Unit) { opQueue.add(op); pump() }
+    @Volatile private var opWatchdog: Runnable? = null
     private fun pump() {
         if (opBusy.compareAndSet(false, true)) {
             val op = opQueue.poll()
             if (op == null) { opBusy.set(false); return }
-            // Per-op watchdog: a lost GATT callback (flaky link) would otherwise latch opBusy forever and every
+            // Per-op watchdog: a LOST GATT callback (flaky link) would otherwise latch opBusy forever and every
             // later control/ERG write would sit undispatched while power keeps streaming (invisible failure).
-            // Token-guarded so a late-firing timeout can't advance a newer op. ponytail: a real callback landing
-            // in the tiny window right after the timeout could double-advance; acceptable vs a permanent wedge —
-            // bump OP_TIMEOUT_MS if it's ever observed.
+            // opDone() cancels this on normal completion; the token guard covers the concurrent-fire edge.
+            // ponytail: a real callback arriving >OP_TIMEOUT_MS LATE (not lost — link already badly degraded)
+            // can still double-advance for an instant. Self-healing and strictly better than the old permanent
+            // wedge; fully closing it needs matching each callback to its op (fragile) — not worth it.
             val token = opToken.incrementAndGet()
-            handler.postDelayed({
+            val w = Runnable {
                 if (opBusy.get() && opToken.get() == token) {
                     FileLog.event("Zycle GATT op timeout ${OP_TIMEOUT_MS}ms -> unstick queue")
                     inFlightWrite = null
                     opDone()
                 }
-            }, OP_TIMEOUT_MS)
+            }
+            opWatchdog = w
+            handler.postDelayed(w, OP_TIMEOUT_MS)
             runCatching { op() }.onFailure { opDone() }
         }
     }
-    private fun opDone() { opToken.incrementAndGet(); opBusy.set(false); pump() }
+    private fun opDone() { opWatchdog?.let { handler.removeCallbacks(it) }; opToken.incrementAndGet(); opBusy.set(false); pump() }
 
     private companion object {
         const val RECONNECT_DELAY_MS = 2000L
