@@ -99,9 +99,11 @@ Open **Configuración** from the Monitor:
 
 - **Correction** — `corrected = raw × (1 + scale%/100) + offset`. Enter the scale (%) and offset (W) from
   your calibration.
-- **ERG floor (W, 0 = off)** — below this ERG target the inverse correction over-corrects downward, so the
-  command is held at the floor's raw target instead. Targets within the offset (≈ a stop) still command 0.
-  Default 50 W.
+- **ERG floor (W, 0 = off)** — a *hardware* floor, not a correction fix: below this target the trainer can
+  no longer hold the commanded resistance and ERG stops tracking, so the command is held at the floor's own
+  raw target. The trade-off is explicit — **every ERG target below the floor is ridden at the floor**, so
+  with the default 50 W a 40 W recovery interval is ridden at 50 W. Set it to 0 if your trainer holds low
+  targets properly. Targets within the offset (≈ a stop) still command 0.
 - **Trainer (BLE)** — scan and pick your trainer to pair it. The scan lists only power sources (FTMS or
   Cycling Power) — heart-rate straps, phones and headphones are filtered out; if that filter finds nothing
   in the first few seconds it retries unfiltered, so a trainer that advertises its services unusually still
