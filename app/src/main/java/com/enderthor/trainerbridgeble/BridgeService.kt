@@ -40,6 +40,7 @@ class BridgeService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
 
+    private val lastValues = java.util.concurrent.ConcurrentHashMap<java.util.UUID, ByteArray>()   // every value seen, for a late mirror
     @Volatile private var lastProfile: GattProfile? = null       // trainer GATT, cached so a late-started mirror can build
     @Volatile private var lastAdvBlueprint: AdvBlueprint? = null  // trainer's advertising, cached for a late-started mirror
 
@@ -211,6 +212,7 @@ class BridgeService : Service() {
         val onProfile: (GattProfile) -> Unit = { profile -> lastProfile = profile; mirror?.build(profile) }
         val onValue: (java.util.UUID, ByteArray) -> Unit = { uuid, value ->
             cacheForUi(config, uuid, value)
+            lastValues[uuid] = value      // the one-shot reads happen long before Broadcast is pressed
             mirror?.onZycleValue(uuid, value)
         }
         val onState: (Boolean) -> Unit = { connected ->
@@ -235,6 +237,7 @@ class BridgeService : Service() {
         mirror?.setTrainerLinked(false)   // no source → nothing to advertise, whatever the call order
         Config(this).let { it.lastSeenAddress = ""; it.lastSeenName = "" }
         client?.stop(); client = null; simSource = null; lastProfile = null; lastAdvBlueprint = null; currentSourceKey = null
+        lastValues.clear()
         CorrectedFeed.clear()
         zycleConnected = false; sawIndoorBikeData = false; lastPowerMs = 0L; lastRawW = null; lastCorrectedW = null; lastSpeedKmh = null; lastCadence = null; lastResistance = null; lastSampleMs = 0L
         status = getString(R.string.status_stopped)
@@ -261,6 +264,13 @@ class BridgeService : Service() {
         m.start()
         m.setTrainerLinked(zycleConnected)            // Start pressed with the trainer already connected
         lastProfile?.let { m.build(it) }              // mirror started after the trainer was already discovered → build now
+        // ...and hand it everything we have already seen. Without this its read cache is empty until the
+        // trainer is re-read, which never happens: an app asking for FTMS Feature gets nothing and decides
+        // the machine has no capabilities (no ERG, no automatic mode) for the whole session.
+        if (lastValues.isNotEmpty()) {
+            FileLog.event("mirror seeded with ${lastValues.size} cached values")
+            lastValues.forEach { (u, v) -> m.onZycleValue(u, v) }
+        }
         lastAdvBlueprint?.let { m.setAdvBlueprint(it) }
         if (config.antOutputEnabled) startAntTx(config)
         emitting = true
