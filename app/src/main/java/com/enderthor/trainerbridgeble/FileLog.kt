@@ -30,8 +30,10 @@ object FileLog {
                 // seconds ago, which is worthless for a ride that just ended. O(1) — a rename, no read.
                 if (f.length() > MAX_BYTES) {
                     val old = File(f.parentFile, f.name + ".1")
-                    runCatching { if (old.exists()) old.delete(); f.renameTo(old) }
-                    f.writeText("# $ts log rotated at ${MAX_BYTES / 1024 / 1024} MB (previous: ${f.name}.1)\n")
+                    // ONLY start a new file if the rename actually happened — falling through on failure
+                    // truncates the very history the rotation exists to keep.
+                    val rotated = runCatching { if (old.exists()) old.delete(); f.renameTo(old) }.getOrDefault(false)
+                    if (rotated) f.writeText("# $ts log rotated at ${MAX_BYTES / 1024 / 1024} MB (previous: ${f.name}.1)\n")
                 }
                 f.appendText("# $ts $msg\n")
             }
@@ -42,5 +44,6 @@ object FileLog {
 
     fun clear() { file?.let { f -> io.execute { runCatching { f.writeText("") } } } }
 
-    fun hex(b: ByteArray): String = b.joinToString("") { "%02X".format(it) }
+    /** Empty when logging is off: callers interpolate this into a message before [event] can check. */
+    fun hex(b: ByteArray): String = if (!enabled) "" else b.joinToString("") { "%02X".format(it) }
 }

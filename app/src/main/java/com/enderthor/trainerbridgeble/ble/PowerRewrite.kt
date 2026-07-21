@@ -36,7 +36,9 @@ object PowerRewrite {
     }
 
     /** FTMS Machine Status (0x2ADA) op 0x08 "Target Power Changed" echoes the watts the trainer was
-     *  commanded — which we inverse-corrected. Correct it forward so the app reads back ITS OWN target. */
+     *  commanded — which we inverse-corrected. Correct it forward so the app reads back the wattage it will
+     *  actually SEE. Below the ERG floor that is not the target it asked for: the floor lifts the command,
+     *  deliberately, and this echo tells the truth about it. */
     fun correctMachineStatusTargetPower(value: ByteArray, c: PowerCorrection): ByteArray {
         if (value.size < 3 || (value[0].toInt() and 0xFF) != 0x08) return value
         val commanded = le16signed(value, 1)

@@ -72,7 +72,7 @@ class ZycleClient(
     override fun stop() {
         stopped = true
         connecting.set(false)
-        inFlightWrite = null
+        inFlightWrite = null; inFlightOp = null; opAbandoned = false
         stopScan()
         handler.removeCallbacksAndMessages(null)   // heartbeat, rescan, connect/op watchdogs, write retries
         opQueue.clear(); opBusy.set(false)
@@ -170,6 +170,7 @@ class ZycleClient(
 
     private fun startScan(): Unit {
         if (stopped || scanning) return
+        if (gatt != null || connecting.get()) return   // already linked/linking — a stray retry must not scan
         // Bluetooth off (or the stack restarting) → no scanner at all. There is no adapter-state receiver,
         // so without a retry here the client would stay dead for the rest of the session.
         val scanner = adapter?.bluetoothLeScanner ?: run {
@@ -191,8 +192,7 @@ class ZycleClient(
         if (started.isFailure) {
             FileLog.event("Zycle scan start threw: ${started.exceptionOrNull()}"); retryScanLater(); return
         }
-        scanning = true
-        retryMs = SCAN_RETRY_MS   // a scan that actually started clears the backoff
+        scanning = true   // NOT the place to reset the backoff: a scan that starts can still fail async
     }
 
     private val rescan: Runnable = Runnable { startScan() }
@@ -215,7 +215,6 @@ class ZycleClient(
 
     // ── connect / GATT ──────────────────────────────────────────────────────────────────────────────
     private fun connect(device: BluetoothDevice) {
-        cancelConnectTimeout()
         if (stopped) { connecting.set(false); return }   // stop() raced a scan result on a binder thread
         // TRANSPORT_LE explicitly: with TRANSPORT_AUTO a device that ever bonded as DUAL is attempted over
         // BR/EDR and fails with status=133 every time.
@@ -236,12 +235,11 @@ class ZycleClient(
                 scheduleReconnect()
             }
         }
-        pendingConnectTimeout = timeout
+        // No cancellation needed: the Runnable checks `connecting` and its own handle, so once this attempt
+        // connects, dies or is superseded it is a no-op. Cancelling it from another thread could — and did —
+        // remove the timeout belonging to a LATER attempt.
         handler.postDelayed(timeout, CONNECT_TIMEOUT_MS)
     }
-
-    @Volatile private var pendingConnectTimeout: Runnable? = null
-    private fun cancelConnectTimeout() { pendingConnectTimeout?.let { handler.removeCallbacks(it) }; pendingConnectTimeout = null }
 
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
@@ -249,7 +247,6 @@ class ZycleClient(
                 if (gatt !== g) { runCatching { g.close() }; return }   // orphaned handle — drop it
                 FileLog.event("Zycle connected status=$status")
                 connecting.set(false)
-                cancelConnectTimeout()
                 retryMs = SCAN_RETRY_MS   // a good connection resets the backoff
                 lastMessageMs = System.currentTimeMillis()   // start the silent-link window at connect
                 onState(true)
@@ -260,8 +257,7 @@ class ZycleClient(
                 if (gatt !== g) return   // a stale/superseded handle — don't touch the live connection's state
                 onState(false)
                 opQueue.clear(); opBusy.set(false)
-                gatt = null; connecting.set(false); inFlightWrite = null; inFlightOp = null; lastMessageMs = 0L
-                cancelConnectTimeout()
+                gatt = null; connecting.set(false); inFlightWrite = null; inFlightOp = null; opAbandoned = false; lastMessageMs = 0L
                 scheduleReconnect()
             }
         }
@@ -387,18 +383,21 @@ class ZycleClient(
         }
     }
 
-    /** False if this callback belongs to an operation the watchdog already gave up on: the queue advanced
-     *  when it timed out, so honouring the late callback would advance it a SECOND time and silently lose
-     *  whatever op is now on the wire (typically a CCCD write → a characteristic that never notifies). */
+    /** The watchdog already advanced the queue for an op it gave up on, so exactly ONE subsequent callback
+     *  must be swallowed — otherwise it advances the queue a second time and silently loses whatever op is
+     *  now on the wire (typically a CCCD write → a characteristic that never notifies).
+     *
+     *  ponytail: a flag, not the characteristic UUID. Keying on the UUID looked more precise and was
+     *  strictly worse: the ERG loop writes the same control point repeatedly, so an abandoned write
+     *  poisoned the next legitimate callback for it, the watchdog re-armed, and every op on that
+     *  characteristic then cost OP_TIMEOUT_MS forever. Worst case here is one stalled op, self-clearing. */
     private fun claimOp(u: UUID): Boolean {
-        if (abandonedOp == u) {
-            abandonedOp = null
-            FileLog.event("Zycle late callback for ${shortUuid(u)} (op already timed out) — ignored")
-            return false
-        }
-        return true
+        if (!opAbandoned) return true
+        opAbandoned = false
+        FileLog.event("Zycle callback for ${shortUuid(u)} after an op timeout — swallowed once")
+        return false
     }
-    @Volatile private var abandonedOp: UUID? = null
+    @Volatile private var opAbandoned = false
 
     // ── GATT op serialisation ────────────────────────────────────────────────────────────────────────
     private fun enqueue(op: () -> Unit) { opQueue.add(op); pump() }
@@ -417,7 +416,7 @@ class ZycleClient(
             val w = Runnable {
                 if (opBusy.get() && opToken.get() == token) {
                     FileLog.event("Zycle GATT op timeout ${OP_TIMEOUT_MS}ms -> unstick queue")
-                    abandonedOp = inFlightOp   // so its late callback can't advance the queue a second time
+                    opAbandoned = true   // swallow the next callback: this op's queue slot is already gone
                     inFlightWrite = null; inFlightOp = null
                     opDone()
                 }

@@ -84,10 +84,13 @@ class BridgeService : Service() {
         else {
             val target = ((lastResistance ?: 0) + delta).coerceIn(0, 200)   // 0..200 per the Zycle's 0x2AD6 range
             // ponytail: 0x04+level% Set Target Resistance, no Request Control first — shares the FTMS control point with the app
-            // optimistic, but ONLY if it was actually dispatched — otherwise the tile moves and the trainer doesn't
-            if (client?.write(com.enderthor.trainerbridgeble.ble.GattUuids.FTMS_CONTROL_POINT, byteArrayOf(0x04, target.toByte()), true) == true)
+            // optimistic, and only if the write was at least QUEUED (no link / unknown char → don't move the
+            // tile). A stack refusal after queueing still shows briefly; the trainer's own IBD corrects it.
+            if (client?.write(com.enderthor.trainerbridgeble.ble.GattUuids.FTMS_CONTROL_POINT, byteArrayOf(0x04, target.toByte()), true) == true) {
                 lastResistance = target
-            lastControl = getString(R.string.control_resistance_target, target); FileLog.event("UI button → resistance target=$target%")
+                lastControl = getString(R.string.control_resistance_target, target)
+                FileLog.event("UI button → resistance target=$target")
+            } else FileLog.event("UI button → resistance target=$target NOT DISPATCHED")
         }
         listener?.invoke()
     }
@@ -318,7 +321,6 @@ class BridgeService : Service() {
         when (uuid) {
             com.enderthor.trainerbridgeble.ble.GattUuids.INDOOR_BIKE_DATA -> {
                 if (value.size < 2) return
-                sawIndoorBikeData = true
                 val flags = le16(value, 0); var off = 2
                 if (flags and (1 shl 0) == 0) { if (off + 2 <= value.size) lastSpeedKmh = le16(value, off) * 0.01; off += 2 }
                 if (flags and (1 shl 1) != 0) off += 2
@@ -332,8 +334,12 @@ class BridgeService : Service() {
                 }
                 // Only a packet that actually CARRIED power may refresh ANT's power-freshness clock, or a
                 // dropout would be transmitted as live. Speed/cadence still flow to the Karoo sensor.
+                if (havePower) sawIndoorBikeData = true   // IBD really carries power here — only now disable the CPM fallback
                 if (havePower) antTx?.setLatest(PowerSample(lastCorrectedW, lastCadence, lastSpeedKmh?.let { it / 3.6 }))
-                CorrectedFeed.push(lastCorrectedW, lastSpeedKmh?.let { it / 3.6 }, lastCadence, System.currentTimeMillis())
+                // power only if THIS packet carried it: CorrectedSource stops emitting power on null while
+                // speed and cadence keep flowing, instead of recording a frozen value as live data
+                CorrectedFeed.push(if (havePower) lastCorrectedW else null,
+                    lastSpeedKmh?.let { it / 3.6 }, lastCadence, System.currentTimeMillis())
                 listener?.invoke()
             }
             com.enderthor.trainerbridgeble.ble.GattUuids.CYCLING_POWER_MEASUREMENT -> {

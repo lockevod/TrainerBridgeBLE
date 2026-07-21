@@ -61,6 +61,8 @@ class MirrorServer(
     private val ADV_RETRY_MS = 1000L
     private val ADV_MAX_RETRIES = 5
     private val SERVICE_RETRY_MS = 300L
+    private val SERVICE_MAX_RETRIES = 5
+    @Volatile private var serviceRetries = 0
     private val ADVERTISE_FAILED_DATA_TOO_LARGE = 1
     private val cccd: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     private val ATT_UNLIKELY_ERROR = 0x0E
@@ -75,6 +77,7 @@ class MirrorServer(
     @Volatile private var advRetries = 0
     @Volatile private var dropNameFromAdv = false   // set after DATA_TOO_LARGE: the packet won't fit the name
     @Volatile private var dropMfrFromAdv = false    // shed the cloned manufacturer data first
+    @Volatile private var dropBlueprintFromAdv = false   // then the cloned UUIDs, falling back to the standard pair
 
     /** Gate advertising on the trainer link. We advertise under the trainer's own name, and the trainer
      *  starts advertising again the moment it drops — so advertising with no trainer behind us puts two
@@ -90,7 +93,7 @@ class MirrorServer(
      *  advertise an identical packet. If we're already advertising, restart to apply it. */
     fun setAdvBlueprint(bp: AdvBlueprint) {
         advBlueprint = bp
-        dropMfrFromAdv = false; dropNameFromAdv = false; advRetries = 0   // a new packet deserves a clean try
+        advRetries = 0   // a new blueprint deserves a fresh retry budget — but keep what we learned about size
         FileLog.event("mirror adv blueprint: ${bp.serviceUuids.size} uuids, ${bp.manufacturerData.size} mfr")
         handler.post { if (advertising) restartAdvertising() }   // serialise onto the advertising thread
     }
@@ -122,11 +125,12 @@ class MirrorServer(
      *  if the user renames the device while we hold it; clear it on restore if that ever matters. */
     private fun restoreName() {
         val prefs = context.getSharedPreferences("trainerbridgeble", Context.MODE_PRIVATE)
+        // Restore unconditionally. Gating on `adapter.name == advertisedName` looked safer but is unsound:
+        // the rename is asynchronous, so a stop right after a start reads back the OLD name, skips the
+        // restore, and leaves the user's phone named after the trainer. Losing a rename the user made
+        // mid-session is the lesser evil, and only a stale pref can cause it.
         val orig = originalName ?: prefs.getString(KEY_ORIG_NAME, null)
-        val current = runCatching { adapter.name }.getOrNull()
-        // Only restore if the adapter still carries OUR name. If the user renamed the device while we held
-        // it, current != advertisedName and writing the stored original would silently undo their change.
-        if (orig != null && current == advertisedName) runCatching { adapter.name = orig }
+        if (orig != null) runCatching { adapter.name = orig }
         originalName = null
     }
 
@@ -163,9 +167,11 @@ class MirrorServer(
             pendingServices.add(service)
         }
         FileLog.event("mirror built ${pendingServices.size} services")
-        if (pendingServices.isEmpty()) {   // nothing to add (empty/filtered profile) — don't wait forever
-            FileLog.event("mirror has NO services to add — advertising anyway")
-            servicesReady = true; handler.post { startAdvertising() }
+        if (pendingServices.isEmpty()) {
+            // Advertising an empty GATT is worse than not advertising: an app connects and caches nothing.
+            // Release the build latch so a later, real discovery can still populate the mirror.
+            FileLog.event("mirror has NO services — not advertising, waiting for a real profile")
+            built.set(false)
         } else addNextService()
     }
 
@@ -181,13 +187,17 @@ class MirrorServer(
         return perm
     }
 
+    /** PEEK, don't poll: the service stays at the head until its own onServiceAdded confirms it. Removing it
+     *  up front let a late success (the stack had queued the "refused" add after all) and the retry both
+     *  drive the chain — adding a service twice and letting `servicesReady` fire with an add still in flight. */
     private fun addNextService() {
-        val svc = pendingServices.poll() ?: return
+        val svc = pendingServices.peek() ?: return
         if (runCatching { server?.addService(svc) }.getOrNull() != true) {
-            // Put it BACK at the head and retry through the normal path: calling addService directly meant a
-            // second refusal stalled the chain forever, and a late success could add the service twice.
-            FileLog.event("mirror addService REFUSED for ${shortUuid(svc.uuid)} — requeueing")
-            pendingServices.addFirst(svc)
+            if (serviceRetries++ >= SERVICE_MAX_RETRIES) {
+                FileLog.event("mirror addService REFUSED for ${shortUuid(svc.uuid)} — giving up, mirror incomplete")
+                return
+            }
+            FileLog.event("mirror addService REFUSED for ${shortUuid(svc.uuid)} — retry ${serviceRetries}")
             handler.postDelayed({ if (server != null) addNextService() }, SERVICE_RETRY_MS)
         }
     }
@@ -250,7 +260,9 @@ class MirrorServer(
         override fun onServiceAdded(status: Int, service: BluetoothGattService?) {
             if (status != BluetoothGatt.GATT_SUCCESS)
                 FileLog.event("mirror addService FAILED status=$status for ${shortUuid(service?.uuid)}")
-            if (pendingServices.isEmpty()) {   // nothing left in flight — the mirrored GATT is complete
+            pendingServices.poll()   // confirmed — NOW it leaves the queue
+            serviceRetries = 0
+            if (pendingServices.isEmpty()) {   // the mirrored GATT is complete
                 servicesReady = true
                 handler.post { startAdvertising() }
             } else addNextService()
@@ -316,8 +328,17 @@ class MirrorServer(
             }
             // ...and if we could not hand it to the trainer, say so the way a trainer would: Response Code
             // 0x80, <op>, 0x04 Operation Failed. Without this the app waits forever for an indication.
-            if (!relayed && uuid != null && value != null && value.isNotEmpty() && GattUuids.carriesControl(uuid))
-                onZycleValue(uuid, byteArrayOf(0x80.toByte(), value[0], 0x04))
+            if (!relayed && uuid != null && device != null && value != null && value.isNotEmpty() &&
+                !preparedWrite && GattUuids.carriesControl(uuid)) {
+                // ONLY to the client that wrote, and NOT into the read cache: the response belongs to one
+                // FTMS procedure, and fanning it out tells the other app its own request failed.
+                val resp = byteArrayOf(0x80.toByte(), value[0], 0x04)
+                val cp = ch
+                handler.post {
+                    val srv = server ?: return@post
+                    notify(srv, device, cp, resp, cp.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)
+                }
+            }
         }
 
         override fun onDescriptorWriteRequest(device: BluetoothDevice?, requestId: Int, descriptor: BluetoothGattDescriptor?,
@@ -375,8 +396,10 @@ class MirrorServer(
             FileLog.event("advertise failed $errorCode (retry ${advRetries + 1}/$ADV_MAX_RETRIES, name=${!dropNameFromAdv})")
             // 31-byte PDU: shed the cloned manufacturer data first (usually the culprit), the name only if
             // that still isn't enough — apps find us BY the name, so it is the last thing to go.
-            if (errorCode == ADVERTISE_FAILED_DATA_TOO_LARGE) {
-                if (!dropMfrFromAdv) dropMfrFromAdv = true else dropNameFromAdv = true
+            if (errorCode == ADVERTISE_FAILED_DATA_TOO_LARGE) when {
+                !dropMfrFromAdv -> dropMfrFromAdv = true          // the cloned manufacturer data usually is it
+                !dropBlueprintFromAdv -> dropBlueprintFromAdv = true   // then the cloned UUIDs (128-bit won't fit)
+                else -> dropNameFromAdv = true                    // last resort: apps find us BY the name
             }
             if (advRetries++ < ADV_MAX_RETRIES) {
                 handler.removeCallbacks(startAdvRunnable); handler.postDelayed(startAdvRunnable, ADV_RETRY_MS)
@@ -396,7 +419,7 @@ class MirrorServer(
         // head unit that filters on them sees us exactly like the real trainer. Fallback (sim / not yet
         // captured): the three standard cycling services.
         val builder = AdvertiseData.Builder().setIncludeDeviceName(!dropNameFromAdv)
-        val bp = advBlueprint
+        val bp = if (dropBlueprintFromAdv) null else advBlueprint
         if (bp != null && bp.serviceUuids.isNotEmpty()) {
             bp.serviceUuids.forEach { builder.addServiceUuid(it) }
             if (!dropMfrFromAdv) bp.manufacturerData.forEach { (id, d) -> runCatching { builder.addManufacturerData(id, d) } }
@@ -413,7 +436,9 @@ class MirrorServer(
      *  onStartSuccess, so an early return here can leave a pending advert running with no trainer behind it. */
     private fun stopAdvertising() {
         handler.removeCallbacks(startAdvRunnable)
-        advertising = false; advStarting = false
+        advertising = false
+        // NOT advStarting: a stop issued while a start is in flight is dropped by the stack, so the start
+        // is still coming. Only its callback may clear the flag, or we let a second start through.
         runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(advCallback) }
     }
 
