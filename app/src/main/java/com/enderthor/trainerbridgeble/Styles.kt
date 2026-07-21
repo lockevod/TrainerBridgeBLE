@@ -93,8 +93,19 @@ fun Activity.tile(row: LinearLayout, label: String, valueColor: Int): TextView {
         orientation = LinearLayout.VERTICAL; background = rounded(Palette.PAGE_BG); setPadding(dp(6), dp(8), dp(6), dp(8)); gravity = Gravity.CENTER
         val lp = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f); lp.setMargins(dp(3), 0, dp(3), 0); layoutParams = lp
     }
-    val value = TextView(this).apply { text = "—"; textSize = 22f; setTextColor(valueColor); typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER }
+    // Fixed height + a single auto-shrinking line: with WRAP_CONTENT a long value (the control tile shows
+    // text, not a number) wrapped onto a second line and stretched the whole row, so the tiles changed size
+    // depending on what was in them.
+    val value = TextView(this).apply {
+        text = "—"; setTextColor(valueColor); typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER
+        maxLines = 1
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(30))
+        setAutoSizeTextTypeUniformWithConfiguration(9, 22, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
+    }
     col.addView(value)
-    col.addView(TextView(this).apply { text = label; textSize = 12f; setTextColor(Palette.MUTED); gravity = Gravity.CENTER })
+    col.addView(TextView(this).apply {
+        text = label; textSize = 12f; setTextColor(Palette.MUTED); gravity = Gravity.CENTER
+        maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+    })
     row.addView(col); return value
 }

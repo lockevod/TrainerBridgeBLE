@@ -54,6 +54,29 @@ class BridgeService : Service() {
     @Volatile var lastSampleMs: Long = 0L; private set   // wall-clock of the last trainer sample, for UI staleness
     @Volatile var lastPowerMs: Long = 0L; private set    // ...and of the last packet that actually CARRIED power
 
+    // FTMS says Instantaneous Speed is 0.01 km/h. Some trainers (the Zycle among them) report 0.1 km/h,
+    // which silently makes speed AND the recorded distance ten times too small. Rather than hardcode either,
+    // believe the spec until the trainer's OWN distance/time contradicts it: dividing metres by seconds is
+    // an in-band measurement no unit confusion can fake.
+    @Volatile private var speedUnit = 0.01
+    @Volatile private var speedUnitLocked = false
+    private var prevDistM = 0; private var prevElapsedS = 0
+
+    private fun speedUnitKmh(distM: Int?, elapsedS: Int?): Double {
+        if (speedUnitLocked || distM == null || elapsedS == null) return speedUnit
+        val dd = distM - prevDistM; val dt = elapsedS - prevElapsedS
+        prevDistM = distM; prevElapsedS = elapsedS
+        if (dt !in 1..10 || dd < 3) return speedUnit          // need a real, recent movement to judge
+        val measuredKmh = dd / dt.toDouble() * 3.6
+        val reportedKmh = lastSpeedKmh ?: return speedUnit
+        if (reportedKmh > 0.1 && measuredKmh / reportedKmh > 5.0) {
+            speedUnit = 0.1; speedUnitLocked = true
+            FileLog.event("speed unit: trainer reports 0.1 km/h, not the spec's 0.01 " +
+                "(measured ${"%.1f".format(measuredKmh)} km/h vs reported ${"%.2f".format(reportedKmh)})")
+        } else if (dd > 10) speedUnitLocked = true            // the spec value held up — stop second-guessing
+        return speedUnit
+    }
+
     /** Power specifically — a packet can arrive without the power field, and a sticky last value must not be
      *  reported as live to ANT, the Karoo recording, or the tiles. A short grace covers one dropped frame. */
     val powerFresh: Boolean get() = lastPowerMs != 0L && System.currentTimeMillis() - lastPowerMs <= POWER_STALE_MS
@@ -239,6 +262,7 @@ class BridgeService : Service() {
         client?.stop(); client = null; simSource = null; lastProfile = null; lastAdvBlueprint = null; currentSourceKey = null
         lastValues.clear()
         CorrectedFeed.clear()
+        speedUnit = 0.01; speedUnitLocked = false; prevDistM = 0; prevElapsedS = 0
         zycleConnected = false; sawIndoorBikeData = false; lastPowerMs = 0L; lastRawW = null; lastCorrectedW = null; lastSpeedKmh = null; lastCadence = null; lastResistance = null; lastSampleMs = 0L
         status = getString(R.string.status_stopped)
         updateNotification(); listener?.invoke()
@@ -342,20 +366,44 @@ class BridgeService : Service() {
             com.enderthor.trainerbridgeble.ble.GattUuids.INDOOR_BIKE_DATA -> {
                 if (value.size < 2) return
                 val flags = le16(value, 0); var off = 2
-                if (flags and (1 shl 0) == 0) { if (off + 2 <= value.size) lastSpeedKmh = le16(value, off) * 0.01; off += 2 }
+                var speedRaw: Int? = null
+                if (flags and (1 shl 0) == 0) { if (off + 2 <= value.size) speedRaw = le16(value, off); off += 2 }
                 if (flags and (1 shl 1) != 0) off += 2
                 if (flags and (1 shl 2) != 0) { if (off + 2 <= value.size) lastCadence = le16(value, off) / 2; off += 2 }
                 if (flags and (1 shl 3) != 0) off += 2
-                if (flags and (1 shl 4) != 0) off += 3
+                var distM: Int? = null
+                if (flags and (1 shl 4) != 0) {
+                    if (off + 3 <= value.size) distM = (value[off].toInt() and 0xFF) or
+                        ((value[off + 1].toInt() and 0xFF) shl 8) or ((value[off + 2].toInt() and 0xFF) shl 16)
+                    off += 3
+                }
                 if (flags and (1 shl 5) != 0) { if (off + 2 <= value.size) lastResistance = le16signed(value, off); off += 2 }
+                // Total Distance is at a known offset only after the fields above, so grab elapsed time too:
+                // together they are the only in-band way to tell what the speed field's unit really is.
+                var elapsedS: Int? = null
+                run {
+                    var o = off
+                    if (flags and (1 shl 6) != 0) o += 2      // instantaneous power
+                    if (flags and (1 shl 7) != 0) o += 2      // average power
+                    if (flags and (1 shl 8) != 0) o += 5      // expended energy
+                    if (flags and (1 shl 9) != 0) o += 1      // heart rate
+                    if (flags and (1 shl 10) != 0) o += 1     // metabolic equivalent
+                    if (flags and (1 shl 11) != 0 && o + 2 <= value.size) elapsedS = le16(value, o)
+                }
+                speedRaw?.let { lastSpeedKmh = it * speedUnitKmh(distM, elapsedS) }
                 var havePower = false
                 if (flags and (1 shl 6) != 0 && off + 2 <= value.size) {
                     val raw = le16signed(value, off); lastRawW = raw; lastCorrectedW = config.correction().correct(raw); havePower = true
                 }
                 // Only a packet that actually CARRIED power may refresh ANT's power-freshness clock, or a
                 // dropout would be transmitted as live. Speed/cadence still flow to the Karoo sensor.
-                if (havePower) sawIndoorBikeData = true   // IBD really carries power here — only now disable the CPM fallback
-                if (havePower) antTx?.setLatest(PowerSample(lastCorrectedW, lastCadence, lastSpeedKmh?.let { it / 3.6 }))
+                if (havePower) {
+                    sawIndoorBikeData = true       // IBD really carries power — only now disable the CPM fallback
+                    lastPowerMs = System.currentTimeMillis()   // the clock powerFresh/freshPowerOrNull read
+                }
+                // ALWAYS report to ANT, with a null power once it has gone stale: gating the CALL froze
+                // speed and cadence too and starved ANT on a trainer whose IBD carries no power field.
+                antTx?.setLatest(PowerSample(freshPowerOrNull(), lastCadence, lastSpeedKmh?.let { it / 3.6 }))
                 // power only if THIS packet carried it: CorrectedSource stops emitting power on null while
                 // speed and cadence keep flowing, instead of recording a frozen value as live data
                 // A single truncated frame must not punch a hole in the recording, and a real dropout must
