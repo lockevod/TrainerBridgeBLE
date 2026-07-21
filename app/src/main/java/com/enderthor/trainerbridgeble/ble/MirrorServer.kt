@@ -56,11 +56,13 @@ class MirrorServer(
     private val pendingServices = ArrayDeque<BluetoothGattService>()
 
     private val cccd: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+    private val ATT_UNLIKELY_ERROR = 0x0E
     private var originalName: String? = null
     @Volatile private var advertising = false
     private val built = java.util.concurrent.atomic.AtomicBoolean(false)   // build the mirrored GATT once; a trainer reconnect keeps it
     @Volatile private var advBlueprint: AdvBlueprint? = null   // the trainer's real advertising, to clone
     @Volatile private var trainerLinked = false   // advertise only while a trainer is actually feeding us
+    @Volatile private var servicesReady = false   // every mirrored service has been ADDED (built != added)
 
     /** Gate advertising on the trainer link. We advertise under the trainer's own name, and the trainer
      *  starts advertising again the moment it drops — so advertising with no trainer behind us puts two
@@ -92,8 +94,10 @@ class MirrorServer(
     private fun renameAdapter() {
         val prefs = context.getSharedPreferences("trainerbridgeble", Context.MODE_PRIVATE)
         val current = runCatching { adapter.name }.getOrNull()
-        // a stored original always wins over a read-back name, which may still be our own (see restoreName)
-        if (prefs.getString(KEY_ORIG_NAME, null) == null && current != null && current != advertisedName)
+        // A stored original wins over a read-back name, which may still be our own (see restoreName) — but
+        // refresh it whenever we observe a real name that is neither ours nor the stored one, so renaming
+        // the device in Android settings isn't undone forever by the pref we are deliberately keeping.
+        if (current != null && current != advertisedName && current != prefs.getString(KEY_ORIG_NAME, null))
             prefs.edit().putString(KEY_ORIG_NAME, current).apply()
         originalName = prefs.getString(KEY_ORIG_NAME, null)
         runCatching { if (current != advertisedName) adapter.name = advertisedName }
@@ -118,6 +122,7 @@ class MirrorServer(
         // Atomic gate: build() is called from both the GATT binder thread (onServicesDiscovered) and the main
         // thread (Start) — a plain check-then-set could let both through and double-add the services.
         if (!built.compareAndSet(false, true)) return
+        servicesReady = false
         chars.clear(); pendingServices.clear()
         for (svc in profile.services) {
             if (GattUuids.isStackService(svc.uuid)) continue
@@ -161,7 +166,7 @@ class MirrorServer(
     fun stop() {
         // Stop the advertiser UNCONDITIONALLY: the `advertising` flag is transiently false mid-restart, so
         // trusting it here can leave the phone broadcasting with a closed GATT server.
-        advertising = false
+        advertising = false; servicesReady = false
         runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(advCallback) }
         runCatching { server?.close() }
         server = null
@@ -202,7 +207,13 @@ class MirrorServer(
     }
 
     private val serverCallback = object : BluetoothGattServerCallback() {
-        override fun onServiceAdded(status: Int, service: BluetoothGattService?) { addNextService(); if (pendingServices.isEmpty()) handler.post { startAdvertising() } }
+        override fun onServiceAdded(status: Int, service: BluetoothGattService?) {
+            val next = pendingServices.poll()
+            if (next == null) {   // nothing left in flight — the mirrored GATT is complete
+                servicesReady = true
+                handler.post { startAdvertising() }
+            } else runCatching { server?.addService(next) }
+        }
 
         override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
             device ?: return
@@ -221,7 +232,14 @@ class MirrorServer(
 
         override fun onCharacteristicReadRequest(device: BluetoothDevice?, requestId: Int, offset: Int, ch: BluetoothGattCharacteristic?) {
             if (offset == 0) FileLog.event("app read ${shortUuid(ch?.uuid)}")   // e.g. does it read our identity/feature?
-            val full = ch?.let { cache[it.uuid] } ?: ByteArray(0)
+            val full = ch?.let { cache[it.uuid] }
+            if (full == null) {
+                // Not read from the trainer yet (its reads queue behind every subscribe). Answer ATT
+                // "Unlikely Error" so the client can retry — an empty SUCCESS reads as "no capabilities".
+                FileLog.event("app read ${shortUuid(ch?.uuid)} — cache cold, answering 0x0E")
+                runCatching { server?.sendResponse(device, requestId, ATT_UNLIKELY_ERROR, offset, ByteArray(0)) }
+                return
+            }
             val value = if (offset in 0..full.size) full.copyOfRange(offset, full.size) else ByteArray(0)
             runCatching { server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value) }
         }
@@ -270,7 +288,7 @@ class MirrorServer(
     private fun startAdvertising() {
         // no trainer → stay off the air (see setTrainerLinked); not built → we'd advertise an empty GATT and
         // an app that connects in that window caches it. onServiceAdded calls back here once services land.
-        if (advertising || !trainerLinked || !built.get()) return
+        if (advertising || !trainerLinked || !servicesReady) return
         val advertiser = adapter.bluetoothLeAdvertiser ?: run { onStatus(context.getString(R.string.status_ble_adv_unsupported)); onAdvState(false); return }
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
@@ -284,8 +302,8 @@ class MirrorServer(
             bp.serviceUuids.forEach { builder.addServiceUuid(it) }
             bp.manufacturerData.forEach { (id, d) -> runCatching { builder.addManufacturerData(id, d) } }
         } else {
-            builder.addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1816)))
-                .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1818)))
+            // only what we actually serve — advertising CSC 0x1816 made head units connect and find nothing
+            builder.addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1818)))
                 .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1826)))
         }
         runCatching { advertiser.startAdvertising(settings, builder.build(), advCallback) }

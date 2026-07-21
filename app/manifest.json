@@ -7,6 +7,6 @@
   "latestVersionCode": 20260721,
   "developer": "Enderthor",
   "description": "Bridges your indoor trainer to your apps (Bestcycling/Garmin/Karoo), correcting the reported power on the fly and inverting the ERG target, and re-exposes it as a virtual power/cadence/speed sensor to the Karoo.",
-  "releaseNotes": "Config changes (simulation, pairing, ANT, advertised name) now apply without restarting. Scan lists only trainers and power meters, and offers the trainer already in use. Simulation reports the same capabilities as the real trainer. The bridge only advertises while a trainer is connected.",
+  "releaseNotes": "Config changes (simulation, pairing, ANT, advertised name) now apply on save, which can briefly drop connected apps \u2014 avoid saving mid-ride. Scan lists only trainers and power meters (retrying unfiltered if that finds nothing) and offers the trainer already in use. With nothing paired the bridge now connects to the first FTMS trainer it finds, so pair yours if another may be in range. Simulation reports the same capabilities as the real trainer. The bridge only advertises while a trainer is connected.",
   "tags": ["health","performance"]
 }

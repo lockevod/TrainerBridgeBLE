@@ -34,7 +34,7 @@
     <string name="config_save_correction">Guardar corrección</string>
     <string name="config_saved">Guardado</string>
     <string name="config_bike">Bicicleta (BLE)</string>
-    <string name="config_scan_start">Buscar bicicleta</string>
+    <string name="config_scan_start">Buscar rodillo</string>
     <string name="config_scan_stop">Parar búsqueda</string>
     <string name="config_forget">Olvidar dispositivo</string>
     <string name="config_none_paired">Ninguna emparejada (se usará el primer rodillo encontrado)</string>
@@ -85,6 +85,6 @@
     <string name="notif_emitting">Emitiendo</string>
     <string name="notif_receiving">Recibiendo</string>
     <string name="config_scan_failed">Fallo al buscar (código %d)</string>
-    <string name="config_in_use">El puente está conectado a %s. Un dispositivo conectado no puede salir en la búsqueda.</string>
+    <string name="config_in_use">El puente está conectado a %s. Un dispositivo conectado no puede aparecer en la búsqueda.</string>
     <string name="config_pair_in_use">Emparejar el rodillo en uso</string>
 </resources>

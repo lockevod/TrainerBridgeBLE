@@ -30,15 +30,16 @@ class SimSource(
     private var crankTurns = 0.0; private var wheelTurns = 0.0   // fractional accumulators, reported as integers
     private var crankRevs = 0; private var wheelRevs = 0
     private var crankEvt1024 = 0; private var wheelEvt2048 = 0   // CPS event timestamps, uint16 wrapping
+    private var clock1024 = 0; private var clock2048 = 0         // free-running, sampled on a revolution
     @Volatile private var ergTarget: Int? = null   // set by a Set Target Power write
-    @Volatile var resistance = 20                   // 0..100 %, changed by the emulated buttons or app control
+    @Volatile var resistance = 40                   // 0..200, FE-C 0.5% units — the range RES_RANGE declares
         private set
 
     /** Emulate the trainer's resistance buttons (test mode). Changes the level and notifies the apps. */
     fun buttonUp() = changeResistance(+5)
     fun buttonDown() = changeResistance(-5)
     private fun changeResistance(delta: Int) {
-        resistance = (resistance + delta).coerceIn(0, 100)
+        resistance = (resistance + delta).coerceIn(0, 200)
         FileLog.event("SIM button → resistance=$resistance%")
         emitResistance()
     }
@@ -46,9 +47,9 @@ class SimSource(
     /** Report the resistance to the apps two ways, like a real Zycle: FTMS Machine Status (standard) AND the
      *  Zycle-style proprietary characteristic carrying the raw FE-C Basic Resistance page (buttons). */
     private fun emitResistance() {
-        val level = resistance   // sim: level == % (0..100)
+        val level = resistance
         onValue(STATUS, byteArrayOf(0x07, (level and 0xFF).toByte(), ((level shr 8) and 0xFF).toByte()))
-        val units = (resistance * 2).coerceIn(0, 200)   // FE-C 0.5% units
+        val units = resistance   // already FE-C 0.5% units
         onValue(PROP_BUTTON, byteArrayOf(0x30, 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), units.toByte()))
     }
 
@@ -70,9 +71,17 @@ class SimSource(
             ticks++; elapsedS = ticks * TICK_MS / 1000
             crankTurns += cadence / 60.0 * (TICK_MS / 1000.0)
             wheelTurns += speedKmh / 3.6 * (TICK_MS / 1000.0) / WHEEL_M
-            crankRevs = crankTurns.toInt() and 0xFFFF; wheelRevs = wheelTurns.toInt()
-            crankEvt1024 = (crankEvt1024 + TICK_MS * 1024 / 1000) and 0xFFFF
-            wheelEvt2048 = (wheelEvt2048 + TICK_MS * 2048 / 1000) and 0xFFFF
+            // Free-running clocks, SAMPLED when a revolution actually happens: the event time must be the
+            // time of that revolution, so a consumer's delta-revs / delta-time lands on the real cadence.
+            // (Advancing it per revolution instead would report every rev as 250 ms apart => ~240 rpm.)
+            clock1024 += TICK_MS * 1024 / 1000
+            clock2048 += TICK_MS * 2048 / 1000
+            if (crankTurns.toInt() and 0xFFFF != crankRevs) {
+                crankRevs = crankTurns.toInt() and 0xFFFF; crankEvt1024 = clock1024 and 0xFFFF
+            }
+            if (wheelTurns.toInt() != wheelRevs) {
+                wheelRevs = wheelTurns.toInt(); wheelEvt2048 = clock2048 and 0xFFFF
+            }
             onValue(IBD, indoorBikeData(power, cadence, speedKmh, resistance))
             onValue(CPM, cyclingPower(power))
             handler.postDelayed(this, TICK_MS.toLong())
@@ -103,14 +112,15 @@ class SimSource(
         val op = bytes[0].toInt() and 0xFF
         when (op) {
             0x05 -> if (bytes.size >= 3) ergTarget = (bytes[1].toInt() and 0xFF) or ((bytes[2].toInt() and 0xFF) shl 8)  // Set Target Power
-            0x04 -> if (bytes.size >= 2) { resistance = (bytes[1].toInt() and 0xFF).coerceIn(0, 100); emitResistance() }   // Set Target Resistance (app → down)
+            0x04 -> if (bytes.size >= 2) { resistance = (bytes[1].toInt() and 0xFF).coerceIn(0, 200); emitResistance() }   // Set Target Resistance (app → down)
             0x01 -> ergTarget = null   // Reset
         }
         // Control Point Response indication (0x80 <reqOp> <result>) — a real trainer sends this, and apps
-        // gate their ERG handshake on it, so emit it or sim control never "takes". Spin Down (0x13) is
-        // declared by the feature value we clone but not implemented: its success response must carry the
-        // target speeds, so answer "op code not supported" (0x02) rather than hang a calibrating app.
-        val result: Byte = if (op == 0x13) 0x02 else 0x01
+        // gate their ERG handshake on it, so emit it or sim control never "takes". We clone the trainer's
+        // feature bits, which advertise more than the simulator implements (slope 0x11, wheel 0x12, spin
+        // down 0x13): answer "op code not supported" (0x02) for those instead of a success an app would
+        // then wait on — a slope-mode app would otherwise watch power ignore the grade forever.
+        val result: Byte = if (op in IMPLEMENTED_OPS) 0x01 else 0x02
         onValue(CONTROL, byteArrayOf(0x80.toByte(), (op and 0xFF).toByte(), result))
     }
 
@@ -169,6 +179,8 @@ class SimSource(
         val PROP_SERVICE: UUID = UUID.fromString("F03EEE01-4910-473C-BE46-960948C2F59C")
         val PROP_BUTTON: UUID = UUID.fromString("F03EE002-4910-473C-BE46-960948C2F59C")
         val CCCD: UUID = GattUuids.uuid16(0x2902)
+        // request control, reset, set target resistance, set target power, start/resume, stop/pause
+        val IMPLEMENTED_OPS = setOf(0x00, 0x01, 0x04, 0x05, 0x07, 0x08)
         const val TICK_MS = 250
         const val WHEEL_M = 2.096   // 700x23c, for the simulated wheel revolutions
         const val R = android.bluetooth.BluetoothGattCharacteristic.PROPERTY_READ

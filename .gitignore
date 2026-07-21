@@ -8,3 +8,5 @@
 .externalNativeBuild
 .cxx
 /app/build/
+/app/release/
+/graphify-out/

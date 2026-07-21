@@ -33,11 +33,12 @@ class BridgeService : Service() {
     inner class LocalBinder : Binder() { val service: BridgeService get() = this@BridgeService }
     private val binder = LocalBinder()
 
-    private var client: TrainerSource? = null
-    private var simSource: SimSource? = null
-    private var mirror: MirrorServer? = null
-    private var antTx: AntFecTx? = null
+    @Volatile private var client: TrainerSource? = null      // all four are written on the main looper and
+    @Volatile private var simSource: SimSource? = null       // read from GATT binder / server callback
+    @Volatile private var mirror: MirrorServer? = null       // threads, so the reference itself must be
+    @Volatile private var antTx: AntFecTx? = null            // safely published
     private var wakeLock: PowerManager.WakeLock? = null
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
 
     @Volatile private var lastProfile: GattProfile? = null       // trainer GATT, cached so a late-started mirror can build
     @Volatile private var lastAdvBlueprint: AdvBlueprint? = null  // trainer's advertising, cached for a late-started mirror
@@ -98,17 +99,22 @@ class BridgeService : Service() {
             ACTION_MASTER_ON -> { if (goForeground()) maybeStartReceive() }
             ACTION_MASTER_OFF -> {
                 stopEmit(); stopReceive(); releaseWakeLock()
+                Config(this).emitEnabled = false
                 foreground = false
                 ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf()
             }
             // master off: nothing to reconfigure, and don't leave an idle started service behind
-            ACTION_RECONFIGURE -> if (foreground) { FileLog.enabled = Config(this).loggingEnabled; applyConfigChange() } else stopSelf()
+            ACTION_RECONFIGURE -> if (foreground) { FileLog.enabled = Config(this).loggingEnabled; applyConfigChange() }
+                                 else if (!Config(this).masterEnabled) stopSelf()   // don't kill a service the master wants alive
             ACTION_EMIT_START -> { if (foreground) startEmit() }   // never emit from a non-foreground (master-off) service
-            ACTION_EMIT_STOP -> stopEmit()
+            ACTION_EMIT_STOP -> { Config(this).emitEnabled = false; stopEmit() }
             else -> {
                 // Null intent = a START_STICKY restart after a process kill. Re-derive from persisted config:
                 // if the master is on, come back up (foreground + receive); otherwise there's nothing to do.
-                if (Config(this).masterEnabled) { if (goForeground()) maybeStartReceive() } else stopSelf()
+                val cfg = Config(this)
+                if (cfg.masterEnabled) {
+                    if (goForeground()) { maybeStartReceive(); if (cfg.emitEnabled) startEmit() }
+                } else stopSelf()
             }
         }
         return START_STICKY
@@ -144,21 +150,25 @@ class BridgeService : Service() {
     private fun sourceKey(config: Config) = if (config.simulate) "sim" else config.pairedAddress.ifEmpty { "any" }
     @Volatile private var currentSourceKey: String? = null
 
-    /** What the emit half was built with. The mirror takes the advertised name in its constructor and the
-     *  ANT settings are read once in [startEmit], so these only apply by cycling the emit half. */
-    private fun emitKey(config: Config) =
-        "${config.advertisedName}|${config.antOutputEnabled}|${config.antDeviceId}"
-    @Volatile private var currentEmitKey: String? = null
+    /** What the emit half was built with. Kept SEPARATE: cycling the mirror drops every connected app, so
+     *  an ANT-only change must never touch it (and vice versa). */
+    private fun mirrorKey(config: Config) = config.advertisedName
+    private fun antKey(config: Config) = "${config.antOutputEnabled}|${config.antDeviceId}"
+    @Volatile private var currentMirrorKey: String? = null
+    @Volatile private var currentAntKey: String? = null
 
     /** Config was saved — re-derive whatever was captured at start time. A source change already cycles the
      *  emit half, so it subsumes an emit change; both are no-ops when nothing relevant moved. */
     private fun applyConfigChange() {
         val config = Config(this)
         if (restartReceiveIfSourceChanged()) return
-        if (emitting && emitKey(config) != currentEmitKey) {
-            FileLog.event("emit config changed $currentEmitKey -> ${emitKey(config)}, restarting emit")
+        if (!emitting) return
+        if (mirrorKey(config) != currentMirrorKey) {   // advertised name — the mirror can't change it live
+            FileLog.event("mirror name changed $currentMirrorKey -> ${mirrorKey(config)}, restarting emit")
             stopEmit(); startEmit()
+            return                                     // startEmit picked up the ANT settings too
         }
+        if (antKey(config) != currentAntKey) restartAnt(config)
     }
 
     /** @return true if the receive half (and with it the emit half) was restarted. */
@@ -166,10 +176,6 @@ class BridgeService : Service() {
         val config = Config(this)
         val wanted = sourceKey(config)
         if (!receiving || wanted == currentSourceKey) return false   // nothing running, or the same source → don't drop a live link
-        if (currentSourceKey == "any" && zycleConnected && wanted == config.lastSeenAddress) {
-            currentSourceKey = wanted   // "pair the trainer in use": same physical device, keep the live link
-            return false
-        }
         FileLog.event("source changed $currentSourceKey -> $wanted, restarting receive")
         // The mirror builds its GATT once (a trainer reconnect keeps it), so a genuine source change has to
         // cycle the emit half too or it keeps serving the previous source's services. Apps reconnect.
@@ -188,6 +194,7 @@ class BridgeService : Service() {
     private fun startReceive() {
         if (client != null || simSource != null) return   // idempotent
         val config = Config(this)
+        config.lastSeenAddress = ""; config.lastSeenName = ""   // runtime state; a process kill leaves it stale
         FileLog.event("receive start paired=${config.pairedAddress.ifEmpty { "any" }} sim=${config.simulate}")
         val onProfile: (GattProfile) -> Unit = { profile -> lastProfile = profile; mirror?.build(profile) }
         val onValue: (java.util.UUID, ByteArray) -> Unit = { uuid, value ->
@@ -205,7 +212,8 @@ class BridgeService : Service() {
         currentSourceKey = sourceKey(config)
         c.start()
         client = c
-        status = getString(R.string.status_searching_trainer)
+        // after start(): SimSource reports connected synchronously, so don't overwrite it with "searching"
+        status = getString(if (zycleConnected) R.string.status_trainer_connected else R.string.status_searching_trainer)
         updateNotification(); listener?.invoke()
     }
 
@@ -242,14 +250,34 @@ class BridgeService : Service() {
         m.setTrainerLinked(zycleConnected)            // Start pressed with the trainer already connected
         lastProfile?.let { m.build(it) }              // mirror started after the trainer was already discovered → build now
         lastAdvBlueprint?.let { m.setAdvBlueprint(it) }
-        if (config.antOutputEnabled) {
-            antEnabled = true; antOk = false; antStatus = getString(R.string.status_starting)
-            antTx = AntFecTx(this, deviceNumber = config.antDeviceId, onState = { ok, detail -> antOk = ok; antStatus = detail; listener?.invoke() })
-                .also { it.start(); FileLog.event("ANT+ output enabled id=${config.antDeviceId}") }
-        }
+        if (config.antOutputEnabled) startAntTx(config)
         emitting = true
-        currentEmitKey = emitKey(config)
+        Config(this).emitEnabled = true               // so a START_STICKY restart brings the mirror back
+        currentMirrorKey = mirrorKey(config); currentAntKey = antKey(config)
         updateNotification(); listener?.invoke()
+    }
+
+    private fun startAntTx(config: Config) {
+        antEnabled = true; antOk = false; antStatus = getString(R.string.status_starting)
+        antTx = AntFecTx(this, deviceNumber = config.antDeviceId, onState = { ok, detail -> antOk = ok; antStatus = detail; listener?.invoke() })
+            .also { it.start(); FileLog.event("ANT+ output enabled id=${config.antDeviceId}") }
+    }
+
+    /** Cycle ONLY the ANT channel — the BLE mirror and every app connected to it stay up. The ANT service
+     *  releases its channel asynchronously, so re-acquiring immediately races the release and loses on
+     *  single-channel hardware. ponytail: fixed delay; wait for a release callback if it still races. */
+    private fun restartAnt(config: Config) {
+        FileLog.event("ANT config changed $currentAntKey -> ${antKey(config)}")
+        antTx?.stop(); antTx = null
+        antEnabled = false; antOk = false; antStatus = ""
+        currentAntKey = antKey(config)
+        listener?.invoke()
+        if (!config.antOutputEnabled) return
+        antEnabled = true; antStatus = getString(R.string.status_starting)
+        handler.postDelayed({
+            val c = Config(this)
+            if (emitting && antTx == null && c.antOutputEnabled) startAntTx(c)
+        }, ANT_RESTART_DELAY_MS)
     }
 
     private fun stopEmit() {
@@ -258,7 +286,7 @@ class BridgeService : Service() {
         mirror?.stop(); mirror = null
         antTx?.stop(); antTx = null
         antEnabled = false; antOk = false; antStatus = ""; bleAdvOk = true; lastControl = null
-        emitting = false
+        emitting = false; currentMirrorKey = null; currentAntKey = null
         updateNotification(); listener?.invoke()
     }
 
@@ -309,7 +337,11 @@ class BridgeService : Service() {
     private fun le16signed(b: ByteArray, i: Int) = le16(b, i).toShort().toInt()
 
     override fun onDestroy() { stopEmit(); stopReceive(); releaseWakeLock(); super.onDestroy() }
-    override fun onTimeout(startId: Int) { stopEmit(); stopReceive(); releaseWakeLock(); stopSelf() }
+    override fun onTimeout(startId: Int) {
+        stopEmit(); stopReceive(); releaseWakeLock()
+        foreground = false   // or a later EMIT_START would pass the foreground gate on a dying service
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf()
+    }
 
     private fun acquireWakeLock() {
         if (wakeLock?.isHeld == true) return
@@ -344,6 +376,7 @@ class BridgeService : Service() {
     companion object {
         private const val CHANNEL_ID = "bridge-ble"
         private const val NOTIF_ID = 1
+        private const val ANT_RESTART_DELAY_MS = 1500L   // let the ANT service release the channel first
         const val ACTION_MASTER_ON = "com.enderthor.trainerbridgeble.MASTER_ON"
         const val ACTION_MASTER_OFF = "com.enderthor.trainerbridgeble.MASTER_OFF"
         const val ACTION_EMIT_START = "com.enderthor.trainerbridgeble.EMIT_START"

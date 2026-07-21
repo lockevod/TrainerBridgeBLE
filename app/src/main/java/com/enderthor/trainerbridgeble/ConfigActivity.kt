@@ -34,6 +34,8 @@ class ConfigActivity : Activity() {
 
     private val adapter by lazy { (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager).adapter }
     private var scanning = false
+    private var softFilter = false   // unfiltered retry in progress: match FTMS/CPS in the callback instead
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
     private val found = LinkedHashMap<String, String>()   // address → name
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -116,6 +118,9 @@ class ConfigActivity : Activity() {
             val name = result.scanRecord?.deviceName ?: dev.name ?: run {
                 FileLog.event("config scan: unnamed ${dev.address} rssi=${result.rssi} — skipped"); return
             }
+            if (softFilter && result.scanRecord?.serviceUuids?.any { it.uuid == POWER_SVC || it.uuid == FTMS_SVC } != true) {
+                FileLog.event("config scan: '$name' ${dev.address} — no FTMS/CPS in advert or scan response, skipped"); return
+            }
             if (found.put(dev.address, name) == null) {
                 FileLog.event("config scan: '$name' ${dev.address} rssi=${result.rssi}")
                 rebuildFound()
@@ -129,22 +134,37 @@ class ConfigActivity : Activity() {
 
     private fun toggleScan() {
         if (scanning) { stopScan(); return }
-        found.clear(); rebuildFound()
+        found.clear(); softFilter = false; rebuildFound()
         val scanner = adapter?.bluetoothLeScanner ?: run { toast(getString(R.string.config_ble_unavailable)); return }
-        scanning = true; scanBtn.text = getString(R.string.config_scan_stop)
         FileLog.event("config scan start (filters: FTMS 0x1826 + CPS 0x1818)")
-        runCatching {
-            scanner.startScan(com.enderthor.trainerbridgeble.ble.GattUuids.scanFilters(0x1826, 0x1818),
-                android.bluetooth.le.ScanSettings.Builder()
-                    .setScanMode(android.bluetooth.le.ScanSettings.SCAN_MODE_LOW_LATENCY).build(),
-                scanCallback)
-        }
+        if (!startScan(filtered = true)) { toast(getString(R.string.config_ble_unavailable)); return }
+        scanning = true; scanBtn.text = getString(R.string.config_scan_stop)   // only once the scan really started
+        // A trainer may carry its service UUIDs in the scan response, which the controller's offloaded
+        // filter never sees — so a filtered scan that finds nothing must not be the end of the road.
+        handler.postDelayed({
+            if (scanning && found.isEmpty()) {
+                FileLog.event("config scan: nothing with a service filter, retrying unfiltered")
+                runCatching { adapter?.bluetoothLeScanner?.stopScan(scanCallback) }
+                softFilter = true
+                startScan(filtered = false)
+            }
+        }, UNFILTERED_RETRY_MS)
+    }
+
+    /** @return false if the scan could not be started at all. */
+    private fun startScan(filtered: Boolean): Boolean {
+        val scanner = adapter?.bluetoothLeScanner ?: return false
+        val settings = android.bluetooth.le.ScanSettings.Builder()
+            .setScanMode(android.bluetooth.le.ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+        val filters = if (filtered) com.enderthor.trainerbridgeble.ble.GattUuids.scanFilters(0x1826, 0x1818) else null
+        return runCatching { scanner.startScan(filters, settings, scanCallback) }.isSuccess
     }
 
     private fun stopScan() {
         if (!scanning) return
         scanning = false; scanBtn.text = getString(R.string.config_scan_start)
-        FileLog.event("config scan stop, ${found.size} device(s)")
+        handler.removeCallbacksAndMessages(null)
+        FileLog.event("config scan stop, ${found.size} device(s)${if (softFilter) " (unfiltered pass)" else ""}")
         runCatching { adapter?.bluetoothLeScanner?.stopScan(scanCallback) }
     }
 
@@ -177,4 +197,10 @@ class ConfigActivity : Activity() {
     }
 
     private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_SHORT).show()
+
+    private companion object {
+        const val UNFILTERED_RETRY_MS = 6000L
+        val FTMS_SVC = com.enderthor.trainerbridgeble.ble.GattUuids.uuid16(0x1826)
+        val POWER_SVC = com.enderthor.trainerbridgeble.ble.GattUuids.uuid16(0x1818)
+    }
 }

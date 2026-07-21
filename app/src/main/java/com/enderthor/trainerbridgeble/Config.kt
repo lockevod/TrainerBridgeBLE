@@ -24,6 +24,12 @@ class Config(context: Context) {
         get() = p.getInt(KEY_INVERT_FLOOR, 50)
         set(v) = p.edit().putInt(KEY_INVERT_FLOOR, v).apply()
 
+    /** Whether the emit half was on, so a START_STICKY restart after a process kill brings the mirror and
+     *  ANT back instead of coming up receive-only mid-ride. */
+    var emitEnabled: Boolean
+        get() = p.getBoolean(KEY_EMIT, false)
+        set(v) = p.edit().putBoolean(KEY_EMIT, v).apply()
+
     /** The trainer the bridge last connected to. A connected BLE peripheral stops advertising, so it can
      *  NOT appear in a scan while the bridge is using it — this is how the config screen offers it anyway. */
     var lastSeenAddress: String
@@ -95,5 +101,6 @@ class Config(context: Context) {
         const val KEY_ANT = "antOutput"
         const val KEY_ANT_ID = "antDeviceId"
         const val KEY_MASTER = "masterEnabled"
+        const val KEY_EMIT = "emitEnabled"
     }
 }

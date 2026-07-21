@@ -70,3 +70,24 @@ class IndoorBikeDataLayoutTest {
         for (i in original.indices) if (i != 11 && i != 12) assertEquals("byte $i", original[i], corrected[i])
     }
 }
+
+/** CPS event time must be the time of the revolution, not one tick per revolution: a consumer computes
+ *  cadence as Δrevs / Δtime, so sampling a free-running clock is the difference between 87 and 240 rpm. */
+class CpsEventClockTest {
+
+    @Test fun cadenceFromEventClockMatchesTheSimulatedCadence() {
+        val tickMs = 250; val cadenceRpm = 87.0
+        var turns = 0.0; var revs = 0; var clock1024 = 0; var evt = 0
+        var firstEvt = -1; var firstRev = 0
+        repeat(240) {                                    // 60 s at 4 Hz
+            turns += cadenceRpm / 60.0 * (tickMs / 1000.0)
+            clock1024 += tickMs * 1024 / 1000
+            if (turns.toInt() != revs) {
+                revs = turns.toInt(); evt = clock1024 and 0xFFFF
+                if (firstEvt < 0) { firstEvt = evt; firstRev = revs }
+            }
+        }
+        val rpm = (revs - firstRev) * 60.0 / ((evt - firstEvt) / 1024.0)
+        assertEquals(cadenceRpm, rpm, 1.0)
+    }
+}

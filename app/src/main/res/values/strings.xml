@@ -34,7 +34,7 @@
     <string name="config_save_correction">Save correction</string>
     <string name="config_saved">Saved</string>
     <string name="config_bike">Bike (BLE)</string>
-    <string name="config_scan_start">Search bike</string>
+    <string name="config_scan_start">Search trainer</string>
     <string name="config_scan_stop">Stop search</string>
     <string name="config_forget">Forget device</string>
     <string name="config_none_paired">None paired (will use the first trainer found)</string>

@@ -127,6 +127,7 @@ class ZycleClient(
     // ── scan ────────────────────────────────────────────────────────────────────────────────────────
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
+            if (stopped) return   // results already queued in the controller when stop() landed
             val dev = result?.device ?: return
             val name = result.scanRecord?.deviceName ?: dev.name
             // the scan filter already guarantees FTMS/CPS, so unpaired = take the first trainer that answers
@@ -203,6 +204,7 @@ class ZycleClient(
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+            if (stopped) return   // a stopped client must not hand its profile to whatever replaced it
             if (status != BluetoothGatt.GATT_SUCCESS) { Log.w(tag, "discover failed $status"); return }
             val profile = buildProfile(g)
             FileLog.event("Zycle profile: " + profile.services.joinToString("; ") { s ->
@@ -248,6 +250,7 @@ class ZycleClient(
 
         @Deprecated("Deprecated in Java")
         override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
+            if (stopped) return   // in-flight notification after stop() — not our data any more
             val value = @Suppress("DEPRECATION") (ch.value?.copyOf() ?: ByteArray(0))
             lastMessageMs = System.currentTimeMillis()   // feed the silent-link watchdog
             logNotif(ch.uuid, value)   // all notifications (power included), rate-limited per char
