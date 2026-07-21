@@ -100,14 +100,23 @@ class ConfigActivity : Activity() {
     else getString(R.string.config_paired, config.pairedName.ifEmpty { config.pairedAddress })
 
     private fun save() {
-        scaleField.text.toString().toIntOrNull()?.let { if (it > -100) config.scaleAdjustPercent = it }
-        offsetField.text.toString().toIntOrNull()?.let { config.offsetW = it }
-        floorField.text.toString().toIntOrNull()?.let { if (it >= 0) config.invertFloorW = it }
+        // A value that doesn't parse used to be dropped in silence, leaving the OLD calibration in place
+        // while the field showed the new one — in an app whose whole job is calibration.
+        val rejected = mutableListOf<String>()
+        fun intField(field: EditText, label: String, ok: (Int) -> Boolean, apply: (Int) -> Unit) {
+            val raw = field.text.toString().trim()
+            val v = raw.toIntOrNull()
+            if (v != null && ok(v)) apply(v) else if (raw.isNotEmpty()) rejected += label
+        }
+        intField(scaleField, getString(R.string.config_scale_label), { it > -100 }) { config.scaleAdjustPercent = it }
+        intField(offsetField, getString(R.string.config_offset_label), { true }) { config.offsetW = it }
+        intField(floorField, getString(R.string.config_floor_label), { it >= 0 }) { config.invertFloorW = it }
         nameField.text.toString().trim().takeIf { it.isNotEmpty() }?.let { config.advertisedName = it }
         config.loggingEnabled = logCheck.isChecked
         config.simulate = simCheck.isChecked
         config.antOutputEnabled = antCheck.isChecked
-        antIdField.text.toString().toIntOrNull()?.let { if (it in 1..65535) config.antDeviceId = it }
+        intField(antIdField, getString(R.string.config_ant_id), { it in 1..65535 }) { config.antDeviceId = it }
+        if (rejected.isNotEmpty()) toast(getString(R.string.config_not_saved, rejected.size))
         BridgeService.reconfigure(this)   // no-op unless the source (simulation / paired trainer) actually changed
     }
 

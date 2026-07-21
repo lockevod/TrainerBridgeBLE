@@ -87,4 +87,5 @@
     <string name="config_scan_failed">Scan failed (code %d)</string>
     <string name="config_in_use">The bridge is connected to %s. A connected device cannot appear in a scan.</string>
     <string name="config_pair_in_use">Pair the trainer in use</string>
+    <string name="config_not_saved">%d value(s) NOT saved: whole numbers only</string>
 </resources>
