@@ -91,4 +91,5 @@
     <string name="control_request">Pide control</string>
     <string name="control_sim">Simulación (pendiente)</string>
     <string name="control_spindown">Calibración</string>
+    <string name="config_name_device_default">(nombre del dispositivo)</string>
 </resources>

@@ -75,6 +75,10 @@ class ConfigActivity : Activity() {
         idc.addView(bodyText(getString(R.string.config_name_hint), 12f))
         nameField = textField(config.advertisedName).apply {
             filters = arrayOf(android.text.InputFilter.LengthFilter(14))   // >14 chars overflows the 31-byte advert with the cloned UUIDs+mfr data
+            // Empty is the normal case, so show what empty actually MEANS: the device's own name, greyed out
+            // in the field itself rather than only explained in the hint text above it.
+            hint = runCatching { adapter?.name }.getOrNull()?.takeIf { it.isNotBlank() }
+                ?: getString(R.string.config_name_device_default)
         }
         idc.addView(nameField)
         body.addView(idc)

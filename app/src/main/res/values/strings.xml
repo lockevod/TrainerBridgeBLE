@@ -91,4 +91,5 @@
     <string name="control_request">Request control</string>
     <string name="control_sim">Simulation (slope)</string>
     <string name="control_spindown">Calibration</string>
+    <string name="config_name_device_default">(this device\'s name)</string>
 </resources>
