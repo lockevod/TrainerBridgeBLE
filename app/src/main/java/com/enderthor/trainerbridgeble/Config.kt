@@ -24,6 +24,15 @@ class Config(context: Context) {
         get() = p.getInt(KEY_INVERT_FLOOR, 50)
         set(v) = p.edit().putInt(KEY_INVERT_FLOOR, v).apply()
 
+    /** The trainer the bridge last connected to. A connected BLE peripheral stops advertising, so it can
+     *  NOT appear in a scan while the bridge is using it — this is how the config screen offers it anyway. */
+    var lastSeenAddress: String
+        get() = p.getString(KEY_SEEN_ADDR, "") ?: ""
+        set(v) = p.edit().putString(KEY_SEEN_ADDR, v).apply()
+    var lastSeenName: String
+        get() = p.getString(KEY_SEEN_NAME, "") ?: ""
+        set(v) = p.edit().putString(KEY_SEEN_NAME, v).apply()
+
     /** The paired trainer's BLE address (empty = connect to the first FTMS/CPS device found). */
     var pairedAddress: String
         get() = p.getString(KEY_ADDR, "") ?: ""
@@ -77,6 +86,8 @@ class Config(context: Context) {
         const val KEY_OFFSET = "offsetW"
         const val KEY_INVERT_FLOOR = "invertFloorW"
         const val KEY_ADDR = "pairedAddress"
+        const val KEY_SEEN_ADDR = "lastSeenAddress"
+        const val KEY_SEEN_NAME = "lastSeenName"
         const val KEY_NAME = "pairedName"
         const val KEY_ADVNAME = "advertisedName"
         const val KEY_LOG = "loggingEnabled"

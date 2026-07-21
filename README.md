@@ -113,7 +113,12 @@ Open **Configuración** from the Monitor:
 ## Notes & limitations
 
 - **Simulation mode** feeds a synthetic trainer through the whole pipeline (UI, correction, mirror, ANT+,
-  virtual sensor) with no hardware — useful for testing.
+  virtual sensor) with no hardware — useful for testing. Two things behave differently from a real trainer:
+  - **The resistance arrows change the reported level, not the power.** The synthetic trainer has no rider,
+    so its power follows its own curve (or the app's ERG target) and ignores resistance entirely. On a real
+    trainer, more resistance changes the rider's effort and the power follows; in simulation nothing
+    downstream moves. The level itself is reported normally (FTMS Machine Status + Indoor Bike Data).
+  - **ERG does work**: an app that writes Set Target Power drives the simulated power to that target.
 - **A Garmin watch over Bluetooth**: watches discover sensors by service UUID (which the mirror
   advertises), but Android can't set the advertising *Appearance* and uses a rotating random address —
   either can stop a picky watch from listing the Bluetooth mirror. The reliable path to a Garmin is the

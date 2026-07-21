@@ -36,6 +36,7 @@ class ZycleClient(
     private val onValue: (charUuid: UUID, value: ByteArray) -> Unit,   // notifications AND initial reads
     private val onState: (connected: Boolean) -> Unit,
     private val onAdv: (AdvBlueprint) -> Unit = {},   // the trainer's own advertising, for the mirror to clone
+    private val onFound: (name: String?, address: String) -> Unit = { _, _ -> },   // for the config screen
 ) : TrainerSource {
     private val tag = "TBB/ZycleClient"
     private val handler = Handler(Looper.getMainLooper())
@@ -134,6 +135,7 @@ class ZycleClient(
                 if (gatt != null || connecting) return   // already connecting/connected — ignore duplicate adverts
                 connecting = true
                 FileLog.event("Zycle found '$name' ${dev.address} rssi=${result.rssi}")
+                onFound(name, dev.address)
                 captureAdv(result)
                 stopScan(); connect(dev)
             }

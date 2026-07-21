@@ -84,4 +84,7 @@
     <string name="ant_failure">ANT failure</string>
     <string name="notif_emitting">Broadcasting</string>
     <string name="notif_receiving">Receiving</string>
+    <string name="config_scan_failed">Scan failed (code %d)</string>
+    <string name="config_in_use">The bridge is connected to %s. A connected device cannot appear in a scan.</string>
+    <string name="config_pair_in_use">Pair the trainer in use</string>
 </resources>

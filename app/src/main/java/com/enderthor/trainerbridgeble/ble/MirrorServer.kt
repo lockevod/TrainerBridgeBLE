@@ -60,6 +60,17 @@ class MirrorServer(
     @Volatile private var advertising = false
     private val built = java.util.concurrent.atomic.AtomicBoolean(false)   // build the mirrored GATT once; a trainer reconnect keeps it
     @Volatile private var advBlueprint: AdvBlueprint? = null   // the trainer's real advertising, to clone
+    @Volatile private var trainerLinked = false   // advertise only while a trainer is actually feeding us
+
+    /** Gate advertising on the trainer link. We advertise under the trainer's own name, and the trainer
+     *  starts advertising again the moment it drops — so advertising with no trainer behind us puts two
+     *  identical devices in the air and lets an app bind to a bridge that has no data to give it. */
+    fun setTrainerLinked(linked: Boolean) {
+        if (trainerLinked == linked) return
+        trainerLinked = linked
+        FileLog.event("mirror trainer link=$linked -> ${if (linked) "advertise" else "stop advertising"}")
+        handler.post { if (linked) startAdvertising() else stopAdvertising() }
+    }
 
     /** Adopt the trainer's own advertised service UUIDs + manufacturer data (captured by the client) so we
      *  advertise an identical packet. If we're already advertising, restart to apply it. */
@@ -81,16 +92,20 @@ class MirrorServer(
     private fun renameAdapter() {
         val prefs = context.getSharedPreferences("trainerbridgeble", Context.MODE_PRIVATE)
         val current = runCatching { adapter.name }.getOrNull()
+        // a stored original always wins over a read-back name, which may still be our own (see restoreName)
         if (prefs.getString(KEY_ORIG_NAME, null) == null && current != null && current != advertisedName)
             prefs.edit().putString(KEY_ORIG_NAME, current).apply()
         originalName = prefs.getString(KEY_ORIG_NAME, null)
         runCatching { if (current != advertisedName) adapter.name = advertisedName }
     }
 
+    /** ponytail: KEY_ORIG_NAME is deliberately NOT cleared. adapter.name is set asynchronously, so a
+     *  stop→start within the same second (a config save that changes the advertised name) would read back
+     *  our own name, fail to store it, and lose the user's real one forever. Keeping it costs a stale pref
+     *  if the user renames the device while we hold it; clear it on restore if that ever matters. */
     private fun restoreName() {
         val prefs = context.getSharedPreferences("trainerbridgeble", Context.MODE_PRIVATE)
         (originalName ?: prefs.getString(KEY_ORIG_NAME, null))?.let { orig -> runCatching { adapter.name = orig } }
-        prefs.edit().remove(KEY_ORIG_NAME).apply()
         originalName = null
     }
 
@@ -253,7 +268,9 @@ class MirrorServer(
     }
 
     private fun startAdvertising() {
-        if (advertising) return
+        // no trainer → stay off the air (see setTrainerLinked); not built → we'd advertise an empty GATT and
+        // an app that connects in that window caches it. onServiceAdded calls back here once services land.
+        if (advertising || !trainerLinked || !built.get()) return
         val advertiser = adapter.bluetoothLeAdvertiser ?: run { onStatus(context.getString(R.string.status_ble_adv_unsupported)); onAdvState(false); return }
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
@@ -274,8 +291,9 @@ class MirrorServer(
         runCatching { advertiser.startAdvertising(settings, builder.build(), advCallback) }
     }
 
+    /** Unconditional, for the same reason [stop] is: `advertising` is false between startAdvertising() and
+     *  onStartSuccess, so an early return here can leave a pending advert running with no trainer behind it. */
     private fun stopAdvertising() {
-        if (!advertising) return
         advertising = false
         runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(advCallback) }
     }

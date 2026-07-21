@@ -84,4 +84,7 @@
     <string name="ant_failure">fallo ANT</string>
     <string name="notif_emitting">Emitiendo</string>
     <string name="notif_receiving">Recibiendo</string>
+    <string name="config_scan_failed">Fallo al buscar (código %d)</string>
+    <string name="config_in_use">El puente está conectado a %s. Un dispositivo conectado no puede salir en la búsqueda.</string>
+    <string name="config_pair_in_use">Emparejar el rodillo en uso</string>
 </resources>

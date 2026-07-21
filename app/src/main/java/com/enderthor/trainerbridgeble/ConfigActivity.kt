@@ -26,6 +26,7 @@ class ConfigActivity : Activity() {
     private lateinit var pairedLine: TextView
     private lateinit var scanBtn: TextView
     private lateinit var foundList: LinearLayout
+    private lateinit var inUseBox: LinearLayout
     private lateinit var logCheck: android.widget.CheckBox
     private lateinit var simCheck: android.widget.CheckBox
     private lateinit var antCheck: android.widget.CheckBox
@@ -38,6 +39,7 @@ class ConfigActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         config = Config(this)
+        FileLog.init(this); FileLog.enabled = config.loggingEnabled
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setBackgroundColor(Palette.PAGE_BG); setPadding(dp(16), dp(20), dp(16), dp(20))
         }
@@ -61,7 +63,9 @@ class ConfigActivity : Activity() {
         foundList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         scanBtn = accentButton(getString(R.string.config_scan_start)) { toggleScan() }
         src.addView(scanBtn); src.addView(foundList)
-        src.addView(plainButton(getString(R.string.config_forget)) { config.pairedAddress = ""; config.pairedName = ""; pairedLine.text = pairedText() })
+        inUseBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        src.addView(inUseBox); rebuildInUse()
+        src.addView(plainButton(getString(R.string.config_forget)) { config.pairedAddress = ""; config.pairedName = ""; pairedLine.text = pairedText(); rebuildInUse() })
         body.addView(src)
 
         // Advertised identity
@@ -87,6 +91,7 @@ class ConfigActivity : Activity() {
         setContentView(ScrollView(this).apply { setBackgroundColor(Palette.PAGE_BG); addView(body) })
     }
 
+    override fun onResume() { super.onResume(); rebuildInUse() }   // the bridge may have connected meanwhile
     override fun onStop() { super.onStop(); stopScan(); save() }
 
     private fun pairedText() = if (config.pairedAddress.isEmpty()) getString(R.string.config_none_paired)
@@ -101,14 +106,24 @@ class ConfigActivity : Activity() {
         config.simulate = simCheck.isChecked
         config.antOutputEnabled = antCheck.isChecked
         antIdField.text.toString().toIntOrNull()?.let { if (it in 1..65535) config.antDeviceId = it }
+        BridgeService.reconfigure(this)   // no-op unless the source (simulation / paired trainer) actually changed
     }
 
     // ── BLE scan ──
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
             val dev = result?.device ?: return
-            val name = result.scanRecord?.deviceName ?: dev.name ?: return   // only named devices
-            if (found.put(dev.address, name) == null) rebuildFound()
+            val name = result.scanRecord?.deviceName ?: dev.name ?: run {
+                FileLog.event("config scan: unnamed ${dev.address} rssi=${result.rssi} — skipped"); return
+            }
+            if (found.put(dev.address, name) == null) {
+                FileLog.event("config scan: '$name' ${dev.address} rssi=${result.rssi}")
+                rebuildFound()
+            }
+        }
+        override fun onScanFailed(errorCode: Int) {
+            FileLog.event("config scan FAILED code=$errorCode")
+            toast(getString(R.string.config_scan_failed, errorCode)); stopScan()
         }
     }
 
@@ -117,6 +132,7 @@ class ConfigActivity : Activity() {
         found.clear(); rebuildFound()
         val scanner = adapter?.bluetoothLeScanner ?: run { toast(getString(R.string.config_ble_unavailable)); return }
         scanning = true; scanBtn.text = getString(R.string.config_scan_stop)
+        FileLog.event("config scan start (filters: FTMS 0x1826 + CPS 0x1818)")
         runCatching {
             scanner.startScan(com.enderthor.trainerbridgeble.ble.GattUuids.scanFilters(0x1826, 0x1818),
                 android.bluetooth.le.ScanSettings.Builder()
@@ -128,7 +144,22 @@ class ConfigActivity : Activity() {
     private fun stopScan() {
         if (!scanning) return
         scanning = false; scanBtn.text = getString(R.string.config_scan_start)
+        FileLog.event("config scan stop, ${found.size} device(s)")
         runCatching { adapter?.bluetoothLeScanner?.stopScan(scanCallback) }
+    }
+
+    /** A BLE peripheral stops advertising while it is connected, so the trainer the bridge is currently
+     *  using can never show up in the scan. Offer it directly instead. */
+    private fun rebuildInUse() {
+        inUseBox.removeAllViews()
+        val addr = config.lastSeenAddress
+        if (addr.isEmpty() || addr == config.pairedAddress) return
+        val name = config.lastSeenName.ifEmpty { addr }
+        inUseBox.addView(bodyText(getString(R.string.config_in_use, name), 13f, Palette.MUTED))
+        inUseBox.addView(plainButton(getString(R.string.config_pair_in_use)) {
+            config.pairedAddress = addr; config.pairedName = config.lastSeenName
+            pairedLine.text = pairedText(); rebuildInUse(); toast(getString(R.string.config_paired, name))
+        })
     }
 
     private fun rebuildFound() {
@@ -139,7 +170,7 @@ class ConfigActivity : Activity() {
                 setPadding(0, dp(8), 0, dp(8))
                 setOnClickListener {
                     config.pairedAddress = addr; config.pairedName = name
-                    pairedLine.text = pairedText(); stopScan(); toast(getString(R.string.config_paired, name))
+                    pairedLine.text = pairedText(); rebuildInUse(); stopScan(); toast(getString(R.string.config_paired, name))
                 }
             })
         }

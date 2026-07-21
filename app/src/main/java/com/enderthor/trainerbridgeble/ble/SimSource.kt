@@ -24,6 +24,12 @@ class SimSource(
     private var current = 170.0
     private var target = 170.0
     private var holdTicks = 0
+    private var distanceM = 0.0   // reported in Indoor Bike Data, like the real trainer
+    private var elapsedS = 0
+    private var ticks = 0
+    private var crankTurns = 0.0; private var wheelTurns = 0.0   // fractional accumulators, reported as integers
+    private var crankRevs = 0; private var wheelRevs = 0
+    private var crankEvt1024 = 0; private var wheelEvt2048 = 0   // CPS event timestamps, uint16 wrapping
     @Volatile private var ergTarget: Int? = null   // set by a Set Target Power write
     @Volatile var resistance = 20                   // 0..100 %, changed by the emulated buttons or app control
         private set
@@ -60,9 +66,16 @@ class SimSource(
             val power = (current + (rng.nextInt(11) - 5)).roundToInt().coerceAtLeast(0)
             val cadence = 87 + (rng.nextInt(7) - 3)
             val speedKmh = 18.0 + power * 0.055
+            distanceM += speedKmh / 3.6 * (TICK_MS / 1000.0)
+            ticks++; elapsedS = ticks * TICK_MS / 1000
+            crankTurns += cadence / 60.0 * (TICK_MS / 1000.0)
+            wheelTurns += speedKmh / 3.6 * (TICK_MS / 1000.0) / WHEEL_M
+            crankRevs = crankTurns.toInt() and 0xFFFF; wheelRevs = wheelTurns.toInt()
+            crankEvt1024 = (crankEvt1024 + TICK_MS * 1024 / 1000) and 0xFFFF
+            wheelEvt2048 = (wheelEvt2048 + TICK_MS * 2048 / 1000) and 0xFFFF
             onValue(IBD, indoorBikeData(power, cadence, speedKmh, resistance))
             onValue(CPM, cyclingPower(power))
-            handler.postDelayed(this, 250)
+            handler.postDelayed(this, TICK_MS.toLong())
         }
     }
 
@@ -70,11 +83,13 @@ class SimSource(
         onState(true)
         onProfile(simProfile())
         FileLog.event("SIM trainer started")
-        // Seed the mirror's read cache for the readable chars.
-        onValue(FEATURE, byteArrayOf(0x02, 0x40, 0, 0, 0x0C, 0, 0, 0))          // machine 0x4002, target 0x000C
-        onValue(POWER_RANGE, byteArrayOf(0, 0, 0xD0.toByte(), 0x07, 1, 0))       // 0..2000 W
+        // Seed the mirror's read cache for the readable chars. These are the REAL trainer's values (captured
+        // from a Zycle): apps gate their UI on them — declaring less than the trainer does (no resistance
+        // level, no Indoor Bike Simulation Parameters) is what greys out an app's automatic/ERG mode.
+        onValue(FEATURE, byteArrayOf(0x86.toByte(), 0x50, 0, 0, 0x0C, 0xE0.toByte(), 0, 0))
+        onValue(POWER_RANGE, byteArrayOf(0, 0, 0xA0.toByte(), 0x0F, 1, 0))       // 0..4000 W
         onValue(RES_RANGE, byteArrayOf(0, 0, 0xC8.toByte(), 0, 1, 0))            // 0..200
-        onValue(CP_FEATURE, byteArrayOf(0, 0, 0, 0))
+        onValue(CP_FEATURE, byteArrayOf(0x0C, 0, 0x04, 0))
         onValue(SENSOR_LOC, byteArrayOf(0))
         emitResistance()
         handler.post(ticker)
@@ -91,20 +106,34 @@ class SimSource(
             0x04 -> if (bytes.size >= 2) { resistance = (bytes[1].toInt() and 0xFF).coerceIn(0, 100); emitResistance() }   // Set Target Resistance (app → down)
             0x01 -> ergTarget = null   // Reset
         }
-        // Control Point Response indication (0x80 <reqOp> <success>) — a real trainer sends this, and apps
-        // gate their ERG handshake on it, so emit it or sim control never "takes".
-        onValue(CONTROL, byteArrayOf(0x80.toByte(), (op and 0xFF).toByte(), 0x01))
+        // Control Point Response indication (0x80 <reqOp> <result>) — a real trainer sends this, and apps
+        // gate their ERG handshake on it, so emit it or sim control never "takes". Spin Down (0x13) is
+        // declared by the feature value we clone but not implemented: its success response must carry the
+        // target speeds, so answer "op code not supported" (0x02) rather than hang a calibrating app.
+        val result: Byte = if (op == 0x13) 0x02 else 0x01
+        onValue(CONTROL, byteArrayOf(0x80.toByte(), (op and 0xFF).toByte(), result))
     }
 
     private fun indoorBikeData(power: Int, cadence: Int, speedKmh: Double, resistance: Int): ByteArray {
         val speed = (speedKmh * 100).roundToInt().coerceIn(0, 0xFFFF)   // 0.01 km/h
         val cad = (cadence * 2).coerceIn(0, 0xFFFF)                     // 0.5 rpm
-        // flags 0x0064: inst speed (bit0=0) + inst cadence (bit2) + resistance level (bit5) + inst power (bit6)
-        return byteArrayOf(0x64, 0x00, lo(speed), hi(speed), lo(cad), hi(cad), lo(resistance), hi(resistance), lo(power), hi(power))
+        val dist = distanceM.toInt().coerceIn(0, 0xFFFFFF)              // uint24, metres
+        val elapsed = elapsedS.coerceIn(0, 0xFFFF)                      // seconds
+        // flags 0x0874, same set the real trainer sends: inst speed (bit0=0) + inst cadence (bit2) +
+        // total distance (bit4) + resistance level (bit5) + inst power (bit6) + elapsed time (bit11)
+        return byteArrayOf(0x74, 0x08, lo(speed), hi(speed), lo(cad), hi(cad),
+            lo(dist), hi(dist), ((dist shr 16) and 0xFF).toByte(),
+            lo(resistance), hi(resistance), lo(power), hi(power), lo(elapsed), hi(elapsed))
     }
 
-    // CPM (0x2A63): flags 0x0000 (power-only; instantaneous power is mandatory at bytes 2-3, no flag).
-    private fun cyclingPower(power: Int): ByteArray = byteArrayOf(0x00, 0x00, lo(power), hi(power))
+    /** CPM (0x2A63): flags 0x0030 — wheel (bit4) + crank (bit5) revolution data, the same set the real
+     *  trainer sends, and what [CP_FEATURE] now declares. Instantaneous power is mandatory, no flag.
+     *  ponytail: the event timestamps advance every tick rather than on a real revolution — a consumer
+     *  computes Δrevs/Δtime, which averages out correctly; emit on true revolutions if that ever matters. */
+    private fun cyclingPower(power: Int): ByteArray = byteArrayOf(0x30, 0x00, lo(power), hi(power),
+        lo(wheelRevs), hi(wheelRevs), ((wheelRevs shr 16) and 0xFF).toByte(), ((wheelRevs shr 24) and 0xFF).toByte(),
+        lo(wheelEvt2048), hi(wheelEvt2048),
+        lo(crankRevs), hi(crankRevs), lo(crankEvt1024), hi(crankEvt1024))
 
     private fun lo(v: Int) = (v and 0xFF).toByte()
     private fun hi(v: Int) = ((v shr 8) and 0xFF).toByte()
@@ -140,6 +169,8 @@ class SimSource(
         val PROP_SERVICE: UUID = UUID.fromString("F03EEE01-4910-473C-BE46-960948C2F59C")
         val PROP_BUTTON: UUID = UUID.fromString("F03EE002-4910-473C-BE46-960948C2F59C")
         val CCCD: UUID = GattUuids.uuid16(0x2902)
+        const val TICK_MS = 250
+        const val WHEEL_M = 2.096   // 700x23c, for the simulated wheel revolutions
         const val R = android.bluetooth.BluetoothGattCharacteristic.PROPERTY_READ
         const val N = android.bluetooth.BluetoothGattCharacteristic.PROPERTY_NOTIFY
         const val W = android.bluetooth.BluetoothGattCharacteristic.PROPERTY_WRITE

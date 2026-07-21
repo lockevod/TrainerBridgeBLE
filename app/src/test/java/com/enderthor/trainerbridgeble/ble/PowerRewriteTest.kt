@@ -2,6 +2,7 @@ package com.enderthor.trainerbridgeble.ble
 
 import com.enderthor.trainerbridgeble.correction.PowerCorrection
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class PowerRewriteTest {
@@ -42,5 +43,30 @@ class PowerRewriteTest {
     @Test fun inverseTargetPower_passesOtherOpsThrough() {
         val reset = bytes(0x01)
         assertArrayEquals(reset, PowerRewrite.inverseTargetPower(reset, c))
+    }
+}
+
+/** The trainer's real Indoor Bike Data layout (flags 0x0874: speed, cadence, distance uint24, resistance,
+ *  power, elapsed) — the simulator emits the same one. Power sits at offset 11, and a parser that skipped
+ *  the uint24 distance would silently correct the wrong two bytes. */
+class IndoorBikeDataLayoutTest {
+
+    private fun realLayoutPacket(power: Int) = byteArrayOf(
+        0x74, 0x08,                     // flags
+        0x10, 0x0E,                     // inst speed  36.00 km/h
+        0x2E, 0x01,                     // inst cadence 151 → 0x012E = 302 half-rpm
+        0x40, 0x1F, 0x00,               // total distance uint24 = 8000 m
+        0x05, 0x00,                     // resistance level 5
+        (power and 0xFF).toByte(), ((power shr 8) and 0xFF).toByte(),
+        0x2C, 0x01,                     // elapsed time 300 s
+    )
+
+    @Test fun correctsPowerPastTheUint24Distance() {
+        val corrected = PowerRewrite.correctIndoorBikeData(realLayoutPacket(200), PowerCorrection(1.0, 50.0))
+        assertEquals(15, corrected.size)
+        assertEquals(250, (corrected[11].toInt() and 0xFF) or ((corrected[12].toInt() and 0xFF) shl 8))
+        // every other byte untouched — a wrong offset would show up here
+        val original = realLayoutPacket(200)
+        for (i in original.indices) if (i != 11 && i != 12) assertEquals("byte $i", original[i], corrected[i])
     }
 }

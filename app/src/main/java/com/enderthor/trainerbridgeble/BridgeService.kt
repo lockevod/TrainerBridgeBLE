@@ -101,6 +101,8 @@ class BridgeService : Service() {
                 foreground = false
                 ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf()
             }
+            // master off: nothing to reconfigure, and don't leave an idle started service behind
+            ACTION_RECONFIGURE -> if (foreground) { FileLog.enabled = Config(this).loggingEnabled; applyConfigChange() } else stopSelf()
             ACTION_EMIT_START -> { if (foreground) startEmit() }   // never emit from a non-foreground (master-off) service
             ACTION_EMIT_STOP -> stopEmit()
             else -> {
@@ -137,6 +139,51 @@ class BridgeService : Service() {
         if (config.masterEnabled && client == null && simSource == null) startReceive()
     }
 
+    /** Which source config asks for. The source is picked ONCE in [startReceive], so ticking simulation or
+     *  pairing a different trainer while the bridge runs would otherwise change nothing until a restart. */
+    private fun sourceKey(config: Config) = if (config.simulate) "sim" else config.pairedAddress.ifEmpty { "any" }
+    @Volatile private var currentSourceKey: String? = null
+
+    /** What the emit half was built with. The mirror takes the advertised name in its constructor and the
+     *  ANT settings are read once in [startEmit], so these only apply by cycling the emit half. */
+    private fun emitKey(config: Config) =
+        "${config.advertisedName}|${config.antOutputEnabled}|${config.antDeviceId}"
+    @Volatile private var currentEmitKey: String? = null
+
+    /** Config was saved — re-derive whatever was captured at start time. A source change already cycles the
+     *  emit half, so it subsumes an emit change; both are no-ops when nothing relevant moved. */
+    private fun applyConfigChange() {
+        val config = Config(this)
+        if (restartReceiveIfSourceChanged()) return
+        if (emitting && emitKey(config) != currentEmitKey) {
+            FileLog.event("emit config changed $currentEmitKey -> ${emitKey(config)}, restarting emit")
+            stopEmit(); startEmit()
+        }
+    }
+
+    /** @return true if the receive half (and with it the emit half) was restarted. */
+    private fun restartReceiveIfSourceChanged(): Boolean {
+        val config = Config(this)
+        val wanted = sourceKey(config)
+        if (!receiving || wanted == currentSourceKey) return false   // nothing running, or the same source → don't drop a live link
+        if (currentSourceKey == "any" && zycleConnected && wanted == config.lastSeenAddress) {
+            currentSourceKey = wanted   // "pair the trainer in use": same physical device, keep the live link
+            return false
+        }
+        FileLog.event("source changed $currentSourceKey -> $wanted, restarting receive")
+        // The mirror builds its GATT once (a trainer reconnect keeps it), so a genuine source change has to
+        // cycle the emit half too or it keeps serving the previous source's services. Apps reconnect.
+        val wasEmitting = emitting
+        if (wasEmitting) stopEmit()
+        stopReceive()
+        // Emit half FIRST: the mirror must exist before the new source starts, or its opening profile and
+        // seed reads (SimSource emits both synchronously in start()) land with mirror == null — leaving the
+        // mirror with no services, which also means it never advertises.
+        if (wasEmitting) startEmit()
+        maybeStartReceive()
+        return true
+    }
+
     // ── receive half (trainer link → CorrectedFeed + tiles + ANT) ─────────────────────────────────────
     private fun startReceive() {
         if (client != null || simSource != null) return   // idempotent
@@ -147,10 +194,15 @@ class BridgeService : Service() {
             cacheForUi(config, uuid, value)
             mirror?.onZycleValue(uuid, value)
         }
-        val onState: (Boolean) -> Unit = { connected -> zycleConnected = connected; status = if (connected) getString(R.string.status_trainer_connected) else getString(R.string.status_searching_trainer); listener?.invoke() }
+        val onState: (Boolean) -> Unit = { connected ->
+            zycleConnected = connected; mirror?.setTrainerLinked(connected)
+            if (!connected) { config.lastSeenAddress = ""; config.lastSeenName = "" }   // the config screen offers it only while live
+            status = if (connected) getString(R.string.status_trainer_connected) else getString(R.string.status_searching_trainer); listener?.invoke() }
         val c: TrainerSource = if (config.simulate) SimSource(onProfile, onValue, onState).also { simSource = it }
         else ZycleClient(this, config.pairedAddress, onProfile, onValue, onState,
-            onAdv = { bp -> lastAdvBlueprint = bp; mirror?.setAdvBlueprint(bp) })   // clone the trainer's real advertising
+            onAdv = { bp -> lastAdvBlueprint = bp; mirror?.setAdvBlueprint(bp) },   // clone the trainer's real advertising
+            onFound = { name, addr -> config.lastSeenName = name ?: ""; config.lastSeenAddress = addr })
+        currentSourceKey = sourceKey(config)
         c.start()
         client = c
         status = getString(R.string.status_searching_trainer)
@@ -160,7 +212,9 @@ class BridgeService : Service() {
     private fun stopReceive() {
         if (client == null && simSource == null) return
         FileLog.event("receive stop")
-        client?.stop(); client = null; simSource = null; lastProfile = null; lastAdvBlueprint = null
+        mirror?.setTrainerLinked(false)   // no source → nothing to advertise, whatever the call order
+        Config(this).let { it.lastSeenAddress = ""; it.lastSeenName = "" }
+        client?.stop(); client = null; simSource = null; lastProfile = null; lastAdvBlueprint = null; currentSourceKey = null
         CorrectedFeed.clear()
         zycleConnected = false; lastRawW = null; lastCorrectedW = null; lastSpeedKmh = null; lastCadence = null; lastResistance = null; lastSampleMs = 0L
         status = getString(R.string.status_stopped)
@@ -185,6 +239,7 @@ class BridgeService : Service() {
         )
         mirror = m
         m.start()
+        m.setTrainerLinked(zycleConnected)            // Start pressed with the trainer already connected
         lastProfile?.let { m.build(it) }              // mirror started after the trainer was already discovered → build now
         lastAdvBlueprint?.let { m.setAdvBlueprint(it) }
         if (config.antOutputEnabled) {
@@ -193,6 +248,7 @@ class BridgeService : Service() {
                 .also { it.start(); FileLog.event("ANT+ output enabled id=${config.antDeviceId}") }
         }
         emitting = true
+        currentEmitKey = emitKey(config)
         updateNotification(); listener?.invoke()
     }
 
@@ -292,6 +348,7 @@ class BridgeService : Service() {
         const val ACTION_MASTER_OFF = "com.enderthor.trainerbridgeble.MASTER_OFF"
         const val ACTION_EMIT_START = "com.enderthor.trainerbridgeble.EMIT_START"
         const val ACTION_EMIT_STOP = "com.enderthor.trainerbridgeble.EMIT_STOP"
+        const val ACTION_RECONFIGURE = "com.enderthor.trainerbridgeble.RECONFIGURE"
 
         private fun intent(context: android.content.Context, action: String) =
             Intent(context, BridgeService::class.java).setAction(action)
@@ -300,6 +357,12 @@ class BridgeService : Service() {
         fun setMaster(context: android.content.Context, on: Boolean) =
             if (on) { context.startForegroundService(intent(context, ACTION_MASTER_ON)); Unit }
             else { context.startService(intent(context, ACTION_MASTER_OFF)); Unit }
+
+        /** Config was saved: the running source may no longer be the one config asks for. Sent from the
+         *  config screen's onStop too, so swallow a background-start refusal instead of crashing. */
+        fun reconfigure(context: android.content.Context) {
+            runCatching { context.startService(intent(context, ACTION_RECONFIGURE)) }
+        }
 
         fun startEmit(context: android.content.Context) { context.startService(intent(context, ACTION_EMIT_START)) }
         fun stopEmit(context: android.content.Context) { context.startService(intent(context, ACTION_EMIT_STOP)) }
