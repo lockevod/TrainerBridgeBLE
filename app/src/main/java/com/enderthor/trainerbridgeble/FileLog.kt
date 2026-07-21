@@ -22,8 +22,18 @@ object FileLog {
     fun event(msg: String) {
         if (!enabled) return
         val f = file ?: return
-        io.execute { runCatching { f.appendText("# ${System.currentTimeMillis()} $msg\n") } }
+        io.execute {
+            runCatching {
+                // Nothing is throttled (a dropped line is the one you needed), so cap the file instead.
+                // ponytail: start over rather than keep a tail — trimming means reading the whole file into
+                // memory on a device with little of it. The marker says a restart happened.
+                if (f.length() > MAX_BYTES) f.writeText("# ${System.currentTimeMillis()} log restarted (${MAX_BYTES / 1024 / 1024} MB cap)\n")
+                f.appendText("# ${System.currentTimeMillis()} $msg\n")
+            }
+        }
     }
+
+    private const val MAX_BYTES = 32L * 1024 * 1024
 
     fun clear() { file?.let { f -> io.execute { runCatching { f.writeText("") } } } }
 

@@ -208,6 +208,8 @@ class MirrorServer(
 
     private val serverCallback = object : BluetoothGattServerCallback() {
         override fun onServiceAdded(status: Int, service: BluetoothGattService?) {
+            if (status != BluetoothGatt.GATT_SUCCESS)
+                FileLog.event("mirror addService FAILED status=$status for ${shortUuid(service?.uuid)}")
             val next = pendingServices.poll()
             if (next == null) {   // nothing left in flight — the mirrored GATT is complete
                 servicesReady = true
@@ -219,40 +221,46 @@ class MirrorServer(
             device ?: return
             if (newState == android.bluetooth.BluetoothProfile.STATE_CONNECTED) {
                 clients[device.address] = device; onStatus(context.getString(R.string.status_app_connected, clients.size))
-                FileLog.event("app connected ${device.address}")
+                FileLog.event("app connected ${device.address} status=$status (${clients.size} total)")
                 // Android stops connectable advertising once a central connects — restart it so a SECOND
                 // central (e.g. the Garmin) can still discover us.
                 handler.post { restartAdvertising() }
             } else {
                 clients.remove(device.address); subscribers.values.forEach { it.remove(device.address) }
                 onStatus(context.getString(R.string.status_app_disconnected, clients.size))
-                FileLog.event("app disconnected ${device.address}")
+                FileLog.event("app disconnected ${device.address} status=$status (${clients.size} left)")
             }
         }
 
         override fun onCharacteristicReadRequest(device: BluetoothDevice?, requestId: Int, offset: Int, ch: BluetoothGattCharacteristic?) {
-            if (offset == 0) FileLog.event("app read ${shortUuid(ch?.uuid)}")   // e.g. does it read our identity/feature?
             val full = ch?.let { cache[it.uuid] }
+            val who = "${shortUuid(ch?.uuid)}${if (offset > 0) " off=$offset" else ""} <- ${device?.address}"
             if (full == null) {
                 // Not read from the trainer yet (its reads queue behind every subscribe). Answer ATT
                 // "Unlikely Error" so the client can retry — an empty SUCCESS reads as "no capabilities".
-                FileLog.event("app read ${shortUuid(ch?.uuid)} — cache cold, answering 0x0E")
+                FileLog.event("app read $who — cache cold, answering 0x0E")
                 runCatching { server?.sendResponse(device, requestId, ATT_UNLIKELY_ERROR, offset, ByteArray(0)) }
                 return
             }
             val value = if (offset in 0..full.size) full.copyOfRange(offset, full.size) else ByteArray(0)
+            FileLog.event("app read $who = ${FileLog.hex(value)}")   // the VALUE, not just the request
             runCatching { server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value) }
         }
 
         override fun onCharacteristicWriteRequest(device: BluetoothDevice?, requestId: Int, ch: BluetoothGattCharacteristic?,
             preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray?) {
             val uuid = ch?.uuid
+            val tag = "${shortUuid(uuid)} <- ${device?.address}" +
+                (if (preparedWrite) " PREPARED off=$offset" else "") + (if (!responseNeeded) " noResp" else "")
             if (uuid != null && value != null) {
                 val out = if (GattUuids.carriesControl(uuid)) PowerRewrite.inverseTargetPower(value, correction()) else value
                 val withResponse = ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0
-                FileLog.event("app write ${shortUuid(uuid)} = ${FileLog.hex(value)}" + if (!out.contentEquals(value)) " -> ${FileLog.hex(out)}" else "")
+                FileLog.event("app write $tag = ${FileLog.hex(value)}" + if (!out.contentEquals(value)) " -> ${FileLog.hex(out)}" else "")
+                // ponytail: a prepared (long) write is relayed fragment-by-fragment rather than buffered
+                // until onExecuteWrite. No FTMS/CPS characteristic exceeds one ATT payload, so this only
+                // matters if some app starts using long writes — the log line above says when it happens.
                 toZycle(uuid, out, withResponse)   // relay to the trainer
-            }
+            } else FileLog.event("app write $tag = <no value / unknown char>")
             if (responseNeeded) runCatching { server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value) }
         }
 
@@ -264,10 +272,26 @@ class MirrorServer(
                 if (cUuid != null) {
                     val set = subscribers.getOrPut(cUuid) { java.util.Collections.synchronizedSet(HashSet()) }
                     if (enabled) set.add(device.address) else set.remove(device.address)
-                    FileLog.event("app subscribe ${shortUuid(cUuid)} enabled=$enabled")
+                    FileLog.event("app subscribe ${shortUuid(cUuid)} enabled=$enabled raw=${FileLog.hex(value ?: ByteArray(0))} <- ${device.address}")
                 }
-            }
+            } else FileLog.event("app descriptor write ${shortUuid(descriptor?.uuid)} = ${FileLog.hex(value ?: ByteArray(0))} <- ${device?.address}")
             if (responseNeeded) runCatching { server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value) }
+        }
+
+        /** Long-write commit. We relay fragments as they arrive (see onCharacteristicWriteRequest), so this
+         *  only has to answer — but log it, because its presence means an app IS using long writes. */
+        override fun onExecuteWrite(device: BluetoothDevice?, requestId: Int, execute: Boolean) {
+            FileLog.event("app execute write execute=$execute <- ${device?.address}")
+            runCatching { server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null) }
+        }
+
+        /** Notification flow control: a failure here means our notifications stopped reaching the app. */
+        override fun onNotificationSent(device: BluetoothDevice?, status: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) FileLog.event("notify FAILED status=$status -> ${device?.address}")
+        }
+
+        override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) {
+            FileLog.event("app mtu=$mtu <- ${device?.address}")
         }
 
         override fun onDescriptorReadRequest(device: BluetoothDevice?, requestId: Int, offset: Int, descriptor: BluetoothGattDescriptor?) {
@@ -275,6 +299,7 @@ class MirrorServer(
             val cUuid = descriptor?.characteristic?.uuid
             val on = device != null && cUuid != null && subscribers[cUuid]?.contains(device.address) == true
             val v = if (on) byteArrayOf(0x01, 0x00) else byteArrayOf(0x00, 0x00)
+            FileLog.event("app read descriptor ${shortUuid(descriptor?.uuid)} of ${shortUuid(cUuid)} = ${FileLog.hex(v)} <- ${device?.address}")
             runCatching { server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, v) }
         }
     }
@@ -324,11 +349,7 @@ class MirrorServer(
         startAdvertising()
     }
 
-    private val relayLogMs = ConcurrentHashMap<UUID, Long>()
     private fun logRelay(uuid: UUID, inV: ByteArray, outV: ByteArray, nClients: Int) {
-        val now = System.currentTimeMillis()
-        if (now - (relayLogMs[uuid] ?: 0L) < 500L) return   // rate-limit power (4 Hz); other chars log promptly
-        relayLogMs[uuid] = now
         val corr = if (!outV.contentEquals(inV)) " -> ${FileLog.hex(outV)}" else ""
         FileLog.event("relay ${shortUuid(uuid)} = ${FileLog.hex(inV)}$corr to $nClients")
     }

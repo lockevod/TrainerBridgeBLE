@@ -141,7 +141,7 @@ class ZycleClient(
                 stopScan(); connect(dev)
             }
         }
-        override fun onScanFailed(errorCode: Int) { Log.w(tag, "scan failed $errorCode"); if (!stopped) handler.postDelayed({ startScan() }, 2000) }
+        override fun onScanFailed(errorCode: Int) { Log.w(tag, "scan failed $errorCode"); FileLog.event("Zycle scan FAILED code=$errorCode"); if (!stopped) handler.postDelayed({ startScan() }, 2000) }
     }
 
     /** Snapshot the trainer's advertised service UUIDs + manufacturer data so the mirror re-advertises an
@@ -205,7 +205,9 @@ class ZycleClient(
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             if (stopped) return   // a stopped client must not hand its profile to whatever replaced it
-            if (status != BluetoothGatt.GATT_SUCCESS) { Log.w(tag, "discover failed $status"); return }
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.w(tag, "discover failed $status"); FileLog.event("Zycle discover FAILED status=$status"); return
+            }
             val profile = buildProfile(g)
             FileLog.event("Zycle profile: " + profile.services.joinToString("; ") { s ->
                 "${s.uuid}[" + s.chars.joinToString(",") { "${shortUuid(it.uuid)}(p=${it.properties})" } + "]"
@@ -224,7 +226,16 @@ class ZycleClient(
             }
         }
 
-        override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) { opDone() }
+        override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            // a failed CCCD write means that characteristic silently never notifies — never let it pass quietly
+            if (status != BluetoothGatt.GATT_SUCCESS)
+                FileLog.event("Zycle subscribe ${shortUuid(descriptor.characteristic.uuid)} FAILED status=$status")
+            opDone()
+        }
+
+        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+            FileLog.event("Zycle mtu=$mtu status=$status")
+        }
 
         @Deprecated("Deprecated in Java")
         override fun onCharacteristicRead(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
@@ -258,11 +269,8 @@ class ZycleClient(
         }
     }
 
-    private val notifLogMs = java.util.concurrent.ConcurrentHashMap<UUID, Long>()
+    /** Every notification, unthrottled: a dropped sample is exactly what you need when diagnosing a gap. */
     private fun logNotif(uuid: UUID, value: ByteArray) {
-        val now = System.currentTimeMillis()
-        if (now - (notifLogMs[uuid] ?: 0L) < 500L) return
-        notifLogMs[uuid] = now
         FileLog.event("Zycle notif ${shortUuid(uuid)} = ${FileLog.hex(value)}")
     }
 
