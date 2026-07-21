@@ -67,6 +67,7 @@ class MirrorServer(
     private val SERVICE_RETRY_MS = 300L
     private val SERVICE_MAX_RETRIES = 5
     private val ADV_START_TIMEOUT_MS = 3000L
+    private val ADV_LATE_STOP_MS = 1500L
     @Volatile private var serviceRetries = 0
     private val serviceRetryRunnable = Runnable { if (server != null) addNextService() }
     private val ADVERTISE_FAILED_DATA_TOO_LARGE = 1
@@ -105,6 +106,12 @@ class MirrorServer(
     }
 
     fun start() {
+        // Kill any advertising set left running by a PREVIOUS instance: its stop may have been dropped
+        // because a start was still in flight, and its callback died with the object.
+        lastAdvCallback?.takeIf { it !== advCallback }?.let { orphan ->
+            FileLog.event("stopping an advertising set left by a previous mirror")
+            runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(orphan) }
+        }
         val srv = runCatching { mgr.openGattServer(context, serverCallback) }.getOrNull()
         if (srv == null) { onStatus(context.getString(R.string.status_ble_server_failed)); onAdvState(false); return }
         server = srv
@@ -217,9 +224,16 @@ class MirrorServer(
     fun stop() {
         // Stop the advertiser UNCONDITIONALLY: the `advertising` flag is transiently false mid-restart, so
         // trusting it here can leave the phone broadcasting with a closed GATT server.
-        advertising = false; advStarting = false; servicesReady = false
+        advertising = false; servicesReady = false
         handler.removeCallbacksAndMessages(null)   // pending adv starts / service retries must not outlive us
         runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(advCallback) }
+        if (advStarting) {
+            // The stop we just issued is dropped when a start is still in flight. Try once more after it
+            // has had time to complete — on a Handler that stop() has NOT just drained.
+            val cb = advCallback; val adv = adapter.bluetoothLeAdvertiser
+            Handler(Looper.getMainLooper()).postDelayed({ runCatching { adv?.stopAdvertising(cb) } }, ADV_LATE_STOP_MS)
+        }
+        advStarting = false
         runCatching { server?.close() }
         server = null
         restoreName()
@@ -453,6 +467,7 @@ class MirrorServer(
                 .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1826)))
         }
         advStarting = true
+        lastAdvCallback = advCallback   // process-wide, so a later instance can still stop this set
         if (runCatching { advertiser.startAdvertising(settings, builder.build(), advCallback) }.isFailure) advStarting = false
         else {
             // An accepted start normally answers with exactly one callback — except when the adapter is
@@ -500,6 +515,7 @@ class MirrorServer(
     }
 
     private companion object {
+        @Volatile private var lastAdvCallback: android.bluetooth.le.AdvertiseCallback? = null
         const val KEY_ADV_NAMES = "advertisedNamesUsed"
         const val KEY_ORIG_NAME = "origBtName"
     }
