@@ -47,6 +47,6 @@ class PowerCorrection(private val scale: Double, private val offset: Double, pri
         // Only applied when a POSITIVE offset is configured — with offset ≤ 0 a fresh install must NOT turn a
         // 40 W target into 50 W. offset ≤ 0 → floorRaw 0 → no-op. Set the floor to 0 to disable.
         val floorRaw = if (offset > 0) ((invertFloorW - offset) / scale).roundToInt().coerceAtLeast(0) else 0
-        return raw.coerceAtLeast(floorRaw)
+        return raw.coerceAtLeast(floorRaw).coerceAtMost(32767)   // sint16, same reason as correct()
     }
 }

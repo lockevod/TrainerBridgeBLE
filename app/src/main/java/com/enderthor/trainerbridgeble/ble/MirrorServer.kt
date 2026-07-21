@@ -53,7 +53,9 @@ class MirrorServer(
     private val cache = ConcurrentHashMap<UUID, ByteArray>()                            // last value (power corrected)
     private val subscribers = ConcurrentHashMap<UUID, MutableSet<String>>()             // char uuid → subscribed client addrs
     private val clients = ConcurrentHashMap<String, BluetoothDevice>()                  // connected centrals
-    private val pendingServices = ArrayDeque<BluetoothGattService>()
+    // touched from the GATT server binder thread, the client's binder thread and main — a plain ArrayDeque
+    // can throw mid-poll when stop() clears it, and an exception on a binder callback kills the process
+    private val pendingServices = java.util.concurrent.ConcurrentLinkedDeque<BluetoothGattService>()
 
     private val ADV_RESTART_MS = 250L
     private val ADV_RETRY_MS = 1000L
@@ -65,12 +67,14 @@ class MirrorServer(
     private val ATT_INVALID_OFFSET = 0x07
     private var originalName: String? = null
     @Volatile private var advertising = false
+    @Volatile private var advStarting = false   // a start is in flight; `advertising` only flips in the callback
     private val built = java.util.concurrent.atomic.AtomicBoolean(false)   // build the mirrored GATT once; a trainer reconnect keeps it
     @Volatile private var advBlueprint: AdvBlueprint? = null   // the trainer's real advertising, to clone
     @Volatile private var trainerLinked = false   // advertise only while a trainer is actually feeding us
     @Volatile private var servicesReady = false     // every mirrored service has been ADDED (built != added)
     @Volatile private var advRetries = 0
     @Volatile private var dropNameFromAdv = false   // set after DATA_TOO_LARGE: the packet won't fit the name
+    @Volatile private var dropMfrFromAdv = false    // shed the cloned manufacturer data first
 
     /** Gate advertising on the trainer link. We advertise under the trainer's own name, and the trainer
      *  starts advertising again the moment it drops — so advertising with no trainer behind us puts two
@@ -86,6 +90,7 @@ class MirrorServer(
      *  advertise an identical packet. If we're already advertising, restart to apply it. */
     fun setAdvBlueprint(bp: AdvBlueprint) {
         advBlueprint = bp
+        dropMfrFromAdv = false; dropNameFromAdv = false; advRetries = 0   // a new packet deserves a clean try
         FileLog.event("mirror adv blueprint: ${bp.serviceUuids.size} uuids, ${bp.manufacturerData.size} mfr")
         handler.post { if (advertising) restartAdvertising() }   // serialise onto the advertising thread
     }
@@ -117,7 +122,11 @@ class MirrorServer(
      *  if the user renames the device while we hold it; clear it on restore if that ever matters. */
     private fun restoreName() {
         val prefs = context.getSharedPreferences("trainerbridgeble", Context.MODE_PRIVATE)
-        (originalName ?: prefs.getString(KEY_ORIG_NAME, null))?.let { orig -> runCatching { adapter.name = orig } }
+        val orig = originalName ?: prefs.getString(KEY_ORIG_NAME, null)
+        val current = runCatching { adapter.name }.getOrNull()
+        // Only restore if the adapter still carries OUR name. If the user renamed the device while we held
+        // it, current != advertisedName and writing the stored original would silently undo their change.
+        if (orig != null && current == advertisedName) runCatching { adapter.name = orig }
         originalName = null
     }
 
@@ -154,7 +163,10 @@ class MirrorServer(
             pendingServices.add(service)
         }
         FileLog.event("mirror built ${pendingServices.size} services")
-        addNextService()
+        if (pendingServices.isEmpty()) {   // nothing to add (empty/filtered profile) — don't wait forever
+            FileLog.event("mirror has NO services to add — advertising anyway")
+            servicesReady = true; handler.post { startAdvertising() }
+        } else addNextService()
     }
 
     /** Read/write GATT permissions for a mirrored characteristic, derived from its BLE properties. */
@@ -172,15 +184,19 @@ class MirrorServer(
     private fun addNextService() {
         val svc = pendingServices.poll() ?: return
         if (runCatching { server?.addService(svc) }.getOrNull() != true) {
-            FileLog.event("mirror addService REFUSED for ${shortUuid(svc.uuid)} — retrying once")
-            handler.postDelayed({ runCatching { server?.addService(svc) } }, SERVICE_RETRY_MS)
+            // Put it BACK at the head and retry through the normal path: calling addService directly meant a
+            // second refusal stalled the chain forever, and a late success could add the service twice.
+            FileLog.event("mirror addService REFUSED for ${shortUuid(svc.uuid)} — requeueing")
+            pendingServices.addFirst(svc)
+            handler.postDelayed({ if (server != null) addNextService() }, SERVICE_RETRY_MS)
         }
     }
 
     fun stop() {
         // Stop the advertiser UNCONDITIONALLY: the `advertising` flag is transiently false mid-restart, so
         // trusting it here can leave the phone broadcasting with a closed GATT server.
-        advertising = false; servicesReady = false
+        advertising = false; advStarting = false; servicesReady = false
+        handler.removeCallbacksAndMessages(null)   // pending adv starts / service retries must not outlive us
         runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(advCallback) }
         runCatching { server?.close() }
         server = null
@@ -284,7 +300,9 @@ class MirrorServer(
                 (if (preparedWrite) " PREPARED off=$offset" else "") + (if (!responseNeeded) " noResp" else "")
             if (uuid != null && value != null) {
                 val out = if (GattUuids.carriesControl(uuid)) PowerRewrite.inverseTargetPower(value, correction()) else value
-                val withResponse = responseNeeded   // what the client actually asked for
+                // what the client asked for, unless the trainer's characteristic can't take a Write Command
+                val withResponse = responseNeeded ||
+                    (ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE == 0)
                 FileLog.event("app write $tag = ${FileLog.hex(value)}" + if (!out.contentEquals(value)) " -> ${FileLog.hex(out)}" else "")
                 // ponytail: a prepared (long) write is relayed fragment-by-fragment rather than buffered
                 // until onExecuteWrite. No FTMS/CPS characteristic exceeds one ATT payload, so this only
@@ -292,11 +310,14 @@ class MirrorServer(
                 relayed = toZycle(uuid, out, withResponse)   // relay to the trainer
                 if (!relayed) FileLog.event("app write $tag NOT RELAYED — answering failure")
             } else FileLog.event("app write $tag = <no value / unknown char>")
+            // ATT response = "received", always. FTMS puts the OUTCOME in the control point indication.
             if (responseNeeded) runCatching {
-                // GATT_SUCCESS here would tell the app its ERG target took effect while it went nowhere
-                val st = if (relayed) BluetoothGatt.GATT_SUCCESS else BluetoothGatt.GATT_FAILURE
-                server?.sendResponse(device, requestId, st, offset, value)
+                server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
             }
+            // ...and if we could not hand it to the trainer, say so the way a trainer would: Response Code
+            // 0x80, <op>, 0x04 Operation Failed. Without this the app waits forever for an indication.
+            if (!relayed && uuid != null && value != null && value.isNotEmpty() && GattUuids.carriesControl(uuid))
+                onZycleValue(uuid, byteArrayOf(0x80.toByte(), value[0], 0x04))
         }
 
         override fun onDescriptorWriteRequest(device: BluetoothDevice?, requestId: Int, descriptor: BluetoothGattDescriptor?,
@@ -344,20 +365,29 @@ class MirrorServer(
 
     // ── advertising ──────────────────────────────────────────────────────────────────────────────────
     private val advCallback = object : android.bluetooth.le.AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { advertising = true; advRetries = 0; onAdvState(true); onStatus(context.getString(R.string.status_advertising, advertisedName)); FileLog.event("advertising as $advertisedName") }
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { advStarting = false; advertising = true; advRetries = 0; onAdvState(true); onStatus(context.getString(R.string.status_advertising, advertisedName)); FileLog.event("advertising as $advertisedName")
+            // a stop issued while this start was in flight is dropped by the stack — reconcile now
+            if (!trainerLinked || server == null) { FileLog.event("advertising with no trainer — stopping"); stopAdvertising() }
+        }
         override fun onStartFailure(errorCode: Int) {
-            advertising = false; onAdvState(false)
+            advStarting = false; advertising = false; onAdvState(false)
             onStatus(context.getString(R.string.status_advertise_failed, errorCode))
             FileLog.event("advertise failed $errorCode (retry ${advRetries + 1}/$ADV_MAX_RETRIES, name=${!dropNameFromAdv})")
-            if (errorCode == ADVERTISE_FAILED_DATA_TOO_LARGE) dropNameFromAdv = true   // 31-byte PDU: shed the name
-            if (advRetries++ < ADV_MAX_RETRIES) handler.postDelayed({ startAdvertising() }, ADV_RETRY_MS)
+            // 31-byte PDU: shed the cloned manufacturer data first (usually the culprit), the name only if
+            // that still isn't enough — apps find us BY the name, so it is the last thing to go.
+            if (errorCode == ADVERTISE_FAILED_DATA_TOO_LARGE) {
+                if (!dropMfrFromAdv) dropMfrFromAdv = true else dropNameFromAdv = true
+            }
+            if (advRetries++ < ADV_MAX_RETRIES) {
+                handler.removeCallbacks(startAdvRunnable); handler.postDelayed(startAdvRunnable, ADV_RETRY_MS)
+            }
         }
     }
 
     private fun startAdvertising() {
         // no trainer → stay off the air (see setTrainerLinked); not built → we'd advertise an empty GATT and
         // an app that connects in that window caches it. onServiceAdded calls back here once services land.
-        if (advertising || !trainerLinked || !servicesReady) return
+        if (advertising || advStarting || !trainerLinked || !servicesReady) return
         val advertiser = adapter.bluetoothLeAdvertiser ?: run { onStatus(context.getString(R.string.status_ble_adv_unsupported)); onAdvState(false); return }
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
@@ -369,33 +399,39 @@ class MirrorServer(
         val bp = advBlueprint
         if (bp != null && bp.serviceUuids.isNotEmpty()) {
             bp.serviceUuids.forEach { builder.addServiceUuid(it) }
-            bp.manufacturerData.forEach { (id, d) -> runCatching { builder.addManufacturerData(id, d) } }
+            if (!dropMfrFromAdv) bp.manufacturerData.forEach { (id, d) -> runCatching { builder.addManufacturerData(id, d) } }
         } else {
             // only what we actually serve — advertising CSC 0x1816 made head units connect and find nothing
             builder.addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1818)))
                 .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1826)))
         }
-        runCatching { advertiser.startAdvertising(settings, builder.build(), advCallback) }
+        advStarting = true
+        if (runCatching { advertiser.startAdvertising(settings, builder.build(), advCallback) }.isFailure) advStarting = false
     }
 
     /** Unconditional, for the same reason [stop] is: `advertising` is false between startAdvertising() and
      *  onStartSuccess, so an early return here can leave a pending advert running with no trainer behind it. */
     private fun stopAdvertising() {
-        advertising = false
+        handler.removeCallbacks(startAdvRunnable)
+        advertising = false; advStarting = false
         runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(advCallback) }
     }
 
     /** Force a fresh advertise (Android silently stopped it when a central connected, but our flag didn't
      *  know). Needed so more than one app can find us. */
+    private val startAdvRunnable = Runnable { startAdvertising() }
+
     private fun restartAdvertising() {
-        runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(advCallback) }
-        advertising = false
+        stopAdvertising()
         // The stop is async and only frees this callback when it completes; starting in the same turn
-        // answers ADVERTISE_FAILED_ALREADY_STARTED. Give it a turn.
-        handler.postDelayed({ startAdvertising() }, ADV_RESTART_MS)
+        // answers ADVERTISE_FAILED_ALREADY_STARTED. Give it a turn — and collapse duplicate restarts
+        // (connect + disconnect in quick succession) into a single pending start.
+        handler.removeCallbacks(startAdvRunnable)
+        handler.postDelayed(startAdvRunnable, ADV_RESTART_MS)
     }
 
     private fun logRelay(uuid: UUID, inV: ByteArray, outV: ByteArray, nClients: Int) {
+        if (!FileLog.enabled) return   // don't build hex strings on the BLE thread when logging is off
         val corr = if (!outV.contentEquals(inV)) " -> ${FileLog.hex(outV)}" else ""
         FileLog.event("relay ${shortUuid(uuid)} = ${FileLog.hex(inV)}$corr to $nClients")
     }

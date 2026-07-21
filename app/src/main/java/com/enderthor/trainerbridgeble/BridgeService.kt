@@ -52,6 +52,7 @@ class BridgeService : Service() {
     @Volatile var lastControl: String? = null; private set
     @Volatile var lastSampleMs: Long = 0L; private set   // wall-clock of the last trainer sample, for UI staleness
     @Volatile private var lastResistance: Int? = null
+    @Volatile private var sawIndoorBikeData = false   // NOT `lastRawW == null`: that is set by the fallback itself
     @Volatile private var antEnabled = false
     @Volatile var antOk = false; private set
     @Volatile var antStatus: String = ""; private set
@@ -83,8 +84,9 @@ class BridgeService : Service() {
         else {
             val target = ((lastResistance ?: 0) + delta).coerceIn(0, 200)   // 0..200 per the Zycle's 0x2AD6 range
             // ponytail: 0x04+level% Set Target Resistance, no Request Control first — shares the FTMS control point with the app
-            client?.write(com.enderthor.trainerbridgeble.ble.GattUuids.FTMS_CONTROL_POINT, byteArrayOf(0x04, target.toByte()), true)
-            lastResistance = target   // optimistic: a trainer that doesn't report resistance would wedge the buttons
+            // optimistic, but ONLY if it was actually dispatched — otherwise the tile moves and the trainer doesn't
+            if (client?.write(com.enderthor.trainerbridgeble.ble.GattUuids.FTMS_CONTROL_POINT, byteArrayOf(0x04, target.toByte()), true) == true)
+                lastResistance = target
             lastControl = getString(R.string.control_resistance_target, target); FileLog.event("UI button → resistance target=$target%")
         }
         listener?.invoke()
@@ -225,7 +227,7 @@ class BridgeService : Service() {
         Config(this).let { it.lastSeenAddress = ""; it.lastSeenName = "" }
         client?.stop(); client = null; simSource = null; lastProfile = null; lastAdvBlueprint = null; currentSourceKey = null
         CorrectedFeed.clear()
-        zycleConnected = false; lastRawW = null; lastCorrectedW = null; lastSpeedKmh = null; lastCadence = null; lastResistance = null; lastSampleMs = 0L
+        zycleConnected = false; sawIndoorBikeData = false; lastRawW = null; lastCorrectedW = null; lastSpeedKmh = null; lastCadence = null; lastResistance = null; lastSampleMs = 0L
         status = getString(R.string.status_stopped)
         updateNotification(); listener?.invoke()
     }
@@ -295,7 +297,8 @@ class BridgeService : Service() {
     private fun describeControl(b: ByteArray): String = when {
         b.isEmpty() -> "?"
         // b is already inverse-corrected (what the trainer is commanded). Re-apply the correction so the
-        // tile shows the target the APP asked for, which is the number the user is looking for.
+        // tile shows the wattage the app will SEE, not the raw command. Below the ERG floor these differ
+        // from what the app asked for — deliberately, that is the floor's documented cost.
         (b[0].toInt() and 0xFF) == 0x05 && b.size >= 3 ->
             getString(R.string.control_erg, Config(this).correction().correct(((b[1].toInt() and 0xFF) or ((b[2].toInt() and 0xFF) shl 8)).toShort().toInt()))
         (b[0].toInt() and 0xFF) == 0x04 && b.size >= 2 -> getString(R.string.control_resistance, b[1].toInt() and 0xFF)
@@ -315,6 +318,7 @@ class BridgeService : Service() {
         when (uuid) {
             com.enderthor.trainerbridgeble.ble.GattUuids.INDOOR_BIKE_DATA -> {
                 if (value.size < 2) return
+                sawIndoorBikeData = true
                 val flags = le16(value, 0); var off = 2
                 if (flags and (1 shl 0) == 0) { if (off + 2 <= value.size) lastSpeedKmh = le16(value, off) * 0.01; off += 2 }
                 if (flags and (1 shl 1) != 0) off += 2
@@ -326,14 +330,14 @@ class BridgeService : Service() {
                 if (flags and (1 shl 6) != 0 && off + 2 <= value.size) {
                     val raw = le16signed(value, off); lastRawW = raw; lastCorrectedW = config.correction().correct(raw); havePower = true
                 }
-                if (havePower) {   // only a packet that actually carried power refreshes the freshness clocks
-                    antTx?.setLatest(PowerSample(lastCorrectedW, lastCadence, lastSpeedKmh?.let { it / 3.6 }))   // corrected → Garmin over ANT+
-                    CorrectedFeed.push(lastCorrectedW, lastSpeedKmh?.let { it / 3.6 }, lastCadence, System.currentTimeMillis())
-                }
+                // Only a packet that actually CARRIED power may refresh ANT's power-freshness clock, or a
+                // dropout would be transmitted as live. Speed/cadence still flow to the Karoo sensor.
+                if (havePower) antTx?.setLatest(PowerSample(lastCorrectedW, lastCadence, lastSpeedKmh?.let { it / 3.6 }))
+                CorrectedFeed.push(lastCorrectedW, lastSpeedKmh?.let { it / 3.6 }, lastCadence, System.currentTimeMillis())
                 listener?.invoke()
             }
             com.enderthor.trainerbridgeble.ble.GattUuids.CYCLING_POWER_MEASUREMENT -> {
-                if (lastRawW == null && value.size >= 4) {   // fallback only if no Indoor Bike Data
+                if (!sawIndoorBikeData && value.size >= 4) {   // fallback only if the trainer sends no IBD
                     val raw = le16signed(value, 2); lastRawW = raw; lastCorrectedW = config.correction().correct(raw)
                     antTx?.setLatest(PowerSample(lastCorrectedW, lastCadence, lastSpeedKmh?.let { it / 3.6 }))   // ANT too, or FE-C stays blank
                     CorrectedFeed.push(lastCorrectedW, lastSpeedKmh?.let { it / 3.6 }, lastCadence, System.currentTimeMillis())

@@ -71,7 +71,7 @@
     <string name="control_erg">ERG %d W</string>
     <string name="control_resistance">Resistencia %d</string>
     <string name="control_op">op 0x%02X</string>
-    <string name="control_resistance_target">Resistencia → %1$d%%</string>
+    <string name="control_resistance_target">Resistencia → %1$d</string>
 
     <!-- Notification -->
     <string name="notif_text">Proxy BLE activo</string>

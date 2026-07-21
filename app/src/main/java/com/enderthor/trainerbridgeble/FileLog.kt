@@ -22,18 +22,23 @@ object FileLog {
     fun event(msg: String) {
         if (!enabled) return
         val f = file ?: return
+        val ts = System.currentTimeMillis()   // when it HAPPENED — the IO queue can lag under load
         io.execute {
             runCatching {
                 // Nothing is throttled (a dropped line is the one you needed), so cap the file instead.
-                // ponytail: start over rather than keep a tail — trimming means reading the whole file into
-                // memory on a device with little of it. The marker says a restart happened.
-                if (f.length() > MAX_BYTES) f.writeText("# ${System.currentTimeMillis()} log restarted (${MAX_BYTES / 1024 / 1024} MB cap)\n")
-                f.appendText("# ${System.currentTimeMillis()} $msg\n")
+                // Rotate rather than truncate: truncating at the cap leaves you holding a log that starts
+                // seconds ago, which is worthless for a ride that just ended. O(1) — a rename, no read.
+                if (f.length() > MAX_BYTES) {
+                    val old = File(f.parentFile, f.name + ".1")
+                    runCatching { if (old.exists()) old.delete(); f.renameTo(old) }
+                    f.writeText("# $ts log rotated at ${MAX_BYTES / 1024 / 1024} MB (previous: ${f.name}.1)\n")
+                }
+                f.appendText("# $ts $msg\n")
             }
         }
     }
 
-    private const val MAX_BYTES = 32L * 1024 * 1024
+    private const val MAX_BYTES = 16L * 1024 * 1024   // two files kept, so 32 MB total
 
     fun clear() { file?.let { f -> io.execute { runCatching { f.writeText("") } } } }
 
