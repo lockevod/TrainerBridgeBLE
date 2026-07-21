@@ -42,6 +42,10 @@ class MirrorServer(
     private val onStatus: (String) -> Unit = {},
     /** Health report to the UI: true once we're actually advertising; false if the server/advertising fails. */
     private val onAdvState: (Boolean) -> Unit = {},
+    /** The trainer's own address. Android reports our CENTRAL link to it on the SERVER callback too, so
+     *  without this it is counted as a connected app: the UI shows a client that isn't there and every
+     *  trainer connect triggers a needless advertising restart. */
+    private val isTrainer: (String) -> Boolean = { false },
 ) {
     private val tag = "TBB/MirrorServer"
     private val handler = Handler(Looper.getMainLooper())
@@ -280,6 +284,10 @@ class MirrorServer(
 
         override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
             device ?: return
+            if (isTrainer(device.address)) {   // our own central link surfacing on the server callback
+                FileLog.event("server sees the trainer link ${device.address} — not an app, ignored")
+                return
+            }
             if (newState == android.bluetooth.BluetoothProfile.STATE_CONNECTED) {
                 clients[device.address] = device; onStatus(context.getString(R.string.status_app_connected, clients.size))
                 FileLog.event("app connected ${device.address} status=$status (${clients.size} total)")

@@ -259,6 +259,10 @@ class BridgeService : Service() {
             },
             onStatus = { s -> status = s; listener?.invoke() },
             onAdvState = { ok -> bleAdvOk = ok; listener?.invoke() },
+            isTrainer = { addr ->
+                val c = Config(this)
+                addr.equals(c.lastSeenAddress, true) || (c.pairedAddress.isNotEmpty() && addr.equals(c.pairedAddress, true))
+            },
         )
         mirror = m
         m.start()
