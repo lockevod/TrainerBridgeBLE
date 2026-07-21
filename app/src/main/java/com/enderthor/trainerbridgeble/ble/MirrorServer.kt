@@ -116,10 +116,15 @@ class MirrorServer(
     private fun renameAdapter() {
         val prefs = context.getSharedPreferences("trainerbridgeble", Context.MODE_PRIVATE)
         val current = runCatching { adapter.name }.getOrNull()
-        // Capture ONLY when nothing is stored yet. adapter.name is set asynchronously, so right after a
-        // stop→start (a config save that changes the advertised name) the read-back is still the PREVIOUS
-        // advertised name — storing that would overwrite the user's real device name forever.
-        if (prefs.getString(KEY_ORIG_NAME, null) == null && current != null && current != advertisedName)
+        // Remember every name WE have ever advertised. Without this the read-back after a stop→start (the
+        // rename is asynchronous, so it still shows the PREVIOUS advertised name) gets stored as if it were
+        // the user's real device name — which is how a Karoo ends up permanently called "ZycleBike7".
+        val ours = prefs.getStringSet(KEY_ADV_NAMES, emptySet())!!.toMutableSet()
+        if (ours.add(advertisedName)) prefs.edit().putStringSet(KEY_ADV_NAMES, ours).apply()
+        // Capture the real name when we see one that is not ours — first run, or the user renamed the
+        // device since. Never capture a name we know we put there.
+        if (current != null && current != advertisedName && current !in ours &&
+            current != prefs.getString(KEY_ORIG_NAME, null))
             prefs.edit().putString(KEY_ORIG_NAME, current).apply()
         originalName = prefs.getString(KEY_ORIG_NAME, null)
         runCatching { if (current != advertisedName) adapter.name = advertisedName }
@@ -495,6 +500,7 @@ class MirrorServer(
     }
 
     private companion object {
+        const val KEY_ADV_NAMES = "advertisedNamesUsed"
         const val KEY_ORIG_NAME = "origBtName"
     }
 }
