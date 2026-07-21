@@ -21,7 +21,7 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * BLE central to the trainer (Zycle). Scans by name prefix, connects, discovers the FULL GATT, subscribes
+ * BLE central to the trainer (Zycle). Scans filtered by FTMS/address, connects, discovers the FULL GATT, subscribes
  * to every notify/indicate characteristic, reads the readable ones once (for the mirror's read cache), and
  * relays incoming values. Exposes [write] so the mirror can forward app writes (control) to the trainer.
  *
@@ -31,8 +31,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 @SuppressLint("MissingPermission")   // BLUETOOTH_SCAN/CONNECT are declared and requested by the UI before start()
 class ZycleClient(
     private val context: Context,
-    private val namePrefix: String,
-    private val pairedAddress: String,      // exact device to connect to; empty → match by namePrefix
+    private val pairedAddress: String,      // exact device to connect to; empty → first trainer the scan filter yields
     private val onProfile: (GattProfile) -> Unit,
     private val onValue: (charUuid: UUID, value: ByteArray) -> Unit,   // notifications AND initial reads
     private val onState: (connected: Boolean) -> Unit,
@@ -129,8 +128,8 @@ class ZycleClient(
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
             val dev = result?.device ?: return
             val name = result.scanRecord?.deviceName ?: dev.name
-            val match = if (pairedAddress.isNotEmpty()) dev.address == pairedAddress
-            else name != null && name.startsWith(namePrefix, ignoreCase = true)
+            // the scan filter already guarantees FTMS/CPS, so unpaired = take the first trainer that answers
+            val match = pairedAddress.isEmpty() || dev.address == pairedAddress
             if (match) {
                 if (gatt != null || connecting) return   // already connecting/connected — ignore duplicate adverts
                 connecting = true
@@ -157,7 +156,16 @@ class ZycleClient(
         if (stopped || scanning) return
         val scanner = adapter?.bluetoothLeScanner ?: return
         scanning = true
-        runCatching { scanner.startScan(scanCallback) }
+        runCatching {
+            // Paired → filter by address only: the trainer's advert may carry its UUIDs in the scan
+            // response, which the controller's offloaded UUID filter never sees. Unpaired → FTMS only:
+            // a bare power meter advertises CPS but can't take ERG, so it must not win the race.
+            val filters = if (pairedAddress.isNotEmpty())
+                listOf(android.bluetooth.le.ScanFilter.Builder().setDeviceAddress(pairedAddress).build())
+            else GattUuids.scanFilters(0x1826)
+            // default scan mode (LOW_POWER) as before — this scan runs until the trainer appears
+            scanner.startScan(filters, android.bluetooth.le.ScanSettings.Builder().build(), scanCallback)
+        }
     }
 
     private fun stopScan() {

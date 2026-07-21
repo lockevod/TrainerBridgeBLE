@@ -37,7 +37,7 @@
     <string name="config_scan_start">Buscar bicicleta</string>
     <string name="config_scan_stop">Parar búsqueda</string>
     <string name="config_forget">Olvidar dispositivo</string>
-    <string name="config_none_paired">Ninguna emparejada (se buscará por nombre \"%s\")</string>
+    <string name="config_none_paired">Ninguna emparejada (se usará el primer rodillo encontrado)</string>
     <string name="config_paired">Emparejada: %s</string>
     <string name="config_identity">Identidad anunciada</string>
     <string name="config_name_hint">Nombre con el que nos ven las apps (por defecto igual que el Zycle para que reconozca sus capacidades).</string>

@@ -100,7 +100,10 @@ Open **Configuración** from the Monitor:
 - **ERG floor (W, 0 = off)** — below this ERG target the inverse correction over-corrects downward, so the
   command is held at the floor's raw target instead. Targets within the offset (≈ a stop) still command 0.
   Default 50 W.
-- **Trainer (BLE)** — scan and pick your trainer to pair it.
+- **Trainer (BLE)** — scan and pick your trainer to pair it. The scan lists only power sources (FTMS or
+  Cycling Power) — heart-rate straps, phones and headphones are filtered out. A bare power meter can be
+  paired too: its power is corrected and mirrored as usual, but ERG control needs a trainer (FTMS).
+  With nothing paired, the bridge auto-connects to the first FTMS trainer it finds.
 - **Advertised name** — the name apps see (defaults to match the trainer so it's recognised).
 - **Options** — save diagnostic log (CSV), simulation mode (a fake trainer for testing with no hardware),
   ANT+ output + its device id.

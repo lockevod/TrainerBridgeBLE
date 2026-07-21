@@ -37,7 +37,7 @@
     <string name="config_scan_start">Search bike</string>
     <string name="config_scan_stop">Stop search</string>
     <string name="config_forget">Forget device</string>
-    <string name="config_none_paired">None paired (will search by name \"%s\")</string>
+    <string name="config_none_paired">None paired (will use the first trainer found)</string>
     <string name="config_paired">Paired: %s</string>
     <string name="config_identity">Advertised identity</string>
     <string name="config_name_hint">Name the apps see us as (by default the same as the Zycle so it recognizes its capabilities).</string>

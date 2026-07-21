@@ -89,7 +89,7 @@ class ConfigActivity : Activity() {
 
     override fun onStop() { super.onStop(); stopScan(); save() }
 
-    private fun pairedText() = if (config.pairedAddress.isEmpty()) getString(R.string.config_none_paired, config.namePrefix)
+    private fun pairedText() = if (config.pairedAddress.isEmpty()) getString(R.string.config_none_paired)
     else getString(R.string.config_paired, config.pairedName.ifEmpty { config.pairedAddress })
 
     private fun save() {
@@ -117,7 +117,12 @@ class ConfigActivity : Activity() {
         found.clear(); rebuildFound()
         val scanner = adapter?.bluetoothLeScanner ?: run { toast(getString(R.string.config_ble_unavailable)); return }
         scanning = true; scanBtn.text = getString(R.string.config_scan_stop)
-        runCatching { scanner.startScan(scanCallback) }
+        runCatching {
+            scanner.startScan(com.enderthor.trainerbridgeble.ble.GattUuids.scanFilters(0x1826, 0x1818),
+                android.bluetooth.le.ScanSettings.Builder()
+                    .setScanMode(android.bluetooth.le.ScanSettings.SCAN_MODE_LOW_LATENCY).build(),
+                scanCallback)
+        }
     }
 
     private fun stopScan() {

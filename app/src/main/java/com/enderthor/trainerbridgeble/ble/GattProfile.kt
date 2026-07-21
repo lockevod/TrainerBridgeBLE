@@ -38,6 +38,13 @@ object GattUuids {
     val CYCLING_POWER_MEASUREMENT: UUID = uuid16(0x2A63) // CPS — carries power (Garmin reads here)
     val FTMS_CONTROL_POINT: UUID = uuid16(0x2AD9)        // ERG / control writes
 
+    /** Scan filters for the given 16-bit service UUIDs (ORed) — the controller drops everything else
+     *  before it reaches the callback, so HR straps, phones and headphones never show up.
+     *  0x1826 = FTMS (a trainer), 0x1818 = Cycling Power (a trainer OR a bare power meter). */
+    fun scanFilters(vararg svc16: Int): List<android.bluetooth.le.ScanFilter> = svc16.map {
+        android.bluetooth.le.ScanFilter.Builder().setServiceUuid(android.os.ParcelUuid(uuid16(it))).build()
+    }
+
     /** GAP/GATT services the stack provides itself — never mirror these. */
     val GENERIC_ACCESS: UUID = uuid16(0x1800)
     val GENERIC_ATTRIBUTE: UUID = uuid16(0x1801)

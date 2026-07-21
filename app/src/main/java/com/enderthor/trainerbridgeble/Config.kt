@@ -3,8 +3,8 @@ package com.enderthor.trainerbridgeble
 import android.content.Context
 import com.enderthor.trainerbridgeble.correction.PowerCorrection
 
-/** Persisted settings: the linear correction (scale as a % adjustment, offset in W) and the trainer name
- *  prefix to scan for. Read live so edits apply without a restart. */
+/** Persisted settings: the linear correction (scale as a % adjustment, offset in W) and the paired
+ *  trainer. Read live so edits apply without a restart. */
 class Config(context: Context) {
     private val p = context.getSharedPreferences("trainerbridgeble", Context.MODE_PRIVATE)
 
@@ -24,12 +24,7 @@ class Config(context: Context) {
         get() = p.getInt(KEY_INVERT_FLOOR, 50)
         set(v) = p.edit().putInt(KEY_INVERT_FLOOR, v).apply()
 
-    /** Name prefix used to find the trainer over BLE when no specific device is paired. */
-    var namePrefix: String
-        get() = p.getString(KEY_PREFIX, "Zycle") ?: "Zycle"
-        set(v) = p.edit().putString(KEY_PREFIX, v).apply()
-
-    /** The paired trainer's BLE address (empty = fall back to scanning by [namePrefix]). */
+    /** The paired trainer's BLE address (empty = connect to the first FTMS/CPS device found). */
     var pairedAddress: String
         get() = p.getString(KEY_ADDR, "") ?: ""
         set(v) = p.edit().putString(KEY_ADDR, v).apply()
@@ -81,7 +76,6 @@ class Config(context: Context) {
         const val KEY_SCALE = "scaleAdjustPct"
         const val KEY_OFFSET = "offsetW"
         const val KEY_INVERT_FLOOR = "invertFloorW"
-        const val KEY_PREFIX = "namePrefix"
         const val KEY_ADDR = "pairedAddress"
         const val KEY_NAME = "pairedName"
         const val KEY_ADVNAME = "advertisedName"

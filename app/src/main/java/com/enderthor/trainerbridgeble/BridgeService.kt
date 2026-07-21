@@ -141,7 +141,7 @@ class BridgeService : Service() {
     private fun startReceive() {
         if (client != null || simSource != null) return   // idempotent
         val config = Config(this)
-        FileLog.event("receive start prefix=${config.namePrefix} sim=${config.simulate}")
+        FileLog.event("receive start paired=${config.pairedAddress.ifEmpty { "any" }} sim=${config.simulate}")
         val onProfile: (GattProfile) -> Unit = { profile -> lastProfile = profile; mirror?.build(profile) }
         val onValue: (java.util.UUID, ByteArray) -> Unit = { uuid, value ->
             cacheForUi(config, uuid, value)
@@ -149,7 +149,7 @@ class BridgeService : Service() {
         }
         val onState: (Boolean) -> Unit = { connected -> zycleConnected = connected; status = if (connected) getString(R.string.status_trainer_connected) else getString(R.string.status_searching_trainer); listener?.invoke() }
         val c: TrainerSource = if (config.simulate) SimSource(onProfile, onValue, onState).also { simSource = it }
-        else ZycleClient(this, config.namePrefix, config.pairedAddress, onProfile, onValue, onState,
+        else ZycleClient(this, config.pairedAddress, onProfile, onValue, onState,
             onAdv = { bp -> lastAdvBlueprint = bp; mirror?.setAdvBlueprint(bp) })   // clone the trainer's real advertising
         c.start()
         client = c
