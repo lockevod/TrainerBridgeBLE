@@ -62,7 +62,9 @@ class MirrorServer(
     private val ADV_MAX_RETRIES = 5
     private val SERVICE_RETRY_MS = 300L
     private val SERVICE_MAX_RETRIES = 5
+    private val ADV_START_TIMEOUT_MS = 3000L
     @Volatile private var serviceRetries = 0
+    private val serviceRetryRunnable = Runnable { if (server != null) addNextService() }
     private val ADVERTISE_FAILED_DATA_TOO_LARGE = 1
     private val cccd: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     private val ATT_UNLIKELY_ERROR = 0x0E
@@ -194,11 +196,12 @@ class MirrorServer(
         val svc = pendingServices.peek() ?: return
         if (runCatching { server?.addService(svc) }.getOrNull() != true) {
             if (serviceRetries++ >= SERVICE_MAX_RETRIES) {
-                FileLog.event("mirror addService REFUSED for ${shortUuid(svc.uuid)} — giving up, mirror incomplete")
+                FileLog.event("mirror addService REFUSED for ${shortUuid(svc.uuid)} — giving up, releasing build latch")
+                built.set(false)   // so the next discovery can rebuild instead of staying silent forever
                 return
             }
             FileLog.event("mirror addService REFUSED for ${shortUuid(svc.uuid)} — retry ${serviceRetries}")
-            handler.postDelayed({ if (server != null) addNextService() }, SERVICE_RETRY_MS)
+            handler.removeCallbacks(serviceRetryRunnable); handler.postDelayed(serviceRetryRunnable, SERVICE_RETRY_MS)
         }
     }
 
@@ -258,8 +261,15 @@ class MirrorServer(
 
     private val serverCallback = object : BluetoothGattServerCallback() {
         override fun onServiceAdded(status: Int, service: BluetoothGattService?) {
-            if (status != BluetoothGatt.GATT_SUCCESS)
-                FileLog.event("mirror addService FAILED status=$status for ${shortUuid(service?.uuid)}")
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                // don't poll it: retry the head rather than advertise a mirror missing a service
+                FileLog.event("mirror addService FAILED status=$status for ${shortUuid(service?.uuid)} — retrying head")
+                if (serviceRetries++ < SERVICE_MAX_RETRIES) {
+                    handler.removeCallbacks(serviceRetryRunnable); handler.postDelayed(serviceRetryRunnable, SERVICE_RETRY_MS)
+                } else { FileLog.event("mirror giving up on ${shortUuid(service?.uuid)} — releasing build latch"); built.set(false) }
+                return
+            }
+            handler.removeCallbacks(serviceRetryRunnable)   // a stale retry would add the NEXT service twice
             pendingServices.poll()   // confirmed — NOW it leaves the queue
             serviceRetries = 0
             if (pendingServices.isEmpty()) {   // the mirrored GATT is complete
@@ -334,7 +344,8 @@ class MirrorServer(
                 // FTMS procedure, and fanning it out tells the other app its own request failed.
                 val resp = byteArrayOf(0x80.toByte(), value[0], 0x04)
                 val cp = ch
-                handler.post {
+                // only if this client actually enabled the control point — never indicate unsolicited
+                if (subscribers[uuid]?.contains(device.address) == true) handler.post {
                     val srv = server ?: return@post
                     notify(srv, device, cp, resp, cp.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)
                 }
@@ -386,12 +397,12 @@ class MirrorServer(
 
     // ── advertising ──────────────────────────────────────────────────────────────────────────────────
     private val advCallback = object : android.bluetooth.le.AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { advStarting = false; advertising = true; advRetries = 0; onAdvState(true); onStatus(context.getString(R.string.status_advertising, advertisedName)); FileLog.event("advertising as $advertisedName")
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { handler.removeCallbacks(advStartWatchdog); advStarting = false; advertising = true; advRetries = 0; onAdvState(true); onStatus(context.getString(R.string.status_advertising, advertisedName)); FileLog.event("advertising as $advertisedName")
             // a stop issued while this start was in flight is dropped by the stack — reconcile now
             if (!trainerLinked || server == null) { FileLog.event("advertising with no trainer — stopping"); stopAdvertising() }
         }
         override fun onStartFailure(errorCode: Int) {
-            advStarting = false; advertising = false; onAdvState(false)
+            handler.removeCallbacks(advStartWatchdog); advStarting = false; advertising = false; onAdvState(false)
             onStatus(context.getString(R.string.status_advertise_failed, errorCode))
             FileLog.event("advertise failed $errorCode (retry ${advRetries + 1}/$ADV_MAX_RETRIES, name=${!dropNameFromAdv})")
             // 31-byte PDU: shed the cloned manufacturer data first (usually the culprit), the name only if
@@ -430,6 +441,12 @@ class MirrorServer(
         }
         advStarting = true
         if (runCatching { advertiser.startAdvertising(settings, builder.build(), advCallback) }.isFailure) advStarting = false
+        else {
+            // An accepted start normally answers with exactly one callback — except when the adapter is
+            // turned off or the BT process dies under it, which drops the callback silently. Without this
+            // the flag latches and we never advertise again.
+            handler.removeCallbacks(advStartWatchdog); handler.postDelayed(advStartWatchdog, ADV_START_TIMEOUT_MS)
+        }
     }
 
     /** Unconditional, for the same reason [stop] is: `advertising` is false between startAdvertising() and
@@ -445,6 +462,9 @@ class MirrorServer(
     /** Force a fresh advertise (Android silently stopped it when a central connected, but our flag didn't
      *  know). Needed so more than one app can find us. */
     private val startAdvRunnable = Runnable { startAdvertising() }
+    private val advStartWatchdog = Runnable {
+        if (advStarting) { FileLog.event("advertise start never answered — clearing in-flight flag"); advStarting = false }
+    }
 
     private fun restartAdvertising() {
         stopAdvertising()

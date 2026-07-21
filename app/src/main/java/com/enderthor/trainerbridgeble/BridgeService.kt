@@ -51,6 +51,12 @@ class BridgeService : Service() {
     @Volatile var lastCadence: Int? = null; private set
     @Volatile var lastControl: String? = null; private set
     @Volatile var lastSampleMs: Long = 0L; private set   // wall-clock of the last trainer sample, for UI staleness
+    @Volatile var lastPowerMs: Long = 0L; private set    // ...and of the last packet that actually CARRIED power
+
+    /** Power specifically — a packet can arrive without the power field, and a sticky last value must not be
+     *  reported as live to ANT, the Karoo recording, or the tiles. A short grace covers one dropped frame. */
+    val powerFresh: Boolean get() = lastPowerMs != 0L && System.currentTimeMillis() - lastPowerMs <= POWER_STALE_MS
+    private fun freshPowerOrNull(): Int? = if (powerFresh) lastCorrectedW else null
     @Volatile private var lastResistance: Int? = null
     @Volatile private var sawIndoorBikeData = false   // NOT `lastRawW == null`: that is set by the fallback itself
     @Volatile private var antEnabled = false
@@ -230,7 +236,7 @@ class BridgeService : Service() {
         Config(this).let { it.lastSeenAddress = ""; it.lastSeenName = "" }
         client?.stop(); client = null; simSource = null; lastProfile = null; lastAdvBlueprint = null; currentSourceKey = null
         CorrectedFeed.clear()
-        zycleConnected = false; sawIndoorBikeData = false; lastRawW = null; lastCorrectedW = null; lastSpeedKmh = null; lastCadence = null; lastResistance = null; lastSampleMs = 0L
+        zycleConnected = false; sawIndoorBikeData = false; lastPowerMs = 0L; lastRawW = null; lastCorrectedW = null; lastSpeedKmh = null; lastCadence = null; lastResistance = null; lastSampleMs = 0L
         status = getString(R.string.status_stopped)
         updateNotification(); listener?.invoke()
     }
@@ -338,15 +344,17 @@ class BridgeService : Service() {
                 if (havePower) antTx?.setLatest(PowerSample(lastCorrectedW, lastCadence, lastSpeedKmh?.let { it / 3.6 }))
                 // power only if THIS packet carried it: CorrectedSource stops emitting power on null while
                 // speed and cadence keep flowing, instead of recording a frozen value as live data
-                CorrectedFeed.push(if (havePower) lastCorrectedW else null,
-                    lastSpeedKmh?.let { it / 3.6 }, lastCadence, System.currentTimeMillis())
+                // A single truncated frame must not punch a hole in the recording, and a real dropout must
+                // not be recorded as live watts: the grace window decides, not this one packet.
+                CorrectedFeed.push(freshPowerOrNull(), lastSpeedKmh?.let { it / 3.6 }, lastCadence, System.currentTimeMillis())
                 listener?.invoke()
             }
             com.enderthor.trainerbridgeble.ble.GattUuids.CYCLING_POWER_MEASUREMENT -> {
                 if (!sawIndoorBikeData && value.size >= 4) {   // fallback only if the trainer sends no IBD
                     val raw = le16signed(value, 2); lastRawW = raw; lastCorrectedW = config.correction().correct(raw)
-                    antTx?.setLatest(PowerSample(lastCorrectedW, lastCadence, lastSpeedKmh?.let { it / 3.6 }))   // ANT too, or FE-C stays blank
-                    CorrectedFeed.push(lastCorrectedW, lastSpeedKmh?.let { it / 3.6 }, lastCadence, System.currentTimeMillis())
+                    lastPowerMs = System.currentTimeMillis()
+                    antTx?.setLatest(PowerSample(freshPowerOrNull(), lastCadence, lastSpeedKmh?.let { it / 3.6 }))   // ANT too, or FE-C stays blank
+                    CorrectedFeed.push(freshPowerOrNull(), lastSpeedKmh?.let { it / 3.6 }, lastCadence, System.currentTimeMillis())
                     listener?.invoke()
                 }
             }
@@ -396,6 +404,7 @@ class BridgeService : Service() {
     companion object {
         private const val CHANNEL_ID = "bridge-ble"
         private const val NOTIF_ID = 1
+        private const val POWER_STALE_MS = 2000L   // ~8 missed frames at 4 Hz: covers a hiccup, not a dropout
         private const val ANT_RESTART_DELAY_MS = 1500L   // let the ANT service release the channel first
         const val ACTION_MASTER_ON = "com.enderthor.trainerbridgeble.MASTER_ON"
         const val ACTION_MASTER_OFF = "com.enderthor.trainerbridgeble.MASTER_OFF"

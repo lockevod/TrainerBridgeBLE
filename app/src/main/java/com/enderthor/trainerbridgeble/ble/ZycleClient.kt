@@ -56,7 +56,6 @@ class ZycleClient(
 
     private class WriteReq(val uuid: UUID, val bytes: ByteArray, val withResponse: Boolean, val retriesLeft: Int, val seq: Int)
     @Volatile private var inFlightWrite: WriteReq? = null   // the write currently on the wire, for retry on failure
-    @Volatile private var inFlightOp: UUID? = null          // char/descriptor whose callback we are waiting for
     private val writeSeq = java.util.concurrent.atomic.AtomicInteger(0)  // bumps per write; a retry is dropped if superseded
 
     private val cccd: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
@@ -72,7 +71,7 @@ class ZycleClient(
     override fun stop() {
         stopped = true
         connecting.set(false)
-        inFlightWrite = null; inFlightOp = null; opAbandoned = false
+        inFlightWrite = null
         stopScan()
         handler.removeCallbacksAndMessages(null)   // heartbeat, rescan, connect/op watchdogs, write retries
         opQueue.clear(); opBusy.set(false)
@@ -121,7 +120,7 @@ class ZycleClient(
         enqueue {
             @Suppress("DEPRECATION")
             run {
-                inFlightWrite = WriteReq(charUuid, bytes, withResponse, retriesLeft, seq); inFlightOp = charUuid
+                inFlightWrite = WriteReq(charUuid, bytes, withResponse, retriesLeft, seq)
                 ch.writeType = if (withResponse) BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
                 else BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
                 ch.value = bytes
@@ -257,7 +256,7 @@ class ZycleClient(
                 if (gatt !== g) return   // a stale/superseded handle — don't touch the live connection's state
                 onState(false)
                 opQueue.clear(); opBusy.set(false)
-                gatt = null; connecting.set(false); inFlightWrite = null; inFlightOp = null; opAbandoned = false; lastMessageMs = 0L
+                gatt = null; connecting.set(false); inFlightWrite = null; lastMessageMs = 0L
                 scheduleReconnect()
             }
         }
@@ -290,7 +289,6 @@ class ZycleClient(
             if (status != BluetoothGatt.GATT_SUCCESS)
                 FileLog.event("Zycle subscribe ${shortUuid(u)} FAILED status=$status")
             lastMessageMs = System.currentTimeMillis()
-            if (!claimOp(u)) return   // late callback for an op the watchdog already abandoned
             opDone()
         }
 
@@ -306,7 +304,6 @@ class ZycleClient(
                 onValue(ch.uuid, v)
             } else FileLog.event("Zycle read ${shortUuid(ch.uuid)} failed status=$status")
             lastMessageMs = System.currentTimeMillis()
-            if (!claimOp(ch.uuid)) return
             opDone()
         }
 
@@ -314,7 +311,6 @@ class ZycleClient(
             lastMessageMs = System.currentTimeMillis()
             // only the write this callback is FOR: a late status used to be attributed to whatever write
             // happened to be in the slot, re-sending someone else's ERG target
-            if (!claimOp(ch.uuid)) return   // BEFORE touching the write slot, or the retry is thrown away
             val w = inFlightWrite?.takeIf { it.uuid == ch.uuid }
             if (w != null) inFlightWrite = null
             if (status != BluetoothGatt.GATT_SUCCESS) {
@@ -332,7 +328,7 @@ class ZycleClient(
             if (stopped) return   // in-flight notification after stop() — not our data any more
             val value = @Suppress("DEPRECATION") (ch.value?.copyOf() ?: ByteArray(0))
             lastMessageMs = System.currentTimeMillis()   // feed the silent-link watchdog
-            logNotif(ch.uuid, value)   // all notifications (power included), rate-limited per char
+            logNotif(ch.uuid, value)   // every notification, unthrottled
             onValue(ch.uuid, value)
         }
     }
@@ -357,7 +353,6 @@ class ZycleClient(
     )
 
     private fun enqueueSubscribe(g: BluetoothGatt, ch: BluetoothGattCharacteristic, retry: Boolean = true): Unit = enqueue {
-        inFlightOp = ch.uuid
         g.setCharacteristicNotification(ch, true)
         val d = ch.getDescriptor(cccd)
         if (d == null) { FileLog.event("Zycle subscribe ${shortUuid(ch.uuid)} — no CCCD"); opDone(); return@enqueue }
@@ -375,7 +370,6 @@ class ZycleClient(
     }
 
     private fun enqueueRead(g: BluetoothGatt, ch: BluetoothGattCharacteristic, retry: Boolean = true): Unit = enqueue {
-        inFlightOp = ch.uuid
         if (g.readCharacteristic(ch) != true) {
             FileLog.event("Zycle read ${shortUuid(ch.uuid)} REFUSED by stack" + if (retry) " — requeueing" else " — giving up")
             if (retry) handler.postDelayed({ if (!stopped && gatt === g) enqueueRead(g, ch, retry = false) }, OP_REQUEUE_MS)
@@ -383,21 +377,6 @@ class ZycleClient(
         }
     }
 
-    /** The watchdog already advanced the queue for an op it gave up on, so exactly ONE subsequent callback
-     *  must be swallowed — otherwise it advances the queue a second time and silently loses whatever op is
-     *  now on the wire (typically a CCCD write → a characteristic that never notifies).
-     *
-     *  ponytail: a flag, not the characteristic UUID. Keying on the UUID looked more precise and was
-     *  strictly worse: the ERG loop writes the same control point repeatedly, so an abandoned write
-     *  poisoned the next legitimate callback for it, the watchdog re-armed, and every op on that
-     *  characteristic then cost OP_TIMEOUT_MS forever. Worst case here is one stalled op, self-clearing. */
-    private fun claimOp(u: UUID): Boolean {
-        if (!opAbandoned) return true
-        opAbandoned = false
-        FileLog.event("Zycle callback for ${shortUuid(u)} after an op timeout — swallowed once")
-        return false
-    }
-    @Volatile private var opAbandoned = false
 
     // ── GATT op serialisation ────────────────────────────────────────────────────────────────────────
     private fun enqueue(op: () -> Unit) { opQueue.add(op); pump() }
@@ -416,8 +395,7 @@ class ZycleClient(
             val w = Runnable {
                 if (opBusy.get() && opToken.get() == token) {
                     FileLog.event("Zycle GATT op timeout ${OP_TIMEOUT_MS}ms -> unstick queue")
-                    opAbandoned = true   // swallow the next callback: this op's queue slot is already gone
-                    inFlightWrite = null; inFlightOp = null
+                    inFlightWrite = null
                     opDone()
                 }
             }
@@ -426,7 +404,7 @@ class ZycleClient(
             runCatching { op() }.onFailure { opDone() }
         }
     }
-    private fun opDone() { inFlightOp = null; opWatchdog?.let { handler.removeCallbacks(it) }; opToken.incrementAndGet(); opBusy.set(false); pump() }
+    private fun opDone() { opWatchdog?.let { handler.removeCallbacks(it) }; opToken.incrementAndGet(); opBusy.set(false); pump() }
 
     private companion object {
         const val RECONNECT_DELAY_MS = 2000L

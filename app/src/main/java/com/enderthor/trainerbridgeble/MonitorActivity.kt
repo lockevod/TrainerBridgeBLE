@@ -159,8 +159,10 @@ class MonitorActivity : Activity() {
         statusLine.text = if (master) s?.status ?: getString(R.string.status_stopped) else getString(R.string.status_stopped)
         statusLine.setTextColor(if (master && s?.zycleConnected == true) Palette.OK else Palette.MUTED)
         val show = master && fresh
-        powerTile.text = if (show) s?.lastRawW?.toString() ?: "—" else "—"
-        correctedTile.text = if (show) s?.lastCorrectedW?.toString() ?: "—" else "—"
+        // power has its own clock: a packet can arrive without it, and a stale value must read "—"
+        val showPower = show && s?.powerFresh == true
+        powerTile.text = if (showPower) s?.lastRawW?.toString() ?: "—" else "—"
+        correctedTile.text = if (showPower) s?.lastCorrectedW?.toString() ?: "—" else "—"
         speedTile.text = if (show) s?.lastSpeedKmh?.let { String.format("%.1f", it) } ?: "—" else "—"
         cadenceTile.text = if (show) s?.lastCadence?.toString() ?: "—" else "—"
         resistTile.text = if (master) s?.resistance?.toString() ?: "—" else "—"
