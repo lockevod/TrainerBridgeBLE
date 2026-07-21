@@ -40,7 +40,7 @@
     <string name="config_none_paired">Ninguna emparejada (se usará el primer rodillo encontrado)</string>
     <string name="config_paired">Emparejada: %s</string>
     <string name="config_identity">Identidad anunciada</string>
-    <string name="config_name_hint">Nombre con el que nos ven las apps. Es cosmético: no afecta a lo que la app puede hacer con el rodillo, así que un nombre distinto se localiza mejor en la lista.</string>
+    <string name="config_name_hint">Nombre con el que nos ven las apps. DÉJALO VACÍO para usar el nombre Bluetooth del propio dispositivo: es lo más simple y así no se cambia el nombre del aparato. Es cosmético en cualquier caso: no afecta a lo que la app puede hacer con el rodillo.</string>
     <string name="config_options">Opciones</string>
     <string name="config_log">Guardar log (CSV)</string>
     <string name="config_sim">Modo simulación (sin bici)</string>
@@ -88,4 +88,7 @@
     <string name="config_in_use">El puente está conectado a %s. Un dispositivo conectado no puede aparecer en la búsqueda.</string>
     <string name="config_pair_in_use">Emparejar el rodillo en uso</string>
     <string name="config_not_saved">%d valor(es) NO guardados: sólo números enteros</string>
+    <string name="control_request">Pide control</string>
+    <string name="control_sim">Simulación (pendiente)</string>
+    <string name="control_spindown">Calibración</string>
 </resources>

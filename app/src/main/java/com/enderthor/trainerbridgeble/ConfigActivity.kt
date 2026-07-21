@@ -111,7 +111,7 @@ class ConfigActivity : Activity() {
         intField(scaleField, getString(R.string.config_scale_label), { it > -100 }) { config.scaleAdjustPercent = it }
         intField(offsetField, getString(R.string.config_offset_label), { true }) { config.offsetW = it }
         intField(floorField, getString(R.string.config_floor_label), { it >= 0 }) { config.invertFloorW = it }
-        nameField.text.toString().trim().takeIf { it.isNotEmpty() }?.let { config.advertisedName = it }
+        config.advertisedName = nameField.text.toString().trim()   // blank = keep the device's own name
         config.loggingEnabled = logCheck.isChecked
         config.simulate = simCheck.isChecked
         config.antOutputEnabled = antCheck.isChecked

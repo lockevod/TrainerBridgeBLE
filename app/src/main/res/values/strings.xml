@@ -40,7 +40,7 @@
     <string name="config_none_paired">None paired (will use the first trainer found)</string>
     <string name="config_paired">Paired: %s</string>
     <string name="config_identity">Advertised identity</string>
-    <string name="config_name_hint">Name the apps see us as. Cosmetic — it does not affect what an app can do with the trainer, so a distinctive name is easier to pick out of the list.</string>
+    <string name="config_name_hint">Name the apps see us as. LEAVE IT EMPTY to use this device\'s own Bluetooth name: simplest, and your device name is never changed. Cosmetic either way — it does not affect what an app can do with the trainer.</string>
     <string name="config_options">Options</string>
     <string name="config_log">Save log (CSV)</string>
     <string name="config_sim">Simulation mode (no bike)</string>
@@ -88,4 +88,7 @@
     <string name="config_in_use">The bridge is connected to %s. A connected device cannot appear in a scan.</string>
     <string name="config_pair_in_use">Pair the trainer in use</string>
     <string name="config_not_saved">%d value(s) NOT saved: whole numbers only</string>
+    <string name="control_request">Request control</string>
+    <string name="control_sim">Simulation (slope)</string>
+    <string name="control_spindown">Calibration</string>
 </resources>

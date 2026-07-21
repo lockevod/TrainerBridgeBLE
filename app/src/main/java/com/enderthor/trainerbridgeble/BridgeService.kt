@@ -349,9 +349,12 @@ class BridgeService : Service() {
         (b[0].toInt() and 0xFF) == 0x05 && b.size >= 3 ->
             getString(R.string.control_erg, Config(this).correction().correct(((b[1].toInt() and 0xFF) or ((b[2].toInt() and 0xFF) shl 8)).toShort().toInt()))
         (b[0].toInt() and 0xFF) == 0x04 && b.size >= 2 -> getString(R.string.control_resistance, b[1].toInt() and 0xFF)
+        (b[0].toInt() and 0xFF) == 0x00 -> getString(R.string.control_request)   // the ERG handshake's first step
         (b[0].toInt() and 0xFF) == 0x01 -> getString(R.string.control_reset)
         (b[0].toInt() and 0xFF) == 0x07 -> getString(R.string.monitor_start)
         (b[0].toInt() and 0xFF) == 0x08 -> getString(R.string.monitor_stop)
+        (b[0].toInt() and 0xFF) == 0x11 -> getString(R.string.control_sim)       // slope / indoor bike simulation
+        (b[0].toInt() and 0xFF) == 0x13 -> getString(R.string.control_spindown)
         else -> getString(R.string.control_op, b[0].toInt() and 0xFF)
     }
 

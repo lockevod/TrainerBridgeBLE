@@ -122,6 +122,18 @@ class MirrorServer(
      *  skips stop()) doesn't lose the user's real Bluetooth name — and so we never capture our own rename. */
     private fun renameAdapter() {
         val prefs = context.getSharedPreferences("trainerbridgeble", Context.MODE_PRIVATE)
+        if (advertisedName.isBlank()) {
+            // No custom name: don't touch the adapter at all. The advert carries the device's own name, and
+            // none of the capture/restore machinery below can misfire, because it never runs. The advertised
+            // name is cosmetic (a captured session proved an app negotiates fine under any name), so this is
+            // the better default: nothing to lose, nothing to restore, no second device wearing our name.
+            prefs.getString(KEY_ORIG_NAME, null)?.let { orig ->   // migration: hand back a name we once took
+                FileLog.event("custom name cleared - restoring $orig")
+                runCatching { adapter.name = orig }
+                prefs.edit().remove(KEY_ORIG_NAME).apply()
+            }
+            return
+        }
         val current = runCatching { adapter.name }.getOrNull()
         // Remember every name WE have ever advertised. Without this the read-back after a stop→start (the
         // rename is asynchronous, so it still shows the PREVIOUS advertised name) gets stored as if it were
@@ -142,6 +154,7 @@ class MirrorServer(
      *  our own name, fail to store it, and lose the user's real one forever. Keeping it costs a stale pref
      *  if the user renames the device while we hold it; clear it on restore if that ever matters. */
     private fun restoreName() {
+        if (advertisedName.isBlank()) return   // we never renamed anything
         val prefs = context.getSharedPreferences("trainerbridgeble", Context.MODE_PRIVATE)
         // Restore unconditionally. Gating on `adapter.name == advertisedName` looked safer but is unsound:
         // the rename is asynchronous, so a stop right after a start reads back the OLD name, skips the

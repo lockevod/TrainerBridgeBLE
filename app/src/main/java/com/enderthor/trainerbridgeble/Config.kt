@@ -54,7 +54,7 @@ class Config(context: Context) {
      *  the mirror actually served the capability characteristics. Default matches the trainer out of habit;
      *  a distinctive name is easier to tell apart in the app's list. */
     var advertisedName: String
-        get() = p.getString(KEY_ADVNAME, "ZycleBike2") ?: "ZycleBike2"
+        get() = p.getString(KEY_ADVNAME, "") ?: ""   // blank = advertise under the device's own name
         set(v) = p.edit().putString(KEY_ADVNAME, v).apply()
 
     /** Write the diagnostic CSV log. */
