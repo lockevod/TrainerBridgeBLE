@@ -40,7 +40,7 @@
     <string name="config_none_paired">None paired (will use the first trainer found)</string>
     <string name="config_paired">Paired: %s</string>
     <string name="config_identity">Advertised identity</string>
-    <string name="config_name_hint">Name the apps see us as (by default the same as the Zycle so it recognizes its capabilities).</string>
+    <string name="config_name_hint">Name the apps see us as. Cosmetic — it does not affect what an app can do with the trainer, so a distinctive name is easier to pick out of the list.</string>
     <string name="config_options">Options</string>
     <string name="config_log">Save log (CSV)</string>
     <string name="config_sim">Simulation mode (no bike)</string>

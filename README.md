@@ -115,7 +115,11 @@ Open **Configuración** from the Monitor:
 - **Saving applies immediately.** Changing the paired trainer, simulation, the advertised name or the ANT+
   settings re-derives the running bridge, which can briefly drop the apps connected to it — so avoid saving
   config mid-ride. The correction values (scale, offset, ERG floor) apply live with no interruption.
-- **Advertised name** — the name apps see (defaults to match the trainer so it's recognised).
+- **Advertised name** — the name apps see in their device list. Cosmetic: it does **not** affect what an
+  app can do with the trainer (a captured session advertised under a different name and still completed the
+  full FTMS control handshake). A distinctive name is easier to tell apart from the trainer itself. Note the
+  bridge renames the device's Bluetooth adapter while emitting, because Android has no per-advertisement
+  name — so anything else the device advertises carries that name too, and it is restored when you stop.
 - **Options** — save diagnostic log (CSV), simulation mode (a fake trainer for testing with no hardware),
   ANT+ output + its device id.
 

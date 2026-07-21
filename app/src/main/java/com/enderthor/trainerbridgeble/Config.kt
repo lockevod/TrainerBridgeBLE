@@ -48,8 +48,11 @@ class Config(context: Context) {
         get() = p.getString(KEY_NAME, "") ?: ""
         set(v) = p.edit().putString(KEY_NAME, v).apply()
 
-    /** The name WE advertise to the apps. Default exactly matches the Zycle so an app that keys capabilities
-     *  off the name recognises us (safe: the real Zycle isn't advertising while we're connected to it). */
+    /** The name WE advertise to the apps — cosmetic: it is what you pick from the app's device list, nothing
+     *  more. It was long assumed that an app keys the trainer's capabilities off the name; a captured session
+     *  disproved it, advertising under a DIFFERENT name and still getting the full FTMS control handshake once
+     *  the mirror actually served the capability characteristics. Default matches the trainer out of habit;
+     *  a distinctive name is easier to tell apart in the app's list. */
     var advertisedName: String
         get() = p.getString(KEY_ADVNAME, "ZycleBike2") ?: "ZycleBike2"
         set(v) = p.edit().putString(KEY_ADVNAME, v).apply()
