@@ -25,7 +25,9 @@ class PowerCorrection(private val scale: Double, private val offset: Double, pri
      */
     fun correct(rawWatts: Int): Int {
         if (rawWatts <= 0) return 0
-        return (scale * rawWatts + offset).roundToInt().coerceAtLeast(0)
+        // clamp to sint16: a garbage raw frame (e.g. 0x7FFF from a flaky link) would otherwise wrap and be
+        // transmitted as a large NEGATIVE wattage
+        return (scale * rawWatts + offset).roundToInt().coerceIn(0, 32767)
     }
 
     /**

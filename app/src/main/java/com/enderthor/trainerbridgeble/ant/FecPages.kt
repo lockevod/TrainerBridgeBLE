@@ -70,7 +70,8 @@ object FecPages {
 
     /** General FE Data (0x10): equipment type, elapsed time, distance, speed, state. */
     fun buildGeneralFe(elapsedQuarterSec: Int, distanceM: Int, speedMps: Double?, feState: Int): ByteArray {
-        val speed = ((speedMps ?: 0.0) * 1000.0).roundToInt().coerceIn(0, 0xFFFE)
+        // 0xFFFF is the FE-C "invalid" sentinel — without it a dropout is recorded as a real 0.000 m/s
+        val speed = speedMps?.let { (it * 1000.0).roundToInt().coerceIn(0, 0xFFFE) } ?: 0xFFFF
         return byteArrayOf(
             PAGE_GENERAL_FE.toByte(),
             EQUIP_TYPE_TRAINER.toByte(),

@@ -35,10 +35,18 @@ object PowerRewrite {
         return value
     }
 
+    /** FTMS Machine Status (0x2ADA) op 0x08 "Target Power Changed" echoes the watts the trainer was
+     *  commanded — which we inverse-corrected. Correct it forward so the app reads back ITS OWN target. */
+    fun correctMachineStatusTargetPower(value: ByteArray, c: PowerCorrection): ByteArray {
+        if (value.size < 3 || (value[0].toInt() and 0xFF) != 0x08) return value
+        val commanded = le16signed(value, 1)
+        return value.copyOf().also { putLe16(it, 1, c.correct(commanded)) }
+    }
+
     /** FTMS Control Point Set Target Power (0x05, uint16 W LE) → inverse-correct the watts. Other ops pass. */
     fun inverseTargetPower(write: ByteArray, c: PowerCorrection): ByteArray {
         if (write.size < 3 || (write[0].toInt() and 0xFF) != 0x05) return write
-        val watts = le16(write, 1)
+        val watts = le16signed(write, 1)   // FTMS: the Set Target Power parameter is sint16
         return write.copyOf().also { putLe16(it, 1, c.invert(watts)) }
     }
 

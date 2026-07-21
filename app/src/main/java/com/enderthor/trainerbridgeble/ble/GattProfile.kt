@@ -37,6 +37,7 @@ object GattUuids {
     val INDOOR_BIKE_DATA: UUID = uuid16(0x2AD2)          // FTMS — carries power (rider read)
     val CYCLING_POWER_MEASUREMENT: UUID = uuid16(0x2A63) // CPS — carries power (Garmin reads here)
     val FTMS_CONTROL_POINT: UUID = uuid16(0x2AD9)        // ERG / control writes
+    val MACHINE_STATUS: UUID = uuid16(0x2ADA)            // echoes accepted targets back to the app
 
     /** Scan filters for the given 16-bit service UUIDs (ORed) — the controller drops everything else
      *  before it reaches the callback, so HR straps, phones and headphones never show up.

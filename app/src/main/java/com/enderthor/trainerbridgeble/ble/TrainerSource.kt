@@ -7,5 +7,7 @@ import java.util.UUID
 interface TrainerSource {
     fun start()
     fun stop()
-    fun write(charUuid: UUID, bytes: ByteArray, withResponse: Boolean)
+    /** @return false if the write could not be dispatched (no link, unknown characteristic) — the mirror
+     *  must NOT then answer the app with success. */
+    fun write(charUuid: UUID, bytes: ByteArray, withResponse: Boolean): Boolean
 }

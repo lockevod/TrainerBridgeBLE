@@ -84,6 +84,7 @@ class BridgeService : Service() {
             val target = ((lastResistance ?: 0) + delta).coerceIn(0, 200)   // 0..200 per the Zycle's 0x2AD6 range
             // ponytail: 0x04+level% Set Target Resistance, no Request Control first — shares the FTMS control point with the app
             client?.write(com.enderthor.trainerbridgeble.ble.GattUuids.FTMS_CONTROL_POINT, byteArrayOf(0x04, target.toByte()), true)
+            lastResistance = target   // optimistic: a trainer that doesn't report resistance would wedge the buttons
             lastControl = getString(R.string.control_resistance_target, target); FileLog.event("UI button → resistance target=$target%")
         }
         listener?.invoke()
@@ -240,7 +241,7 @@ class BridgeService : Service() {
             correction = { config.correction() },
             toZycle = { uuid, bytes, withResponse ->
                 if (com.enderthor.trainerbridgeble.ble.GattUuids.carriesControl(uuid)) { lastControl = describeControl(bytes); listener?.invoke() }
-                client?.write(uuid, bytes, withResponse)
+                client?.write(uuid, bytes, withResponse) ?: false   // false → the mirror answers the app with failure
             },
             onStatus = { s -> status = s; listener?.invoke() },
             onAdvState = { ok -> bleAdvOk = ok; listener?.invoke() },
@@ -293,7 +294,10 @@ class BridgeService : Service() {
     /** Human-readable summary of a control write the app sent (shown in the UI: "app → trainer"). */
     private fun describeControl(b: ByteArray): String = when {
         b.isEmpty() -> "?"
-        (b[0].toInt() and 0xFF) == 0x05 && b.size >= 3 -> getString(R.string.control_erg, (b[1].toInt() and 0xFF) or ((b[2].toInt() and 0xFF) shl 8))
+        // b is already inverse-corrected (what the trainer is commanded). Re-apply the correction so the
+        // tile shows the target the APP asked for, which is the number the user is looking for.
+        (b[0].toInt() and 0xFF) == 0x05 && b.size >= 3 ->
+            getString(R.string.control_erg, Config(this).correction().correct(((b[1].toInt() and 0xFF) or ((b[2].toInt() and 0xFF) shl 8)).toShort().toInt()))
         (b[0].toInt() and 0xFF) == 0x04 && b.size >= 2 -> getString(R.string.control_resistance, b[1].toInt() and 0xFF)
         (b[0].toInt() and 0xFF) == 0x01 -> getString(R.string.control_reset)
         (b[0].toInt() and 0xFF) == 0x07 -> getString(R.string.monitor_start)
@@ -317,15 +321,21 @@ class BridgeService : Service() {
                 if (flags and (1 shl 2) != 0) { if (off + 2 <= value.size) lastCadence = le16(value, off) / 2; off += 2 }
                 if (flags and (1 shl 3) != 0) off += 2
                 if (flags and (1 shl 4) != 0) off += 3
-                if (flags and (1 shl 5) != 0) { if (off + 2 <= value.size) lastResistance = le16(value, off); off += 2 }
-                if (flags and (1 shl 6) != 0 && off + 2 <= value.size) { val raw = le16signed(value, off); lastRawW = raw; lastCorrectedW = config.correction().correct(raw) }
-                antTx?.setLatest(PowerSample(lastCorrectedW, lastCadence, lastSpeedKmh?.let { it / 3.6 }))   // corrected → Garmin over ANT+
-                CorrectedFeed.push(lastCorrectedW, lastSpeedKmh?.let { it / 3.6 }, lastCadence, System.currentTimeMillis())
+                if (flags and (1 shl 5) != 0) { if (off + 2 <= value.size) lastResistance = le16signed(value, off); off += 2 }
+                var havePower = false
+                if (flags and (1 shl 6) != 0 && off + 2 <= value.size) {
+                    val raw = le16signed(value, off); lastRawW = raw; lastCorrectedW = config.correction().correct(raw); havePower = true
+                }
+                if (havePower) {   // only a packet that actually carried power refreshes the freshness clocks
+                    antTx?.setLatest(PowerSample(lastCorrectedW, lastCadence, lastSpeedKmh?.let { it / 3.6 }))   // corrected → Garmin over ANT+
+                    CorrectedFeed.push(lastCorrectedW, lastSpeedKmh?.let { it / 3.6 }, lastCadence, System.currentTimeMillis())
+                }
                 listener?.invoke()
             }
             com.enderthor.trainerbridgeble.ble.GattUuids.CYCLING_POWER_MEASUREMENT -> {
                 if (lastRawW == null && value.size >= 4) {   // fallback only if no Indoor Bike Data
                     val raw = le16signed(value, 2); lastRawW = raw; lastCorrectedW = config.correction().correct(raw)
+                    antTx?.setLatest(PowerSample(lastCorrectedW, lastCadence, lastSpeedKmh?.let { it / 3.6 }))   // ANT too, or FE-C stays blank
                     CorrectedFeed.push(lastCorrectedW, lastSpeedKmh?.let { it / 3.6 }, lastCadence, System.currentTimeMillis())
                     listener?.invoke()
                 }

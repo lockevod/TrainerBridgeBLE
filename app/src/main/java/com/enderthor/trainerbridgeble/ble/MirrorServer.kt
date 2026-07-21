@@ -38,7 +38,7 @@ class MirrorServer(
     private val context: Context,
     private val advertisedName: String,
     private val correction: () -> PowerCorrection,
-    private val toZycle: (charUuid: UUID, bytes: ByteArray, withResponse: Boolean) -> Unit,
+    private val toZycle: (charUuid: UUID, bytes: ByteArray, withResponse: Boolean) -> Boolean,
     private val onStatus: (String) -> Unit = {},
     /** Health report to the UI: true once we're actually advertising; false if the server/advertising fails. */
     private val onAdvState: (Boolean) -> Unit = {},
@@ -55,14 +55,22 @@ class MirrorServer(
     private val clients = ConcurrentHashMap<String, BluetoothDevice>()                  // connected centrals
     private val pendingServices = ArrayDeque<BluetoothGattService>()
 
+    private val ADV_RESTART_MS = 250L
+    private val ADV_RETRY_MS = 1000L
+    private val ADV_MAX_RETRIES = 5
+    private val SERVICE_RETRY_MS = 300L
+    private val ADVERTISE_FAILED_DATA_TOO_LARGE = 1
     private val cccd: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     private val ATT_UNLIKELY_ERROR = 0x0E
+    private val ATT_INVALID_OFFSET = 0x07
     private var originalName: String? = null
     @Volatile private var advertising = false
     private val built = java.util.concurrent.atomic.AtomicBoolean(false)   // build the mirrored GATT once; a trainer reconnect keeps it
     @Volatile private var advBlueprint: AdvBlueprint? = null   // the trainer's real advertising, to clone
     @Volatile private var trainerLinked = false   // advertise only while a trainer is actually feeding us
-    @Volatile private var servicesReady = false   // every mirrored service has been ADDED (built != added)
+    @Volatile private var servicesReady = false     // every mirrored service has been ADDED (built != added)
+    @Volatile private var advRetries = 0
+    @Volatile private var dropNameFromAdv = false   // set after DATA_TOO_LARGE: the packet won't fit the name
 
     /** Gate advertising on the trainer link. We advertise under the trainer's own name, and the trainer
      *  starts advertising again the moment it drops — so advertising with no trainer behind us puts two
@@ -94,10 +102,10 @@ class MirrorServer(
     private fun renameAdapter() {
         val prefs = context.getSharedPreferences("trainerbridgeble", Context.MODE_PRIVATE)
         val current = runCatching { adapter.name }.getOrNull()
-        // A stored original wins over a read-back name, which may still be our own (see restoreName) — but
-        // refresh it whenever we observe a real name that is neither ours nor the stored one, so renaming
-        // the device in Android settings isn't undone forever by the pref we are deliberately keeping.
-        if (current != null && current != advertisedName && current != prefs.getString(KEY_ORIG_NAME, null))
+        // Capture ONLY when nothing is stored yet. adapter.name is set asynchronously, so right after a
+        // stop→start (a config save that changes the advertised name) the read-back is still the PREVIOUS
+        // advertised name — storing that would overwrite the user's real device name forever.
+        if (prefs.getString(KEY_ORIG_NAME, null) == null && current != null && current != advertisedName)
             prefs.edit().putString(KEY_ORIG_NAME, current).apply()
         originalName = prefs.getString(KEY_ORIG_NAME, null)
         runCatching { if (current != advertisedName) adapter.name = advertisedName }
@@ -161,7 +169,13 @@ class MirrorServer(
         return perm
     }
 
-    private fun addNextService() { pendingServices.poll()?.let { s -> runCatching { server?.addService(s) } } }
+    private fun addNextService() {
+        val svc = pendingServices.poll() ?: return
+        if (runCatching { server?.addService(svc) }.getOrNull() != true) {
+            FileLog.event("mirror addService REFUSED for ${shortUuid(svc.uuid)} — retrying once")
+            handler.postDelayed({ runCatching { server?.addService(svc) } }, SERVICE_RETRY_MS)
+        }
+    }
 
     fun stop() {
         // Stop the advertiser UNCONDITIONALLY: the `advertising` flag is transiently false mid-restart, so
@@ -180,6 +194,9 @@ class MirrorServer(
         val out = when {
             charUuid == GattUuids.INDOOR_BIKE_DATA -> PowerRewrite.correctIndoorBikeData(value, correction())
             charUuid == GattUuids.CYCLING_POWER_MEASUREMENT -> PowerRewrite.correctCyclingPower(value, correction())
+            // Machine Status "Target Power Changed" echoes the (inverse-corrected) watts we commanded, so
+            // correct it forward or the app reads back a target it never asked for
+            charUuid == GattUuids.MACHINE_STATUS -> PowerRewrite.correctMachineStatusTargetPower(value, correction())
             else -> value
         }
         cache[charUuid] = out
@@ -201,8 +218,15 @@ class MirrorServer(
     @Suppress("DEPRECATION")
     private fun notify(srv: BluetoothGattServer, dev: BluetoothDevice, ch: BluetoothGattCharacteristic, value: ByteArray, indicate: Boolean) {
         runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) srv.notifyCharacteristicChanged(dev, ch, indicate, value)
-            else { ch.value = value; srv.notifyCharacteristicChanged(dev, ch, indicate) }
+            val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+                srv.notifyCharacteristicChanged(dev, ch, indicate, value) == android.bluetooth.BluetoothStatusCodes.SUCCESS
+            else {
+                ch.value = value
+                @Suppress("DEPRECATION")
+                srv.notifyCharacteristicChanged(dev, ch, indicate)
+            }
+            // a refused notification is a silently dropped sample — "power froze in the app"
+            if (!ok) FileLog.event("notify ${shortUuid(ch.uuid)} REFUSED (buffer full?) -> ${dev.address}")
         }
     }
 
@@ -210,11 +234,10 @@ class MirrorServer(
         override fun onServiceAdded(status: Int, service: BluetoothGattService?) {
             if (status != BluetoothGatt.GATT_SUCCESS)
                 FileLog.event("mirror addService FAILED status=$status for ${shortUuid(service?.uuid)}")
-            val next = pendingServices.poll()
-            if (next == null) {   // nothing left in flight — the mirrored GATT is complete
+            if (pendingServices.isEmpty()) {   // nothing left in flight — the mirrored GATT is complete
                 servicesReady = true
                 handler.post { startAdvertising() }
-            } else runCatching { server?.addService(next) }
+            } else addNextService()
         }
 
         override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
@@ -229,6 +252,7 @@ class MirrorServer(
                 clients.remove(device.address); subscribers.values.forEach { it.remove(device.address) }
                 onStatus(context.getString(R.string.status_app_disconnected, clients.size))
                 FileLog.event("app disconnected ${device.address} status=$status (${clients.size} left)")
+                handler.post { restartAdvertising() }   // the controller stopped our advert when it connected
             }
         }
 
@@ -242,7 +266,12 @@ class MirrorServer(
                 runCatching { server?.sendResponse(device, requestId, ATT_UNLIKELY_ERROR, offset, ByteArray(0)) }
                 return
             }
-            val value = if (offset in 0..full.size) full.copyOfRange(offset, full.size) else ByteArray(0)
+            if (offset < 0 || offset > full.size) {
+                FileLog.event("app read $who — invalid offset, answering 0x07")
+                runCatching { server?.sendResponse(device, requestId, ATT_INVALID_OFFSET, offset, ByteArray(0)) }
+                return
+            }
+            val value = full.copyOfRange(offset, full.size)
             FileLog.event("app read $who = ${FileLog.hex(value)}")   // the VALUE, not just the request
             runCatching { server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value) }
         }
@@ -250,18 +279,24 @@ class MirrorServer(
         override fun onCharacteristicWriteRequest(device: BluetoothDevice?, requestId: Int, ch: BluetoothGattCharacteristic?,
             preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray?) {
             val uuid = ch?.uuid
+            var relayed = false
             val tag = "${shortUuid(uuid)} <- ${device?.address}" +
                 (if (preparedWrite) " PREPARED off=$offset" else "") + (if (!responseNeeded) " noResp" else "")
             if (uuid != null && value != null) {
                 val out = if (GattUuids.carriesControl(uuid)) PowerRewrite.inverseTargetPower(value, correction()) else value
-                val withResponse = ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0
+                val withResponse = responseNeeded   // what the client actually asked for
                 FileLog.event("app write $tag = ${FileLog.hex(value)}" + if (!out.contentEquals(value)) " -> ${FileLog.hex(out)}" else "")
                 // ponytail: a prepared (long) write is relayed fragment-by-fragment rather than buffered
                 // until onExecuteWrite. No FTMS/CPS characteristic exceeds one ATT payload, so this only
                 // matters if some app starts using long writes — the log line above says when it happens.
-                toZycle(uuid, out, withResponse)   // relay to the trainer
+                relayed = toZycle(uuid, out, withResponse)   // relay to the trainer
+                if (!relayed) FileLog.event("app write $tag NOT RELAYED — answering failure")
             } else FileLog.event("app write $tag = <no value / unknown char>")
-            if (responseNeeded) runCatching { server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value) }
+            if (responseNeeded) runCatching {
+                // GATT_SUCCESS here would tell the app its ERG target took effect while it went nowhere
+                val st = if (relayed) BluetoothGatt.GATT_SUCCESS else BluetoothGatt.GATT_FAILURE
+                server?.sendResponse(device, requestId, st, offset, value)
+            }
         }
 
         override fun onDescriptorWriteRequest(device: BluetoothDevice?, requestId: Int, descriptor: BluetoothGattDescriptor?,
@@ -270,7 +305,7 @@ class MirrorServer(
                 val enabled = value != null && value.isNotEmpty() && value[0].toInt() != 0
                 val cUuid = descriptor.characteristic?.uuid
                 if (cUuid != null) {
-                    val set = subscribers.getOrPut(cUuid) { java.util.Collections.synchronizedSet(HashSet()) }
+                    val set = subscribers.computeIfAbsent(cUuid) { java.util.Collections.synchronizedSet(HashSet()) }
                     if (enabled) set.add(device.address) else set.remove(device.address)
                     FileLog.event("app subscribe ${shortUuid(cUuid)} enabled=$enabled raw=${FileLog.hex(value ?: ByteArray(0))} <- ${device.address}")
                 }
@@ -298,7 +333,10 @@ class MirrorServer(
             // Report the client's current CCCD state so a read doesn't time out.
             val cUuid = descriptor?.characteristic?.uuid
             val on = device != null && cUuid != null && subscribers[cUuid]?.contains(device.address) == true
-            val v = if (on) byteArrayOf(0x01, 0x00) else byteArrayOf(0x00, 0x00)
+            val indicate = descriptor?.characteristic?.properties
+                ?.and(BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
+            val v = if (!on) byteArrayOf(0x00, 0x00)
+                    else if (indicate) byteArrayOf(0x02, 0x00) else byteArrayOf(0x01, 0x00)
             FileLog.event("app read descriptor ${shortUuid(descriptor?.uuid)} of ${shortUuid(cUuid)} = ${FileLog.hex(v)} <- ${device?.address}")
             runCatching { server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, v) }
         }
@@ -306,8 +344,14 @@ class MirrorServer(
 
     // ── advertising ──────────────────────────────────────────────────────────────────────────────────
     private val advCallback = object : android.bluetooth.le.AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { advertising = true; onAdvState(true); onStatus(context.getString(R.string.status_advertising, advertisedName)); FileLog.event("advertising as $advertisedName") }
-        override fun onStartFailure(errorCode: Int) { advertising = false; onAdvState(false); onStatus(context.getString(R.string.status_advertise_failed, errorCode)); FileLog.event("advertise failed $errorCode") }
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { advertising = true; advRetries = 0; onAdvState(true); onStatus(context.getString(R.string.status_advertising, advertisedName)); FileLog.event("advertising as $advertisedName") }
+        override fun onStartFailure(errorCode: Int) {
+            advertising = false; onAdvState(false)
+            onStatus(context.getString(R.string.status_advertise_failed, errorCode))
+            FileLog.event("advertise failed $errorCode (retry ${advRetries + 1}/$ADV_MAX_RETRIES, name=${!dropNameFromAdv})")
+            if (errorCode == ADVERTISE_FAILED_DATA_TOO_LARGE) dropNameFromAdv = true   // 31-byte PDU: shed the name
+            if (advRetries++ < ADV_MAX_RETRIES) handler.postDelayed({ startAdvertising() }, ADV_RETRY_MS)
+        }
     }
 
     private fun startAdvertising() {
@@ -321,7 +365,7 @@ class MirrorServer(
         // Clone the trainer's own advertising when we have it (same service UUIDs + manufacturer data), so a
         // head unit that filters on them sees us exactly like the real trainer. Fallback (sim / not yet
         // captured): the three standard cycling services.
-        val builder = AdvertiseData.Builder().setIncludeDeviceName(true)
+        val builder = AdvertiseData.Builder().setIncludeDeviceName(!dropNameFromAdv)
         val bp = advBlueprint
         if (bp != null && bp.serviceUuids.isNotEmpty()) {
             bp.serviceUuids.forEach { builder.addServiceUuid(it) }
@@ -346,7 +390,9 @@ class MirrorServer(
     private fun restartAdvertising() {
         runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(advCallback) }
         advertising = false
-        startAdvertising()
+        // The stop is async and only frees this callback when it completes; starting in the same turn
+        // answers ADVERTISE_FAILED_ALREADY_STARTED. Give it a turn.
+        handler.postDelayed({ startAdvertising() }, ADV_RESTART_MS)
     }
 
     private fun logRelay(uuid: UUID, inV: ByteArray, outV: ByteArray, nClients: Int) {

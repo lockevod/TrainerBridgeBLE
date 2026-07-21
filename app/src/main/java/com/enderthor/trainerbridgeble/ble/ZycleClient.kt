@@ -43,11 +43,12 @@ class ZycleClient(
     private val adapter by lazy { (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter }
 
     @Volatile private var gatt: BluetoothGatt? = null
-    @Volatile private var connecting = false
+    private val connecting = AtomicBoolean(false)   // CAS: scan results arrive on a binder thread pool
     @Volatile private var stopped = false
     @Volatile private var scanning = false
     @Volatile private var lastMessageMs = 0L   // wall-clock of the last notification, for the silent-link watchdog
     private val reconnectPending = AtomicBoolean(false)
+    @Volatile private var retryMs = SCAN_RETRY_MS   // scan backoff, reset on a good connection
 
     private val opQueue = ConcurrentLinkedQueue<() -> Unit>()
     private val opBusy = AtomicBoolean(false)
@@ -55,6 +56,7 @@ class ZycleClient(
 
     private class WriteReq(val uuid: UUID, val bytes: ByteArray, val withResponse: Boolean, val retriesLeft: Int, val seq: Int)
     @Volatile private var inFlightWrite: WriteReq? = null   // the write currently on the wire, for retry on failure
+    @Volatile private var inFlightOp: UUID? = null          // char/descriptor whose callback we are waiting for
     private val writeSeq = java.util.concurrent.atomic.AtomicInteger(0)  // bumps per write; a retry is dropped if superseded
 
     private val cccd: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
@@ -68,9 +70,10 @@ class ZycleClient(
 
     override fun stop() {
         stopped = true
-        connecting = false
+        connecting.set(false)
+        inFlightWrite = null
         stopScan()
-        handler.removeCallbacks(heartbeat)
+        handler.removeCallbacksAndMessages(null)   // heartbeat, rescan, connect/op watchdogs, write retries
         opQueue.clear(); opBusy.set(false)
         gatt?.let { runCatching { it.disconnect() }; runCatching { it.close() } }
         gatt = null
@@ -104,28 +107,33 @@ class ZycleClient(
     }
 
     /** Forward a write to the trainer's characteristic [charUuid] (control relay). Queued. */
-    override fun write(charUuid: UUID, bytes: ByteArray, withResponse: Boolean) =
+    override fun write(charUuid: UUID, bytes: ByteArray, withResponse: Boolean): Boolean =
         writeInternal(charUuid, bytes, withResponse, CONTROL_WRITE_RETRIES)
 
-    private fun writeInternal(charUuid: UUID, bytes: ByteArray, withResponse: Boolean, retriesLeft: Int) {
-        FileLog.event("Zycle write $charUuid = ${FileLog.hex(bytes)}")
-        val g = gatt ?: return
-        val ch = g.services.firstNotNullOfOrNull { s -> s.getCharacteristic(charUuid) } ?: return
+    private fun writeInternal(charUuid: UUID, bytes: ByteArray, withResponse: Boolean, retriesLeft: Int): Boolean {
+        val g = gatt ?: run { FileLog.event("Zycle write ${shortUuid(charUuid)} DROPPED — no trainer link"); return false }
+        // g.services is repopulated by discovery while this runs on the GATT-server binder thread
+        val ch = runCatching { g.services.firstNotNullOfOrNull { s -> s.getCharacteristic(charUuid) } }.getOrNull()
+            ?: run { FileLog.event("Zycle write ${shortUuid(charUuid)} DROPPED — characteristic not found"); return false }
+        FileLog.event("Zycle write ${shortUuid(charUuid)} = ${FileLog.hex(bytes)}")
         val seq = writeSeq.incrementAndGet()
         enqueue {
             @Suppress("DEPRECATION")
             run {
-                inFlightWrite = WriteReq(charUuid, bytes, withResponse, retriesLeft, seq)
+                inFlightWrite = WriteReq(charUuid, bytes, withResponse, retriesLeft, seq); inFlightOp = charUuid
                 ch.writeType = if (withResponse) BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
                 else BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
                 ch.value = bytes
-                if (g.writeCharacteristic(ch) != true) { inFlightWrite = null; opDone() }   // couldn't start → free the queue
+                if (g.writeCharacteristic(ch) != true) {
+                    FileLog.event("Zycle write ${shortUuid(charUuid)} REFUSED by stack"); inFlightWrite = null; opDone()
+                }
             }
         }
+        return true
     }
 
     // ── scan ────────────────────────────────────────────────────────────────────────────────────────
-    private val scanCallback = object : ScanCallback() {
+    private val scanCallback: ScanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
             if (stopped) return   // results already queued in the controller when stop() landed
             val dev = result?.device ?: return
@@ -133,15 +141,19 @@ class ZycleClient(
             // the scan filter already guarantees FTMS/CPS, so unpaired = take the first trainer that answers
             val match = pairedAddress.isEmpty() || dev.address == pairedAddress
             if (match) {
-                if (gatt != null || connecting) return   // already connecting/connected — ignore duplicate adverts
-                connecting = true
+                if (gatt != null || !connecting.compareAndSet(false, true)) return   // duplicate advert / already busy
                 FileLog.event("Zycle found '$name' ${dev.address} rssi=${result.rssi}")
                 onFound(name, dev.address)
                 captureAdv(result)
                 stopScan(); connect(dev)
             }
         }
-        override fun onScanFailed(errorCode: Int) { Log.w(tag, "scan failed $errorCode"); FileLog.event("Zycle scan FAILED code=$errorCode"); if (!stopped) handler.postDelayed({ startScan() }, 2000) }
+        override fun onScanFailed(errorCode: Int) {
+            Log.w(tag, "scan failed $errorCode"); FileLog.event("Zycle scan FAILED code=$errorCode")
+            stopScan()         // clears `scanning` — without that every later startScan() early-returns
+            scanning = false   // ...and clear it even if stopScan() found nothing to stop
+            retryScanLater()
+        }
     }
 
     /** Snapshot the trainer's advertised service UUIDs + manufacturer data so the mirror re-advertises an
@@ -155,20 +167,41 @@ class ZycleClient(
         onAdv(AdvBlueprint(uuids, mfr))
     }
 
-    private fun startScan() {
+    private fun startScan(): Unit {
         if (stopped || scanning) return
-        val scanner = adapter?.bluetoothLeScanner ?: return
-        scanning = true
-        runCatching {
-            // Paired → filter by address only: the trainer's advert may carry its UUIDs in the scan
-            // response, which the controller's offloaded UUID filter never sees. Unpaired → FTMS only:
-            // a bare power meter advertises CPS but can't take ERG, so it must not win the race.
-            val filters = if (pairedAddress.isNotEmpty())
-                listOf(android.bluetooth.le.ScanFilter.Builder().setDeviceAddress(pairedAddress).build())
-            else GattUuids.scanFilters(0x1826)
-            // default scan mode (LOW_POWER) as before — this scan runs until the trainer appears
-            scanner.startScan(filters, android.bluetooth.le.ScanSettings.Builder().build(), scanCallback)
+        // Bluetooth off (or the stack restarting) → no scanner at all. There is no adapter-state receiver,
+        // so without a retry here the client would stay dead for the rest of the session.
+        val scanner = adapter?.bluetoothLeScanner ?: run {
+            FileLog.event("Zycle scan: no LE scanner (Bluetooth off?) — retry in ${retryMs}ms"); retryScanLater(); return
         }
+        // Paired → filter by address only: the trainer's advert may carry its UUIDs in the scan
+        // response, which the controller's offloaded UUID filter never sees. Unpaired → FTMS only:
+        // a bare power meter advertises CPS but can't take ERG, so it must not win the race.
+        val filters = if (pairedAddress.isNotEmpty())
+            listOf(android.bluetooth.le.ScanFilter.Builder().setDeviceAddress(pairedAddress).build())
+        else GattUuids.scanFilters(0x1826)
+        // BALANCED, not LOW_POWER: this scan runs while we have no trainer, and with the screen off
+        // LOW_POWER's duty cycle can take minutes to reacquire mid-ride.
+        val settings = android.bluetooth.le.ScanSettings.Builder()
+            .setScanMode(android.bluetooth.le.ScanSettings.SCAN_MODE_BALANCED).build()
+        // A revoked BLUETOOTH_SCAN throws here; swallowing it while `scanning` was already true left the
+        // client permanently dead and silent. Set the flag ONLY once the scan really started.
+        val started = runCatching { scanner.startScan(filters, settings, scanCallback) }
+        if (started.isFailure) {
+            FileLog.event("Zycle scan start threw: ${started.exceptionOrNull()}"); retryScanLater(); return
+        }
+        scanning = true
+    }
+
+    private val rescan: Runnable = Runnable { startScan() }
+
+    /** Backoff, so a connect/fail flap can't drive us into Android's 5-scans-per-30s throttle — which
+     *  answers with onScanFailed(6) and used to latch the client dead. */
+    private fun retryScanLater(): Unit {
+        if (stopped) return
+        handler.removeCallbacks(rescan)
+        handler.postDelayed(rescan, retryMs)
+        retryMs = (retryMs * 2).coerceAtMost(SCAN_RETRY_MAX_MS)
     }
 
     private fun stopScan() {
@@ -180,7 +213,28 @@ class ZycleClient(
     // ── connect / GATT ──────────────────────────────────────────────────────────────────────────────
     private fun connect(device: BluetoothDevice) {
         if (stopped) return
-        gatt = device.connectGatt(context, false, gattCallback)
+        // TRANSPORT_LE explicitly: with TRANSPORT_AUTO a device that ever bonded as DUAL is attempted over
+        // BR/EDR and fails with status=133 every time.
+        val g = runCatching {
+            device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        }.getOrNull()
+        gatt = g
+        if (g == null) {   // registerClient failed (client-interface exhaustion / stack restart)
+            FileLog.event("Zycle connectGatt returned null — rescheduling")
+            connecting.set(false); scheduleReconnect(); return
+        }
+        handler.postDelayed(connectTimeout, CONNECT_TIMEOUT_MS)
+    }
+
+    /** No connection callback ever arrives on some stack failures, and `connecting` would then block every
+     *  future advert from being acted on. */
+    private val connectTimeout = Runnable {
+        if (!stopped && connecting.get() && gatt != null) {
+            FileLog.event("Zycle connect timeout ${CONNECT_TIMEOUT_MS}ms -> retry")
+            val g = gatt; gatt = null; connecting.set(false)
+            runCatching { g?.disconnect() }; runCatching { g?.close() }
+            scheduleReconnect()
+        }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
@@ -188,7 +242,9 @@ class ZycleClient(
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 if (gatt !== g) { runCatching { g.close() }; return }   // orphaned handle — drop it
                 FileLog.event("Zycle connected status=$status")
-                connecting = false
+                connecting.set(false)
+                handler.removeCallbacks(connectTimeout)
+                retryMs = SCAN_RETRY_MS   // a good connection resets the backoff
                 lastMessageMs = System.currentTimeMillis()   // start the silent-link window at connect
                 onState(true)
                 handler.post { runCatching { g.discoverServices() } }
@@ -198,38 +254,40 @@ class ZycleClient(
                 if (gatt !== g) return   // a stale/superseded handle — don't touch the live connection's state
                 onState(false)
                 opQueue.clear(); opBusy.set(false)
-                gatt = null; connecting = false; lastMessageMs = 0L
+                gatt = null; connecting.set(false); inFlightWrite = null; lastMessageMs = 0L
                 scheduleReconnect()
             }
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-            if (stopped) return   // a stopped client must not hand its profile to whatever replaced it
+            if (stopped || gatt !== g) return   // stopped, or a callback from a handle we already replaced
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 Log.w(tag, "discover failed $status"); FileLog.event("Zycle discover FAILED status=$status"); return
             }
+            lastMessageMs = System.currentTimeMillis()   // discovery counts as life, or the watchdog recycles us mid-subscribe
             val profile = buildProfile(g)
             FileLog.event("Zycle profile: " + profile.services.joinToString("; ") { s ->
                 "${s.uuid}[" + s.chars.joinToString(",") { "${shortUuid(it.uuid)}(p=${it.properties})" } + "]"
             })
             onProfile(profile)
             // Subscribe to every notify/indicate char, and read every readable char once — all serialised.
-            for (svc in g.services) {
-                if (GattUuids.isStackService(svc.uuid)) continue
-                for (ch in svc.characteristics) {
-                    val p = ch.properties
-                    if (p and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0)
-                        enqueueSubscribe(g, ch)
-                    if (p and BluetoothGattCharacteristic.PROPERTY_READ != 0)
-                        enqueueRead(g, ch)
-                }
-            }
+            val svcs = g.services.filterNot { GattUuids.isStackService(it.uuid) }
+            // READS FIRST: an app connecting to the mirror reads FTMS Feature almost immediately, and a cold
+            // cache there reads to it as "this machine has no capabilities" for the whole session.
+            for (svc in svcs) for (ch in svc.characteristics)
+                if (ch.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) enqueueRead(g, ch)
+            for (svc in svcs) for (ch in svc.characteristics)
+                if (ch.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0)
+                    enqueueSubscribe(g, ch)
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            val u = descriptor.characteristic.uuid
             // a failed CCCD write means that characteristic silently never notifies — never let it pass quietly
             if (status != BluetoothGatt.GATT_SUCCESS)
-                FileLog.event("Zycle subscribe ${shortUuid(descriptor.characteristic.uuid)} FAILED status=$status")
+                FileLog.event("Zycle subscribe ${shortUuid(u)} FAILED status=$status")
+            lastMessageMs = System.currentTimeMillis()
+            if (!claimOp(u)) return   // late callback for an op the watchdog already abandoned
             opDone()
         }
 
@@ -244,11 +302,18 @@ class ZycleClient(
                 FileLog.event("Zycle read ${shortUuid(ch.uuid)} = ${FileLog.hex(v)}")   // identity/feature/ranges values
                 onValue(ch.uuid, v)
             } else FileLog.event("Zycle read ${shortUuid(ch.uuid)} failed status=$status")
+            lastMessageMs = System.currentTimeMillis()
+            if (!claimOp(ch.uuid)) return
             opDone()
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
-            val w = inFlightWrite; inFlightWrite = null
+            lastMessageMs = System.currentTimeMillis()
+            // only the write this callback is FOR: a late status used to be attributed to whatever write
+            // happened to be in the slot, re-sending someone else's ERG target
+            val w = inFlightWrite?.takeIf { it.uuid == ch.uuid }
+            if (w != null) inFlightWrite = null
+            if (!claimOp(ch.uuid)) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 // Retry a failed CONTROL write (the trainer occasionally NAKs with status 133), but only if a
                 // newer control write hasn't superseded it (w.seq == writeSeq) — never re-send a stale target.
@@ -287,7 +352,8 @@ class ZycleClient(
         }
     )
 
-    private fun enqueueSubscribe(g: BluetoothGatt, ch: BluetoothGattCharacteristic) = enqueue {
+    private fun enqueueSubscribe(g: BluetoothGatt, ch: BluetoothGattCharacteristic, retry: Boolean = true): Unit = enqueue {
+        inFlightOp = ch.uuid
         g.setCharacteristicNotification(ch, true)
         val d = ch.getDescriptor(cccd)
         if (d == null) { FileLog.event("Zycle subscribe ${shortUuid(ch.uuid)} — no CCCD"); opDone(); return@enqueue }
@@ -296,12 +362,30 @@ class ZycleClient(
         run {
             d.value = if (ch.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)
                 BluetoothGattDescriptor.ENABLE_INDICATION_VALUE else BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            if (g.writeDescriptor(d) != true) opDone()
+            if (g.writeDescriptor(d) != true) {
+                FileLog.event("Zycle subscribe ${shortUuid(ch.uuid)} REFUSED by stack" + if (retry) " — requeueing" else " — giving up")
+                if (retry) handler.postDelayed({ if (!stopped && gatt === g) enqueueSubscribe(g, ch, retry = false) }, OP_REQUEUE_MS)
+                opDone()
+            }
         }
     }
 
-    private fun enqueueRead(g: BluetoothGatt, ch: BluetoothGattCharacteristic) = enqueue {
-        if (g.readCharacteristic(ch) != true) opDone()
+    private fun enqueueRead(g: BluetoothGatt, ch: BluetoothGattCharacteristic, retry: Boolean = true): Unit = enqueue {
+        inFlightOp = ch.uuid
+        if (g.readCharacteristic(ch) != true) {
+            FileLog.event("Zycle read ${shortUuid(ch.uuid)} REFUSED by stack" + if (retry) " — requeueing" else " — giving up")
+            if (retry) handler.postDelayed({ if (!stopped && gatt === g) enqueueRead(g, ch, retry = false) }, OP_REQUEUE_MS)
+            opDone()
+        }
+    }
+
+    /** True if this callback belongs to the operation currently on the wire. A callback arriving after the
+     *  op watchdog gave up must NOT advance the queue again — that skew is what silently loses the next op. */
+    private fun claimOp(u: UUID): Boolean {
+        val expected = inFlightOp ?: return true   // nothing tracked (e.g. a write) — accept
+        if (expected != u) { FileLog.event("Zycle stale callback for ${shortUuid(u)} (waiting ${shortUuid(expected)}) — ignored"); return false }
+        inFlightOp = null
+        return true
     }
 
     // ── GATT op serialisation ────────────────────────────────────────────────────────────────────────
@@ -321,7 +405,7 @@ class ZycleClient(
             val w = Runnable {
                 if (opBusy.get() && opToken.get() == token) {
                     FileLog.event("Zycle GATT op timeout ${OP_TIMEOUT_MS}ms -> unstick queue")
-                    inFlightWrite = null
+                    inFlightWrite = null; inFlightOp = null
                     opDone()
                 }
             }
@@ -330,10 +414,14 @@ class ZycleClient(
             runCatching { op() }.onFailure { opDone() }
         }
     }
-    private fun opDone() { opWatchdog?.let { handler.removeCallbacks(it) }; opToken.incrementAndGet(); opBusy.set(false); pump() }
+    private fun opDone() { inFlightOp = null; opWatchdog?.let { handler.removeCallbacks(it) }; opToken.incrementAndGet(); opBusy.set(false); pump() }
 
     private companion object {
         const val RECONNECT_DELAY_MS = 2000L
+        const val SCAN_RETRY_MS = 2000L
+        const val SCAN_RETRY_MAX_MS = 60000L      // backoff ceiling: stay clear of the 5-scans-per-30s throttle
+        const val CONNECT_TIMEOUT_MS = 20000L     // no connection callback ever arrives on some stack failures
+        const val OP_REQUEUE_MS = 300L
         const val HEARTBEAT_CHECK_MS = 7000L
         const val HEARTBEAT_TIMEOUT_MS = 15000L   // silent this long while "connected" → recycle the link (~15s, ANT-learned)
         const val CONTROL_WRITE_RETRIES = 2       // resend a control write that NAKs (status 133) up to twice

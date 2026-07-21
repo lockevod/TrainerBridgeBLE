@@ -48,7 +48,7 @@ class SimSource(
      *  Zycle-style proprietary characteristic carrying the raw FE-C Basic Resistance page (buttons). */
     private fun emitResistance() {
         val level = resistance
-        onValue(STATUS, byteArrayOf(0x07, (level and 0xFF).toByte(), ((level shr 8) and 0xFF).toByte()))
+        onValue(STATUS, byteArrayOf(0x07, (level and 0xFF).toByte()))   // FTMS: the parameter is uint8
         val units = resistance   // already FE-C 0.5% units
         onValue(PROP_BUTTON, byteArrayOf(0x30, 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(), units.toByte()))
     }
@@ -106,13 +106,14 @@ class SimSource(
 
     override fun stop() { handler.removeCallbacks(ticker); onState(false); FileLog.event("SIM trainer stopped") }
 
-    override fun write(charUuid: UUID, bytes: ByteArray, withResponse: Boolean) {
+    override fun write(charUuid: UUID, bytes: ByteArray, withResponse: Boolean): Boolean {
         FileLog.event("SIM write ${bytes.joinToString("") { "%02X".format(it) }}")
-        if (charUuid != CONTROL || bytes.isEmpty()) return
+        if (charUuid != CONTROL || bytes.isEmpty()) return true
         val op = bytes[0].toInt() and 0xFF
         when (op) {
             0x05 -> if (bytes.size >= 3) ergTarget = (bytes[1].toInt() and 0xFF) or ((bytes[2].toInt() and 0xFF) shl 8)  // Set Target Power
-            0x04 -> if (bytes.size >= 2) { resistance = (bytes[1].toInt() and 0xFF).coerceIn(0, 200); emitResistance() }   // Set Target Resistance (app → down)
+            // Set Target Resistance: a real trainer leaves ERG mode when you command resistance
+            0x04 -> if (bytes.size >= 2) { ergTarget = null; resistance = (bytes[1].toInt() and 0xFF).coerceIn(0, 200); emitResistance() }
             0x01 -> ergTarget = null   // Reset
         }
         // Control Point Response indication (0x80 <reqOp> <result>) — a real trainer sends this, and apps
@@ -122,6 +123,7 @@ class SimSource(
         // then wait on — a slope-mode app would otherwise watch power ignore the grade forever.
         val result: Byte = if (op in IMPLEMENTED_OPS) 0x01 else 0x02
         onValue(CONTROL, byteArrayOf(0x80.toByte(), (op and 0xFF).toByte(), result))
+        return true
     }
 
     private fun indoorBikeData(power: Int, cadence: Int, speedKmh: Double, resistance: Int): ByteArray {
@@ -138,8 +140,8 @@ class SimSource(
 
     /** CPM (0x2A63): flags 0x0030 — wheel (bit4) + crank (bit5) revolution data, the same set the real
      *  trainer sends, and what [CP_FEATURE] now declares. Instantaneous power is mandatory, no flag.
-     *  ponytail: the event timestamps advance every tick rather than on a real revolution — a consumer
-     *  computes Δrevs/Δtime, which averages out correctly; emit on true revolutions if that ever matters. */
+     *  The event times are sampled from a free-running clock when a revolution happens (see the ticker),
+     *  which is what a consumer's Δrevs/Δtime needs — pinned by CpsEventClockTest. */
     private fun cyclingPower(power: Int): ByteArray = byteArrayOf(0x30, 0x00, lo(power), hi(power),
         lo(wheelRevs), hi(wheelRevs), ((wheelRevs shr 16) and 0xFF).toByte(), ((wheelRevs shr 24) and 0xFF).toByte(),
         lo(wheelEvt2048), hi(wheelEvt2048),
