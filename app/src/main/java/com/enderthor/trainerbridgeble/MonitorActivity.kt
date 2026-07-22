@@ -97,8 +97,9 @@ class MonitorActivity : Activity() {
             .apply { background = rounded(Palette.CARD_BG) })   // white so it stands out from the page bg
 
         setContentView(ScrollView(this).apply { setBackgroundColor(Palette.PAGE_BG); addView(body) })
-        ensurePermissions()
-        requestBatteryExemption()
+        // Battery exemption only once the permission dialog is out of the way (it starts an Activity, and
+        // both prompts at once on a fresh install is how one of them gets dismissed blind).
+        if (!ensurePermissions()) requestBatteryExemption()
     }
 
     /** Doze kills the pipeline a few minutes after the screen turns off unless we're whitelisted. Ask once. */
@@ -180,12 +181,27 @@ class MonitorActivity : Activity() {
 
     private companion object { const val STALE_MS = 3000L }
 
-    private fun ensurePermissions() {
-        val needed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+    /** @return true if a permission dialog was shown (the result arrives in onRequestPermissionsResult). */
+    private fun ensurePermissions(): Boolean {
+        val needed = (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
             listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE)
-        else listOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        else listOf(Manifest.permission.ACCESS_FINE_LOCATION)) +
+            // Declared in the manifest and runtime-gated since API 33; without it the foreground service
+            // runs with no visible notification, so there is no way back to the Monitor.
+            (if (Build.VERSION.SDK_INT >= 33) listOf(Manifest.permission.POST_NOTIFICATIONS) else emptyList())
         val missing = needed.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
-        if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 1)
+        if (missing.isEmpty()) return false
+        requestPermissions(missing.toTypedArray(), 1)
+        return true
+    }
+
+    /** Bluetooth denied = the scan silently no-ops forever and the screen just says "searching". Say so. */
+    private fun warnIfBluetoothDenied() {
+        val bt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+            listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+        else listOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (bt.any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED })
+            android.widget.Toast.makeText(this, R.string.status_missing_bt_permission, android.widget.Toast.LENGTH_LONG).show()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -193,9 +209,16 @@ class MonitorActivity : Activity() {
         // Fresh install: master defaults ON, but onStart's setMaster ran before these were granted (the BLE
         // scan silently no-op'd on SecurityException). Re-assert once granted so it starts receiving without
         // needing an app reopen.
-        if (requestCode == 1 && grantResults.isNotEmpty() &&
-            grantResults.all { it == PackageManager.PERMISSION_GRANTED } && config.masterEnabled) {
-            BridgeService.setMaster(this, true); render()
+        if (requestCode != 1) return
+        // Scoped to the BLUETOOTH permissions ON PURPOSE: POST_NOTIFICATIONS rides in the same request, and
+        // denying only that one must not cost the master re-assert — the bridge works fine without it.
+        val btGranted = permissions.indices.none {
+            permissions[it] != Manifest.permission.POST_NOTIFICATIONS &&
+                grantResults.getOrNull(it) != PackageManager.PERMISSION_GRANTED
         }
+        if (grantResults.isNotEmpty() && btGranted && config.masterEnabled) {
+            BridgeService.setMaster(this, true); render()
+        } else warnIfBluetoothDenied()
+        requestBatteryExemption()   // deferred from onCreate so the two dialogs don't overlap
     }
 }

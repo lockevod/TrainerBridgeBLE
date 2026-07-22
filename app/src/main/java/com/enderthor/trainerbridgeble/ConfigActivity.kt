@@ -148,7 +148,7 @@ class ConfigActivity : Activity() {
     private fun toggleScan() {
         if (scanning) { stopScan(); return }
         found.clear(); softFilter = false; rebuildFound()
-        val scanner = adapter?.bluetoothLeScanner ?: run { toast(getString(R.string.config_ble_unavailable)); return }
+        adapter?.bluetoothLeScanner ?: run { toast(getString(R.string.config_ble_unavailable)); return }   // BT off / no LE
         FileLog.event("config scan start (filters: FTMS 0x1826 + CPS 0x1818)")
         if (!startScan(filtered = true)) { toast(getString(R.string.config_ble_unavailable)); return }
         scanning = true; scanBtn.text = getString(R.string.config_scan_stop)   // only once the scan really started

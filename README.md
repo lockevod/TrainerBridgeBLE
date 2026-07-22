@@ -40,17 +40,16 @@ available three ways:
 
 ---
 
-## The three controls
+## The two controls
 
-The Monitor screen has three independent switches — this is the key to understanding the app:
+The Monitor screen has two independent controls — this is the key to understanding the app:
 
 | Control | What it does |
 |---|---|
-| **App active** (master) | The on/off of the whole app. **Off = nothing runs, zero battery.** Turn it on to use the app. |
-| **Trainer enabled** | Connect to your trainer (the "receiving" side). On by default. While on, the app is connected and the tiles show live power/cadence/speed/resistance — **you do not need to press Broadcast for this**. |
+| **App active** (master) | The on/off of the whole app. **Off = nothing runs, zero battery.** Turn it on and the app connects to your trainer: the tiles show live power/cadence/speed/resistance — **you do not need to press Broadcast for this**. |
 | **Broadcast** (the big button) | Start/stop **emitting to the outside**: the Bluetooth mirror for training apps + the ANT+ output. |
 
-**Receiving is always available** (whenever *App active* + *Trainer enabled* are on). **Broadcast is only
+**Receiving is always available** whenever *App active* is on. **Broadcast is only
 for sending to external apps / ANT+.** So the Karoo virtual sensor works without ever pressing Broadcast.
 
 ---
@@ -61,7 +60,7 @@ This is where it's most useful: **indoor training on the Karoo**. Indoors you ha
 trainer for power, speed and cadence — so recording the *corrected* power matters. The Karoo runs the app
 **and** records the ride from it, all on the one device, with no ANT dongle.
 
-1. Install the app and open it. Turn **App active** on. Make sure **Trainer enabled** is on.
+1. Install the app and open it. Turn **App active** on.
 2. The app connects to your trainer; the Monitor tiles show corrected power/cadence/speed.
 3. On the Karoo, go to **Sensors → Add sensor** and pair **"TrainerBridge"**. The Karoo now records the
    **corrected** power, cadence and speed for your indoor ride.
@@ -79,7 +78,7 @@ trainer for power, speed and cadence — so recording the *corrected* power matt
 
 The phone acts as the bridge between the trainer and your training app (and, optionally, a Garmin).
 
-1. Install and open the app. Turn **App active** on; keep **Trainer enabled** on — it connects to the
+1. Install and open the app. Turn **App active** on — it connects to the
    trainer and the tiles show corrected power.
 2. Press **Broadcast**. The phone advertises the mirrored trainer over Bluetooth **while it is connected
    to your trainer** — if the trainer sleeps, the mirror goes off the air until it wakes (otherwise two

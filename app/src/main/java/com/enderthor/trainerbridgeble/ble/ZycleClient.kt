@@ -35,6 +35,11 @@ class ZycleClient(
     private val onProfile: (GattProfile) -> Unit,
     private val onValue: (charUuid: UUID, value: ByteArray) -> Unit,   // notifications AND initial reads
     private val onState: (connected: Boolean) -> Unit,
+    // Fired once per connection when the opening burst of reads+subscribes has drained, i.e. when we
+    // actually HAVE the trainer's values. The mirror waits for this before advertising: services are added
+    // locally in milliseconds, but the reads take 0.5-2 s over the air, and an app that connects in that
+    // window reads an empty FTMS Feature and decides the machine has no ERG for the whole session.
+    private val onSynced: () -> Unit = {},
     private val onAdv: (AdvBlueprint) -> Unit = {},   // the trainer's own advertising, for the mirror to clone
     private val onFound: (name: String?, address: String) -> Unit = { _, _ -> },   // for the config screen
 ) : TrainerSource {
@@ -52,6 +57,16 @@ class ZycleClient(
 
     private val opQueue = ConcurrentLinkedQueue<() -> Unit>()
     private val opBusy = AtomicBoolean(false)
+    private val syncOwed = AtomicBoolean(false)      // onSynced not yet delivered for THIS connection
+    @Volatile private var burstEnqueued = false      // the opening read/subscribe burst is in the queue
+
+    /** Deliver [onSynced] at most once per connection, on the main thread, and never for a link that has
+     *  dropped in the meantime: a stale delivery would put the mirror on the air with no trainer behind it,
+     *  and setTrainerLinked is edge-triggered, so it would STAY there. */
+    private fun fireSynced(g: BluetoothGatt) {
+        if (!syncOwed.compareAndSet(true, false)) return
+        handler.post { if (!stopped && gatt === g) onSynced() }
+    }
     private val opToken = java.util.concurrent.atomic.AtomicInteger(0)   // guards the per-op watchdog vs a stale timeout
 
     private class WriteReq(val uuid: UUID, val bytes: ByteArray, val withResponse: Boolean, val retriesLeft: Int, val seq: Int)
@@ -91,7 +106,7 @@ class ZycleClient(
                 FileLog.event("Zycle watchdog: silent ${System.currentTimeMillis() - lastMessageMs}ms -> reconnect")
                 gatt = null; lastMessageMs = 0L
                 onState(false)
-                opQueue.clear(); opBusy.set(false)
+                opQueue.clear(); opBusy.set(false); syncOwed.set(false); burstEnqueued = false
                 runCatching { g.disconnect() }; runCatching { g.close() }
                 scheduleReconnect()
             }
@@ -248,14 +263,22 @@ class ZycleClient(
                 connecting.set(false)
                 retryMs = SCAN_RETRY_MS   // a good connection resets the backoff
                 lastMessageMs = System.currentTimeMillis()   // start the silent-link window at connect
+                syncOwed.set(true); burstEnqueued = false
                 onState(true)
                 handler.post { runCatching { g.discoverServices() } }
+                // Floor under the mirror going on the air. Discovery can fail, be refused by the stack, or
+                // yield a profile with nothing to read; and a lost GATT callback costs OP_TIMEOUT_MS each.
+                // Waiting forever for a perfect sync is worse than advertising with a partial cache.
+                handler.postDelayed({
+                    if (syncOwed.get()) FileLog.event("Zycle sync fallback ${SYNC_FALLBACK_MS}ms -> advertising anyway")
+                    fireSynced(g)
+                }, SYNC_FALLBACK_MS)
             } else {
                 FileLog.event("Zycle disconnected status=$status")
                 runCatching { g.close() }
                 if (gatt !== g) return   // a stale/superseded handle — don't touch the live connection's state
                 onState(false)
-                opQueue.clear(); opBusy.set(false)
+                opQueue.clear(); opBusy.set(false); syncOwed.set(false); burstEnqueued = false
                 gatt = null; connecting.set(false); inFlightWrite = null; lastMessageMs = 0L
                 scheduleReconnect()
             }
@@ -274,6 +297,10 @@ class ZycleClient(
             onProfile(profile)
             // Subscribe to every notify/indicate char, and read every readable char once — all serialised.
             val svcs = g.services.filterNot { GattUuids.isStackService(it.uuid) }
+            // BEFORE the loops: an op the stack refuses completes synchronously inside pump(), so the whole
+            // burst can drain right here — and a flag set afterwards would arm an already-empty queue,
+            // leaving the mirror permanently off the air.
+            burstEnqueued = true
             // READS FIRST: an app connecting to the mirror reads FTMS Feature almost immediately, and a cold
             // cache there reads to it as "this machine has no capabilities" for the whole session.
             for (svc in svcs) for (ch in svc.characteristics)
@@ -281,6 +308,7 @@ class ZycleClient(
             for (svc in svcs) for (ch in svc.characteristics)
                 if (ch.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0)
                     enqueueSubscribe(g, ch)
+            pump()   // a profile with nothing readable/notifiable enqueues nothing: drain now, don't hang
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
@@ -384,7 +412,12 @@ class ZycleClient(
     private fun pump() {
         if (opBusy.compareAndSet(false, true)) {
             val op = opQueue.poll()
-            if (op == null) { opBusy.set(false); return }
+            if (op == null) {
+                opBusy.set(false)
+                // Drained: the opening burst is done, so the mirror now has every readable value we can give it.
+                if (burstEnqueued) gatt?.let { fireSynced(it) }
+                return
+            }
             // Per-op watchdog: a LOST GATT callback (flaky link) would otherwise latch opBusy forever and every
             // later control/ERG write would sit undispatched while power keeps streaming (invisible failure).
             // opDone() cancels this on normal completion; the token guard covers the concurrent-fire edge.
@@ -417,5 +450,6 @@ class ZycleClient(
         const val CONTROL_WRITE_RETRIES = 2       // resend a control write that NAKs (status 133) up to twice
         const val CONTROL_RETRY_DELAY_MS = 250L
         const val OP_TIMEOUT_MS = 4000L           // unstick the GATT queue if a callback is ever lost (flaky link)
+        const val SYNC_FALLBACK_MS = 6000L        // go on the air with a partial cache rather than never
     }
 }

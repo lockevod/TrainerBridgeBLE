@@ -188,6 +188,7 @@ class RawAntLink(
                 ch.open()
                 Log.d(tag, "channel open")
                 FileLog.event("$tag opened")   // diagnostic: which channels actually acquire+open
+                reopenDelayMs = REOPEN_DELAY_MS   // on the air: a later failure starts its backoff from scratch
                 onState(true, context.getString(R.string.ant_transmitting))
                 onOpened(ch)
             }.onFailure { e ->
@@ -213,12 +214,18 @@ class RawAntLink(
         }
     }
 
+    // Backoff, because the common failure is PERMANENT for the whole ride: no ANT Radio Service installed,
+    // or no dongle plugged in. At a flat 2 s that retried ~1800 times an hour, each one a log line.
+    @Volatile private var reopenDelayMs = REOPEN_DELAY_MS
+
     private fun scheduleReopen(reason: String) {
         if (stopped) return
-        Log.w(tag, "reopen scheduled: $reason")
-        FileLog.event("$tag reopen: $reason")
+        val wait = reopenDelayMs
+        reopenDelayMs = (wait * 2).coerceAtMost(REOPEN_MAX_MS)
+        Log.w(tag, "reopen scheduled in ${wait}ms: $reason")
+        FileLog.event("$tag reopen in ${wait}ms: $reason")
         scope.launch {
-            delay(REOPEN_DELAY_MS)
+            delay(wait)
             if (stopped) return@launch
             if (antService == null) {
                 runCatching { context.unbindService(conn) }
@@ -259,6 +266,7 @@ class RawAntLink(
 
     private companion object {
         const val REOPEN_DELAY_MS = 2000L
+        const val REOPEN_MAX_MS = 60_000L        // ceiling: no dongle / no ANT service is a whole-ride failure
         const val HEARTBEAT_CHECK_MS = 7_000L
         const val HEARTBEAT_TIMEOUT_MS = 15_000L // recycle a tracking-but-silent channel this long (RF loss);
                                                  // lower than before so a lost trainer recovers in ~15s not ~30s

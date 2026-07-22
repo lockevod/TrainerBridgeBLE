@@ -6,8 +6,9 @@ import kotlinx.coroutines.flow.StateFlow
 /**
  * Process-wide holder of the trainer's CORRECTED values, written by the receive side (BridgeService) and
  * read by the Monitor and the karoo-ext virtual sensor. Same process → plain StateFlows, no IPC.
- * Speed is stored in m/s (the karoo-ext canonical unit). [lastMs] is the wall-clock of the last push, for
- * the sensor's freshness (SEARCHING vs CONNECTED). Cleared when receiving stops.
+ * Speed is stored in m/s (the karoo-ext canonical unit). [lastMs] is SystemClock.elapsedRealtime() at the
+ * last push — NOT wall-clock, which jumps when the Karoo re-syncs its time and would blink the sensor to
+ * SEARCHING mid-ride. Used for the sensor's freshness (SEARCHING vs CONNECTED). Cleared when receiving stops.
  */
 object CorrectedFeed {
     private val _power = MutableStateFlow<Int?>(null)

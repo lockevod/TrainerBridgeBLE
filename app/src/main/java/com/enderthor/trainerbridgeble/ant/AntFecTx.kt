@@ -28,12 +28,14 @@ class AntFecTx(
 ) : PowerTx {
 
     @Volatile private var latest = PowerSample()
+    // elapsedRealtime, not wall-clock: a time re-sync mid-ride would otherwise jump the FE-C elapsed-time
+    // field (8-bit, rolling) and the head unit reads that as an absurd delta.
     @Volatile private var lastUpdateMs = 0L
 
     /** Feed the latest corrected values; transmitted on the next matching page. */
     override fun setLatest(sample: PowerSample) {
         latest = sample
-        lastUpdateMs = System.currentTimeMillis()
+        lastUpdateMs = android.os.SystemClock.elapsedRealtime()
     }
 
     // TX state — mutated from BOTH the IO thread (onOpened) and the ANT callback thread (onMessage TX
@@ -57,7 +59,7 @@ class AntFecTx(
         },
         onOpened = { ch ->
             synchronized(lock) {
-                val now = System.currentTimeMillis()
+                val now = android.os.SystemClock.elapsedRealtime()
                 if (startMs == 0L) startMs = now   // keep the original session start across reopens (no
                 lastBuildMs = now                  // backward elapsed-time jump); reset dt anchor only
             }
@@ -75,7 +77,7 @@ class AntFecTx(
     /** True while the RX is actively feeding fresh samples. */
     private fun fresh(): Boolean {
         val t = lastUpdateMs
-        return t != 0L && System.currentTimeMillis() - t <= STALE_MS
+        return t != 0L && android.os.SystemClock.elapsedRealtime() - t <= STALE_MS
     }
 
     /**
@@ -100,7 +102,7 @@ class AntFecTx(
     // fresh() and latest are each snapshotted ONCE per page so a sample arriving mid-build can't produce
     // a self-contradictory frame (e.g. invalid power with an IN_USE state).
     private fun buildGeneral(): ByteArray {
-        val now = System.currentTimeMillis()
+        val now = android.os.SystemClock.elapsedRealtime()
         val fresh = fresh()
         val speed = if (fresh) latest.speedMps else null
         val dt = (now - lastBuildMs) / 1000.0

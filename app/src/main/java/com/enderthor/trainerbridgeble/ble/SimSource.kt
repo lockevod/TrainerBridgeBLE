@@ -17,6 +17,7 @@ class SimSource(
     private val onProfile: (GattProfile) -> Unit,
     private val onValue: (charUuid: UUID, value: ByteArray) -> Unit,
     private val onState: (connected: Boolean) -> Unit,
+    private val onSynced: () -> Unit = {},   // see ZycleClient: nothing is over the air here, so it's immediate
 ) : TrainerSource {
     private val handler = Handler(Looper.getMainLooper())
     private val rng = Random(1)
@@ -101,6 +102,7 @@ class SimSource(
         onValue(CP_FEATURE, byteArrayOf(0x0C, 0, 0x04, 0))
         onValue(SENSOR_LOC, byteArrayOf(0))
         emitResistance()
+        onSynced()   // the cache above is already complete — no reason to hold the mirror off the air
         handler.post(ticker)
     }
 

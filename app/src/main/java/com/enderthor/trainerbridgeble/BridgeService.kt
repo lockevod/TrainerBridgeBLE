@@ -5,7 +5,11 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.bluetooth.BluetoothAdapter
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.IBinder
@@ -46,6 +50,9 @@ class BridgeService : Service() {
 
     @Volatile var status: String = ""; private set
     @Volatile var zycleConnected: Boolean = false; private set
+    // Connected AND its opening reads have landed. The mirror advertises on THIS, not on zycleConnected:
+    // going on the air with an empty read cache is what makes an app decide the machine has no ERG.
+    @Volatile private var zycleSynced: Boolean = false
     @Volatile var lastRawW: Int? = null; private set
     @Volatile var lastCorrectedW: Int? = null; private set
     @Volatile var lastSpeedKmh: Double? = null; private set
@@ -125,7 +132,29 @@ class BridgeService : Service() {
         listener?.invoke()
     }
 
-    override fun onCreate() { super.onCreate(); status = getString(R.string.status_stopped) }
+    /** The BLE stack does not survive a Bluetooth off/on (or a crash of com.android.bluetooth): the GATT
+     *  server and the advertising set die with it, and nothing reopens them — the mirror goes silently mute
+     *  for the rest of the ride. The central half recovers on its own (its scan retries), so only the emit
+     *  half is cycled here. */
+    private val btStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, intent: Intent?) {
+            if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            if (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1) != BluetoothAdapter.STATE_ON) return
+            if (!emitting) return
+            // NOT immediately: STATE_ON means the adapter flipped, not that the stack can serve a GATT
+            // server yet. openGattServer() returning null here leaves the mirror dead with no retry.
+            FileLog.event("bluetooth back on — rebuilding the mirror shortly")
+            handler.postDelayed({ if (emitting) { stopEmit(); startEmit() } }, BT_RESTART_SETTLE_MS)
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate(); status = getString(R.string.status_stopped)
+        // Exempt from the API-34 exported-flag requirement only because STATE_CHANGED is a protected system
+        // broadcast — guarded anyway, so adding a non-protected action here can't kill the service at birth.
+        runCatching { registerReceiver(btStateReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)) }
+            .onFailure { FileLog.event("bt state receiver not registered: ${it.message}") }
+    }
 
     override fun onBind(intent: Intent?): IBinder = binder
     override fun onUnbind(intent: Intent?): Boolean { listener = null; return super.onUnbind(intent) }
@@ -160,6 +189,8 @@ class BridgeService : Service() {
     private fun goForeground(): Boolean {
         if (foreground) return true
         createChannel()
+        // Before the try, not after: the catch below logs WHY startForeground failed, and FileLog silently
+        // drops anything written before init. One File object is not what blows the 5 s window.
         FileLog.init(this); FileLog.enabled = Config(this).loggingEnabled
         try {
             // connectedDevice only: dataSync would add a ~6h/24h cumulative FGS timeout on Android 14+ that
@@ -239,11 +270,14 @@ class BridgeService : Service() {
             mirror?.onZycleValue(uuid, value)
         }
         val onState: (Boolean) -> Unit = { connected ->
-            zycleConnected = connected; mirror?.setTrainerLinked(connected)
+            zycleConnected = connected
+            // Only the DROP is immediate; going on the air waits for onSynced below.
+            if (!connected) { zycleSynced = false; mirror?.setTrainerLinked(false) }
             if (!connected) { config.lastSeenAddress = ""; config.lastSeenName = "" }   // the config screen offers it only while live
             status = if (connected) getString(R.string.status_trainer_connected) else getString(R.string.status_searching_trainer); listener?.invoke() }
-        val c: TrainerSource = if (config.simulate) SimSource(onProfile, onValue, onState).also { simSource = it }
-        else ZycleClient(this, config.pairedAddress, onProfile, onValue, onState,
+        val onSynced: () -> Unit = { zycleSynced = true; mirror?.setTrainerLinked(true) }
+        val c: TrainerSource = if (config.simulate) SimSource(onProfile, onValue, onState, onSynced).also { simSource = it }
+        else ZycleClient(this, config.pairedAddress, onProfile, onValue, onState, onSynced,
             onAdv = { bp -> lastAdvBlueprint = bp; mirror?.setAdvBlueprint(bp) },   // clone the trainer's real advertising
             onFound = { name, addr -> config.lastSeenName = name ?: ""; config.lastSeenAddress = addr })
         currentSourceKey = sourceKey(config)
@@ -263,7 +297,7 @@ class BridgeService : Service() {
         lastValues.clear()
         CorrectedFeed.clear()
         speedUnit = 0.01; speedUnitLocked = false; prevDistM = 0; prevElapsedS = 0
-        zycleConnected = false; sawIndoorBikeData = false; lastPowerMs = 0L; lastRawW = null; lastCorrectedW = null; lastSpeedKmh = null; lastCadence = null; lastResistance = null; lastSampleMs = 0L
+        zycleConnected = false; zycleSynced = false; sawIndoorBikeData = false; lastPowerMs = 0L; lastRawW = null; lastCorrectedW = null; lastSpeedKmh = null; lastCadence = null; lastResistance = null; lastSampleMs = 0L
         status = getString(R.string.status_stopped)
         updateNotification(); listener?.invoke()
     }
@@ -290,7 +324,7 @@ class BridgeService : Service() {
         )
         mirror = m
         m.start()
-        m.setTrainerLinked(zycleConnected)            // Start pressed with the trainer already connected
+        m.setTrainerLinked(zycleSynced)               // Start pressed with the trainer already connected AND read
         lastProfile?.let { m.build(it) }              // mirror started after the trainer was already discovered → build now
         // ...and hand it everything we have already seen. Without this its read cache is empty until the
         // trainer is re-read, which never happens: an app asking for FTMS Feature gets nothing and decides
@@ -411,7 +445,7 @@ class BridgeService : Service() {
                 // speed and cadence keep flowing, instead of recording a frozen value as live data
                 // A single truncated frame must not punch a hole in the recording, and a real dropout must
                 // not be recorded as live watts: the grace window decides, not this one packet.
-                CorrectedFeed.push(freshPowerOrNull(), lastSpeedKmh?.let { it / 3.6 }, lastCadence, System.currentTimeMillis())
+                CorrectedFeed.push(freshPowerOrNull(), lastSpeedKmh?.let { it / 3.6 }, lastCadence, android.os.SystemClock.elapsedRealtime())
                 listener?.invoke()
             }
             com.enderthor.trainerbridgeble.ble.GattUuids.CYCLING_POWER_MEASUREMENT -> {
@@ -419,7 +453,7 @@ class BridgeService : Service() {
                     val raw = le16signed(value, 2); lastRawW = raw; lastCorrectedW = config.correction().correct(raw)
                     lastPowerMs = System.currentTimeMillis()
                     antTx?.setLatest(PowerSample(freshPowerOrNull(), lastCadence, lastSpeedKmh?.let { it / 3.6 }))   // ANT too, or FE-C stays blank
-                    CorrectedFeed.push(freshPowerOrNull(), lastSpeedKmh?.let { it / 3.6 }, lastCadence, System.currentTimeMillis())
+                    CorrectedFeed.push(freshPowerOrNull(), lastSpeedKmh?.let { it / 3.6 }, lastCadence, android.os.SystemClock.elapsedRealtime())
                     listener?.invoke()
                 }
             }
@@ -429,7 +463,10 @@ class BridgeService : Service() {
     private fun le16(b: ByteArray, i: Int) = (b[i].toInt() and 0xFF) or ((b[i + 1].toInt() and 0xFF) shl 8)
     private fun le16signed(b: ByteArray, i: Int) = le16(b, i).toShort().toInt()
 
-    override fun onDestroy() { stopEmit(); stopReceive(); releaseWakeLock(); super.onDestroy() }
+    override fun onDestroy() {
+        runCatching { unregisterReceiver(btStateReceiver) }
+        stopEmit(); stopReceive(); releaseWakeLock(); super.onDestroy()
+    }
     override fun onTimeout(startId: Int) {
         stopEmit(); stopReceive(); releaseWakeLock()
         foreground = false   // or a later EMIT_START would pass the foreground gate on a dying service
@@ -469,6 +506,7 @@ class BridgeService : Service() {
     companion object {
         private const val CHANNEL_ID = "bridge-ble"
         private const val NOTIF_ID = 1
+        private const val BT_RESTART_SETTLE_MS = 2000L   // let the BT stack settle before reopening the server
         private const val POWER_STALE_MS = 2000L   // ~8 missed frames at 4 Hz: covers a hiccup, not a dropout
         private const val ANT_RESTART_DELAY_MS = 1500L   // let the ANT service release the channel first
         const val ACTION_MASTER_ON = "com.enderthor.trainerbridgeble.MASTER_ON"
@@ -481,9 +519,15 @@ class BridgeService : Service() {
             Intent(context, BridgeService::class.java).setAction(action)
 
         /** Master switch: ON starts the foreground service (receive comes up gated); OFF tears everything down. */
-        fun setMaster(context: android.content.Context, on: Boolean) =
-            if (on) { context.startForegroundService(intent(context, ACTION_MASTER_ON)); Unit }
-            else { context.startService(intent(context, ACTION_MASTER_OFF)); Unit }
+        /** Also called from the Karoo extension's connectDevice, i.e. possibly with the app in background —
+         *  where Android 12+ refuses to start a foreground service. Swallow it: the alternative is an
+         *  uncaught ForegroundServiceStartNotAllowedException that takes the extension down with it. */
+        fun setMaster(context: android.content.Context, on: Boolean) {
+            runCatching {
+                if (on) context.startForegroundService(intent(context, ACTION_MASTER_ON))
+                else context.startService(intent(context, ACTION_MASTER_OFF))
+            }.onFailure { FileLog.event("setMaster($on) refused: ${it.message}") }
+        }
 
         /** Config was saved: the running source may no longer be the one config asks for. Sent from the
          *  config screen's onStop too, so swallow a background-start refusal instead of crashing. */

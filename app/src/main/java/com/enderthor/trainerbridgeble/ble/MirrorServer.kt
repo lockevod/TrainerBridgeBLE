@@ -175,7 +175,13 @@ class MirrorServer(
         // thread (Start) — a plain check-then-set could let both through and double-add the services.
         if (!built.compareAndSet(false, true)) return
         servicesReady = false
-        chars.clear(); pendingServices.clear()
+        // Only reachable on a REBUILD (the latch was released after addService gave up), and then the server
+        // still holds whatever did get added — re-adding over it yields a duplicated GATT.
+        runCatching { srv.clearServices() }
+        // subscribers/clients too: clearServices() moves every ATT handle, so a peer that reconnected to a
+        // remembered MAC would be tracked as subscribed to characteristic objects that no longer exist.
+        // serviceRetries, or a rebuild starts with the budget the failed build already spent.
+        chars.clear(); pendingServices.clear(); subscribers.clear(); serviceRetries = 0
         for (svc in profile.services) {
             if (GattUuids.isStackService(svc.uuid)) continue
             val service = BluetoothGattService(svc.uuid,
@@ -426,8 +432,8 @@ class MirrorServer(
             // Report the client's current CCCD state so a read doesn't time out.
             val cUuid = descriptor?.characteristic?.uuid
             val on = device != null && cUuid != null && subscribers[cUuid]?.contains(device.address) == true
-            val indicate = descriptor?.characteristic?.properties
-                ?.and(BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
+            val indicate = (descriptor?.characteristic?.properties ?: 0)
+                .and(BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0   // null props must read as NOT indicate
             val v = if (!on) byteArrayOf(0x00, 0x00)
                     else if (indicate) byteArrayOf(0x02, 0x00) else byteArrayOf(0x01, 0x00)
             FileLog.event("app read descriptor ${shortUuid(descriptor?.uuid)} of ${shortUuid(cUuid)} = ${FileLog.hex(v)} <- ${device?.address}")

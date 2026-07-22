@@ -70,7 +70,7 @@ class Config(context: Context) {
     /** Re-broadcast the corrected power over ANT+ (needs an ANT USB dongle) so a Garmin head unit that
      *  pairs sensors over ANT+ gets the corrected value. */
     var antOutputEnabled: Boolean
-        get() = p.getBoolean(KEY_ANT, true)
+        get() = p.getBoolean(KEY_ANT, false)   // OFF by default: without a dongle it just alarms and retries
         set(v) = p.edit().putBoolean(KEY_ANT, v).apply()
 
     /** ANT+ device number our FE-C broadcasts on (what the head unit pairs). Configurable so the phone and
