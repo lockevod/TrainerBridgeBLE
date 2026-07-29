@@ -16,6 +16,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
+import android.os.SystemClock
 import android.util.Log
 import com.enderthor.trainerbridgeble.FileLog
 import com.enderthor.trainerbridgeble.R
@@ -68,6 +69,9 @@ class MirrorServer(
     private val SERVICE_MAX_RETRIES = 5
     private val ADV_START_TIMEOUT_MS = 3000L
     private val ADV_LATE_STOP_MS = 1500L
+    /** How long after a control write the trainer's level is still settling on it. Observed on the 28-jul
+     *  ride: every servo-driven level step landed 0.19-2.6 s after the write that caused it. */
+    private val LEVEL_SETTLE_MS = 3000L
     @Volatile private var serviceRetries = 0
     private val serviceRetryRunnable = Runnable { if (server != null) addNextService() }
     private val ADVERTISE_FAILED_DATA_TOO_LARGE = 1
@@ -258,7 +262,27 @@ class MirrorServer(
         restoreName()
         built.set(false); advBlueprint = null
         chars.clear(); cache.clear(); subscribers.clear(); clients.clear(); pendingServices.clear()
+        shownZycleLevel = null; lastRawZycleLevel = null; lastControlWriteMs = 0L; servoStepOwed = false
     }
+
+    /**
+     * The Zycle level byte we report. It is NOT the trainer's: it starts there and then moves only by the
+     * steps the RIDER makes on the bike's own +/- buttons. Measured over a 38 min ride, 118 of the 126 level
+     * changes we relayed verbatim were followed within 45-100 ms by a target write the app never meant to
+     * make — the servo settling on our own command, read by the app as the rider changing intensity. Pinning
+     * the byte outright stopped that, and also stopped the rider's real button presses from ever reaching
+     * the app (28-jul ride: the level walked 7→16 and 10→90 under the rider's thumb while the app sat at 6).
+     * So: each control write we relay buys the servo one level step, and every other step is the rider's.
+     * The rule itself, and why it is a budget rather than a time window, is in [PowerRewrite.levelToShow].
+     *
+     * ponytail: a budget of one, not a model of the servo. Replayed against both rides it still leaks 13 of
+     * 125 servo steps to the app and still eats about half the rider's presses in a fast burst; only the
+     * machine's real level↔watts curve would separate them exactly.
+     */
+    @Volatile private var shownZycleLevel: Int? = null    // what the app sees
+    @Volatile private var lastRawZycleLevel: Int? = null  // what the trainer last reported, to difference against
+    @Volatile private var lastControlWriteMs = 0L         // elapsedRealtime of the last control write we relayed
+    @Volatile private var servoStepOwed = false           // that write has a level step coming; it is not the rider's
 
     /** A value arrived from the trainer: correct power, cache, and notify every subscribed client. */
     fun onZycleValue(charUuid: UUID, value: ByteArray) {
@@ -268,6 +292,18 @@ class MirrorServer(
             // Machine Status "Target Power Changed" echoes the (inverse-corrected) watts we commanded, so
             // correct it forward or the app reads back a target it never asked for
             charUuid == GattUuids.MACHINE_STATUS -> PowerRewrite.correctMachineStatusTargetPower(value, correction())
+            // Zycle's own telemetry carries the same watts as 0x2AD2 and Bestcycling subscribes to both:
+            // one bridge must never hand one app two different numbers for the same instant.
+            charUuid == GattUuids.ZYCLE_TELEMETRY -> {
+                PowerRewrite.zycleLevel(value)?.let { raw ->
+                    // The budget expires: 57 of 169 writes moved no level at all, and an armed one left
+                    // lying around would eat the rider's next press minutes later.
+                    val owed = servoStepOwed && SystemClock.elapsedRealtime() - lastControlWriteMs < LEVEL_SETTLE_MS
+                    val next = PowerRewrite.levelToShow(shownZycleLevel, lastRawZycleLevel, raw, owed)
+                    shownZycleLevel = next.level; servoStepOwed = next.servoStepOwed; lastRawZycleLevel = raw
+                }
+                PowerRewrite.correctZycleTelemetry(value, correction(), shownZycleLevel)
+            }
             else -> value
         }
         cache[charUuid] = out
@@ -368,6 +404,9 @@ class MirrorServer(
                 (if (preparedWrite) " PREPARED off=$offset" else "") + (if (!responseNeeded) " noResp" else "")
             if (uuid != null && value != null) {
                 val out = if (GattUuids.carriesControl(uuid)) PowerRewrite.inverseTargetPower(value, correction()) else value
+                // Any control op can make the servo move the level; from here on that move is ours, not the
+                // rider's. Stamped before the relay, so the window covers the trip to the trainer too.
+                if (GattUuids.carriesControl(uuid)) { lastControlWriteMs = SystemClock.elapsedRealtime(); servoStepOwed = true }
                 // what the client asked for, unless the trainer's characteristic can't take a Write Command
                 val withResponse = responseNeeded ||
                     (ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE == 0)

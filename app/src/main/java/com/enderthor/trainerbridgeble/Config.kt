@@ -24,6 +24,15 @@ class Config(context: Context) {
         get() = p.getInt(KEY_INVERT_FLOOR, 50)
         set(v) = p.edit().putInt(KEY_INVERT_FLOOR, v).apply()
 
+    /** Raw watts the trainer settles above its ERG command, LEARNED at ride time (not a setting anyone is
+     *  expected to know) and kept so the next ride starts calibrated. See
+     *  [com.enderthor.trainerbridgeble.correction.ErgBias]. Clamped on the way OUT too: this value goes
+     *  straight into the ERG command, and a pref written by an older/broken build must not be able to
+     *  steer the trainer by 500 W. */
+    var ergBiasW: Int
+        get() = p.getInt(KEY_ERG_BIAS, 0).coerceIn(-ERG_BIAS_LIMIT_W, ERG_BIAS_LIMIT_W)
+        set(v) = p.edit().putInt(KEY_ERG_BIAS, v.coerceIn(-ERG_BIAS_LIMIT_W, ERG_BIAS_LIMIT_W)).apply()
+
     /** Whether the emit half was on, so a START_STICKY restart after a process kill brings the mirror and
      *  ANT back instead of coming up receive-only mid-ride. */
     var emitEnabled: Boolean
@@ -87,13 +96,15 @@ class Config(context: Context) {
     /** LIVE correction from the current scale/offset. */
     fun correction(): PowerCorrection {
         val mult = 1.0 + scaleAdjustPercent / 100.0
-        return PowerCorrection(if (mult > 0.0) mult else 1.0, offsetW.toDouble(), invertFloorW)
+        return PowerCorrection(if (mult > 0.0) mult else 1.0, offsetW.toDouble(), invertFloorW, ergBiasW)
     }
 
     private companion object {
         const val KEY_SCALE = "scaleAdjustPct"
         const val KEY_OFFSET = "offsetW"
         const val KEY_INVERT_FLOOR = "invertFloorW"
+        const val KEY_ERG_BIAS = "ergBiasW"
+        const val ERG_BIAS_LIMIT_W = 30   // must match ErgBias's own clamp
         const val KEY_ADDR = "pairedAddress"
         const val KEY_SEEN_ADDR = "lastSeenAddress"
         const val KEY_SEEN_NAME = "lastSeenName"

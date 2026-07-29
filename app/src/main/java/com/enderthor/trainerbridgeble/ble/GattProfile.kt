@@ -39,6 +39,12 @@ object GattUuids {
     val FTMS_CONTROL_POINT: UUID = uuid16(0x2AD9)        // ERG / control writes
     val MACHINE_STATUS: UUID = uuid16(0x2ADA)            // echoes accepted targets back to the app
 
+    /** Zycle's own telemetry notification. Bestcycling subscribes to THIS as well as to 0x2AD2, and it
+     *  carries the same watts — so leaving it uncorrected handed one app two different numbers for the same
+     *  instant, ~8% + offset apart, from the same bridge. Whatever an app does with power, it must read the
+     *  same value whichever channel it listens on. */
+    val ZYCLE_TELEMETRY: UUID = UUID.fromString("beefe004-4910-473c-be46-960948c2f59c")
+
     /** Scan filters for the given 16-bit service UUIDs (ORed) — the controller drops everything else
      *  before it reaches the callback, so HR straps, phones and headphones never show up.
      *  0x1826 = FTMS (a trainer), 0x1818 = Cycling Power (a trainer OR a bare power meter). */

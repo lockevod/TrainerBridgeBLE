@@ -23,6 +23,7 @@ import com.enderthor.trainerbridgeble.ble.MirrorServer
 import com.enderthor.trainerbridgeble.ble.SimSource
 import com.enderthor.trainerbridgeble.ble.TrainerSource
 import com.enderthor.trainerbridgeble.ble.ZycleClient
+import com.enderthor.trainerbridgeble.correction.ErgBias
 
 /**
  * Foreground service split into two independently-controlled halves under a master switch:
@@ -121,6 +122,8 @@ class BridgeService : Service() {
         else {
             val target = ((lastResistance ?: 0) + delta).coerceIn(0, 200)   // 0..200 per the Zycle's 0x2AD6 range
             // ponytail: 0x04+level% Set Target Resistance, no Request Control first — shares the FTMS control point with the app
+            // Deliberately NOT routed through the mirror, so it arms no servo-step budget: this button is the
+            // rider, exactly like the bike's own, and the level move it causes SHOULD reach the app.
             // optimistic, and only if the write was at least QUEUED (no link / unknown char → don't move the
             // tile). A stack refusal after queueing still shows briefly; the trainer's own IBD corrects it.
             if (client?.write(com.enderthor.trainerbridgeble.ble.GattUuids.FTMS_CONTROL_POINT, byteArrayOf(0x04, target.toByte()), true) == true) {
@@ -262,7 +265,8 @@ class BridgeService : Service() {
         if (client != null || simSource != null) return   // idempotent
         val config = Config(this)
         config.lastSeenAddress = ""; config.lastSeenName = ""   // runtime state; a process kill leaves it stale
-        FileLog.event("receive start paired=${config.pairedAddress.ifEmpty { "any" }} sim=${config.simulate}")
+        ErgBias.seed(config.ergBiasW)   // start calibrated; there is no live command to measure against yet
+        FileLog.event("receive start paired=${config.pairedAddress.ifEmpty { "any" }} sim=${config.simulate} ergBias=${config.ergBiasW}W")
         val onProfile: (GattProfile) -> Unit = { profile -> lastProfile = profile; mirror?.build(profile) }
         val onValue: (java.util.UUID, ByteArray) -> Unit = { uuid, value ->
             cacheForUi(config, uuid, value)
@@ -272,7 +276,7 @@ class BridgeService : Service() {
         val onState: (Boolean) -> Unit = { connected ->
             zycleConnected = connected
             // Only the DROP is immediate; going on the air waits for onSynced below.
-            if (!connected) { zycleSynced = false; mirror?.setTrainerLinked(false) }
+            if (!connected) { zycleSynced = false; mirror?.setTrainerLinked(false); ErgBias.forget() }
             if (!connected) { config.lastSeenAddress = ""; config.lastSeenName = "" }   // the config screen offers it only while live
             status = if (connected) getString(R.string.status_trainer_connected) else getString(R.string.status_searching_trainer); listener?.invoke() }
         val onSynced: () -> Unit = { zycleSynced = true; mirror?.setTrainerLinked(true) }
@@ -291,6 +295,7 @@ class BridgeService : Service() {
     private fun stopReceive() {
         if (client == null && simSource == null) return
         FileLog.event("receive stop")
+        ErgBias.forget()
         mirror?.setTrainerLinked(false)   // no source → nothing to advertise, whatever the call order
         Config(this).let { it.lastSeenAddress = ""; it.lastSeenName = "" }
         client?.stop(); client = null; simSource = null; lastProfile = null; lastAdvBlueprint = null; currentSourceKey = null
@@ -312,7 +317,12 @@ class BridgeService : Service() {
             advertisedName = config.advertisedName,
             correction = { config.correction() },
             toZycle = { uuid, bytes, withResponse ->
-                if (com.enderthor.trainerbridgeble.ble.GattUuids.carriesControl(uuid)) { lastControl = describeControl(bytes); listener?.invoke() }
+                if (com.enderthor.trainerbridgeble.ble.GattUuids.carriesControl(uuid)) {
+                    // `bytes` is already inverse-corrected: exactly the raw watts the trainer is told to hold,
+                    // which is what the measured power has to be compared against.
+                    ErgBias.onControl(bytes, android.os.SystemClock.elapsedRealtime())
+                    lastControl = describeControl(bytes); listener?.invoke()
+                }
                 client?.write(uuid, bytes, withResponse) ?: false   // false → the mirror answers the app with failure
             },
             onStatus = { s -> status = s; listener?.invoke() },
@@ -381,7 +391,7 @@ class BridgeService : Service() {
         // tile shows the wattage the app will SEE, not the raw command. Below the ERG floor these differ
         // from what the app asked for — deliberately, that is the floor's documented cost.
         (b[0].toInt() and 0xFF) == 0x05 && b.size >= 3 ->
-            getString(R.string.control_erg, Config(this).correction().correct(((b[1].toInt() and 0xFF) or ((b[2].toInt() and 0xFF) shl 8)).toShort().toInt()))
+            getString(R.string.control_erg, Config(this).correction().correctCommanded(((b[1].toInt() and 0xFF) or ((b[2].toInt() and 0xFF) shl 8)).toShort().toInt()))
         (b[0].toInt() and 0xFF) == 0x04 && b.size >= 2 -> getString(R.string.control_resistance, b[1].toInt() and 0xFF)
         (b[0].toInt() and 0xFF) == 0x00 -> getString(R.string.control_request)   // the ERG handshake's first step
         (b[0].toInt() and 0xFF) == 0x01 -> getString(R.string.control_reset)
@@ -431,6 +441,7 @@ class BridgeService : Service() {
                 var havePower = false
                 if (flags and (1 shl 6) != 0 && off + 2 <= value.size) {
                     val raw = le16signed(value, off); lastRawW = raw; lastCorrectedW = config.correction().correct(raw); havePower = true
+                    learnErgBias(config, raw)
                 }
                 // Only a packet that actually CARRIED power may refresh ANT's power-freshness clock, or a
                 // dropout would be transmitted as live. Speed/cadence still flow to the Karoo sensor.
@@ -451,12 +462,25 @@ class BridgeService : Service() {
             com.enderthor.trainerbridgeble.ble.GattUuids.CYCLING_POWER_MEASUREMENT -> {
                 if (!sawIndoorBikeData && value.size >= 4) {   // fallback only if the trainer sends no IBD
                     val raw = le16signed(value, 2); lastRawW = raw; lastCorrectedW = config.correction().correct(raw)
+                    learnErgBias(config, raw)
                     lastPowerMs = System.currentTimeMillis()
                     antTx?.setLatest(PowerSample(freshPowerOrNull(), lastCadence, lastSpeedKmh?.let { it / 3.6 }))   // ANT too, or FE-C stays blank
                     CorrectedFeed.push(freshPowerOrNull(), lastSpeedKmh?.let { it / 3.6 }, lastCadence, android.os.SystemClock.elapsedRealtime())
                     listener?.invoke()
                 }
             }
+        }
+    }
+
+    /** Feed the ERG-bias learner and persist it when it moves a whole watt, so the next ride starts where
+     *  this one finished instead of spending its first minutes re-converging. */
+    private fun learnErgBias(config: Config, raw: Int) {
+        // SimSource tracks the ERG target exactly, so it would teach a bias of ~0 and PERSIST it — running
+        // the simulator for three minutes would quietly wipe the real trainer's calibration.
+        if (config.simulate) return
+        ErgBias.onPower(raw, android.os.SystemClock.elapsedRealtime())?.let {
+            config.ergBiasW = it
+            FileLog.event("ERG bias learned: ${it}W (trainer settles above its command)")
         }
     }
 
