@@ -40,7 +40,10 @@ object FileLog {
         }
     }
 
-    private const val MAX_BYTES = 16L * 1024 * 1024   // two files kept, so 32 MB total
+    // Every notification is logged unthrottled (~2 KB/s), so 16 MB filled in ~2 h and rotation threw away
+    // the START of the ride — which is exactly where the connect / sync / first-advertise sequence lives,
+    // the part you turned logging on to see. 48 MB holds a ~6 h ride in one file, 12 h across the two.
+    private const val MAX_BYTES = 48L * 1024 * 1024   // two files kept, so 96 MB worst case
 
     fun clear() { file?.let { f -> io.execute { runCatching { f.writeText("") } } } }
 

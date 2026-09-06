@@ -51,9 +51,14 @@ class ZycleClient(
     private val connecting = AtomicBoolean(false)   // CAS: scan results arrive on a binder thread pool
     @Volatile private var stopped = false
     @Volatile private var scanning = false
-    @Volatile private var lastMessageMs = 0L   // wall-clock of the last notification, for the silent-link watchdog
+    // elapsedRealtime, not wall-clock: a mid-ride clock re-sync would otherwise either trip the watchdog on
+    // a healthy link or delay it past a real one, by the size of the correction.
+    @Volatile private var lastMessageMs = 0L   // last notification, for the silent-link watchdog
     private val reconnectPending = AtomicBoolean(false)
     @Volatile private var retryMs = SCAN_RETRY_MS   // scan backoff, reset on a good connection
+    // Have we ever had this trainer on the line in THIS session? Splits the two scans that look alike:
+    // a cold search (trainer not powered on — may run for hours) from a mid-ride reacquisition.
+    @Volatile private var everConnected = false
 
     private val opQueue = ConcurrentLinkedQueue<() -> Unit>()
     private val opBusy = AtomicBoolean(false)
@@ -102,8 +107,8 @@ class ZycleClient(
         override fun run() {
             if (stopped) return
             val g = gatt
-            if (g != null && lastMessageMs != 0L && System.currentTimeMillis() - lastMessageMs > HEARTBEAT_TIMEOUT_MS) {
-                FileLog.event("Zycle watchdog: silent ${System.currentTimeMillis() - lastMessageMs}ms -> reconnect")
+            if (g != null && lastMessageMs != 0L && android.os.SystemClock.elapsedRealtime() - lastMessageMs > HEARTBEAT_TIMEOUT_MS) {
+                FileLog.event("Zycle watchdog: silent ${android.os.SystemClock.elapsedRealtime() - lastMessageMs}ms -> reconnect")
                 gatt = null; lastMessageMs = 0L
                 onState(false)
                 opQueue.clear(); opBusy.set(false); syncOwed.set(false); burstEnqueued = false
@@ -196,12 +201,21 @@ class ZycleClient(
         val filters = if (pairedAddress.isNotEmpty())
             listOf(android.bluetooth.le.ScanFilter.Builder().setDeviceAddress(pairedAddress).build())
         else GattUuids.scanFilters(0x1826)
-        // BALANCED, not LOW_POWER: this scan runs while we have no trainer, and with the screen off
-        // LOW_POWER's duty cycle can take minutes to reacquire mid-ride.
+        // BALANCED, not LOW_POWER, for a REACQUISITION: with the screen off LOW_POWER's duty cycle can take
+        // minutes to find the trainer again mid-ride. That argument is about a scan following a connection we
+        // already had. A cold search is the other case and is not the same: the trainer simply isn't powered
+        // on, nothing stops a successful scan, and BALANCED's 25% radio duty then runs for hours. Cost of
+        // telling them apart: the first acquisition of the day takes a few seconds longer.
         val settings = android.bluetooth.le.ScanSettings.Builder()
-            .setScanMode(android.bluetooth.le.ScanSettings.SCAN_MODE_BALANCED).build()
+            .setScanMode(if (everConnected) android.bluetooth.le.ScanSettings.SCAN_MODE_BALANCED
+                         else android.bluetooth.le.ScanSettings.SCAN_MODE_LOW_POWER).build()
         // A revoked BLUETOOTH_SCAN throws here; swallowing it while `scanning` was already true left the
         // client permanently dead and silent. Set the flag ONLY once the scan really started.
+        // Log the START, not just failures: without it a log cannot tell "scanning and the trainer is off"
+        // from "never started scanning", and it is the only way to time how long a cold acquisition takes
+        // (the cost E2's LOW_POWER duty cycle trades against) or to prove a reacquisition ran at BALANCED.
+        FileLog.event("Zycle scan start mode=${if (everConnected) "BALANCED" else "LOW_POWER"} " +
+            "filter=${if (pairedAddress.isNotEmpty()) "addr" else "FTMS"}")
         val started = runCatching { scanner.startScan(filters, settings, scanCallback) }
         if (started.isFailure) {
             FileLog.event("Zycle scan start threw: ${started.exceptionOrNull()}"); retryScanLater(); return
@@ -262,7 +276,8 @@ class ZycleClient(
                 FileLog.event("Zycle connected status=$status")
                 connecting.set(false)
                 retryMs = SCAN_RETRY_MS   // a good connection resets the backoff
-                lastMessageMs = System.currentTimeMillis()   // start the silent-link window at connect
+                everConnected = true      // ...and promotes every later scan to the reacquisition duty cycle
+                lastMessageMs = android.os.SystemClock.elapsedRealtime()   // start the silent-link window at connect
                 syncOwed.set(true); burstEnqueued = false
                 onState(true)
                 handler.post { runCatching { g.discoverServices() } }
@@ -289,7 +304,7 @@ class ZycleClient(
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 Log.w(tag, "discover failed $status"); FileLog.event("Zycle discover FAILED status=$status"); return
             }
-            lastMessageMs = System.currentTimeMillis()   // discovery counts as life, or the watchdog recycles us mid-subscribe
+            lastMessageMs = android.os.SystemClock.elapsedRealtime()   // discovery counts as life, or the watchdog recycles us mid-subscribe
             val profile = buildProfile(g)
             FileLog.event("Zycle profile: " + profile.services.joinToString("; ") { s ->
                 "${s.uuid}[" + s.chars.joinToString(",") { "${shortUuid(it.uuid)}(p=${it.properties})" } + "]"
@@ -301,13 +316,29 @@ class ZycleClient(
             // burst can drain right here — and a flag set afterwards would arm an already-empty queue,
             // leaving the mirror permanently off the air.
             burstEnqueued = true
-            // READS FIRST: an app connecting to the mirror reads FTMS Feature almost immediately, and a cold
-            // cache there reads to it as "this machine has no capabilities" for the whole session.
-            for (svc in svcs) for (ch in svc.characteristics)
-                if (ch.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) enqueueRead(g, ch)
-            for (svc in svcs) for (ch in svc.characteristics)
-                if (ch.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0)
-                    enqueueSubscribe(g, ch)
+            // try/finally is load-bearing, not defensive habit: anything escaping between these two
+            // assignments would leave the queue held shut for the rest of the session — a silent link with
+            // no watchdog able to reopen it, which is the worst failure this file has.
+            burstBuilding = true   // hold the queue until every op below is in it (see burstBuilding)
+            try {
+                // THE DATA STREAMS FIRST — ahead of the reads. Nothing notifies until the queue reaches the
+                // subscribes, and the read burst below is 20-40 ATT round trips (0.5-2 s over the air), so every
+                // reconnect punched that long a hole in what the apps, ANT and the Karoo recording received.
+                // This does NOT weaken the cold-cache invariant documented below: what gates the mirror going on
+                // the air is the WHOLE queue draining (onSynced), not the first subscribe. The two are re-issued
+                // by the general loop further down; a repeated CCCD write is idempotent and costs one op each.
+                for (svc in svcs) for (ch in svc.characteristics)
+                    if ((ch.uuid == GattUuids.INDOOR_BIKE_DATA || ch.uuid == GattUuids.CYCLING_POWER_MEASUREMENT) &&
+                        ch.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0)
+                        enqueueSubscribe(g, ch)
+                // READS NEXT: an app connecting to the mirror reads FTMS Feature almost immediately, and a cold
+                // cache there reads to it as "this machine has no capabilities" for the whole session.
+                for (svc in svcs) for (ch in svc.characteristics)
+                    if (ch.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) enqueueRead(g, ch)
+                for (svc in svcs) for (ch in svc.characteristics)
+                    if (ch.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0)
+                        enqueueSubscribe(g, ch)
+            } finally { burstBuilding = false }
             pump()   // a profile with nothing readable/notifiable enqueues nothing: drain now, don't hang
         }
 
@@ -316,7 +347,7 @@ class ZycleClient(
             // a failed CCCD write means that characteristic silently never notifies — never let it pass quietly
             if (status != BluetoothGatt.GATT_SUCCESS)
                 FileLog.event("Zycle subscribe ${shortUuid(u)} FAILED status=$status")
-            lastMessageMs = System.currentTimeMillis()
+            lastMessageMs = android.os.SystemClock.elapsedRealtime()
             opDone()
         }
 
@@ -331,12 +362,12 @@ class ZycleClient(
                 FileLog.event("Zycle read ${shortUuid(ch.uuid)} = ${FileLog.hex(v)}")   // identity/feature/ranges values
                 onValue(ch.uuid, v)
             } else FileLog.event("Zycle read ${shortUuid(ch.uuid)} failed status=$status")
-            lastMessageMs = System.currentTimeMillis()
+            lastMessageMs = android.os.SystemClock.elapsedRealtime()
             opDone()
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
-            lastMessageMs = System.currentTimeMillis()
+            lastMessageMs = android.os.SystemClock.elapsedRealtime()
             // only the write this callback is FOR: a late status used to be attributed to whatever write
             // happened to be in the slot, re-sending someone else's ERG target
             val w = inFlightWrite?.takeIf { it.uuid == ch.uuid }
@@ -355,7 +386,7 @@ class ZycleClient(
         override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
             if (stopped) return   // in-flight notification after stop() — not our data any more
             val value = @Suppress("DEPRECATION") (ch.value?.copyOf() ?: ByteArray(0))
-            lastMessageMs = System.currentTimeMillis()   // feed the silent-link watchdog
+            lastMessageMs = android.os.SystemClock.elapsedRealtime()   // feed the silent-link watchdog
             logNotif(ch.uuid, value)   // every notification, unthrottled
             onValue(ch.uuid, value)
         }
@@ -408,8 +439,14 @@ class ZycleClient(
 
     // ── GATT op serialisation ────────────────────────────────────────────────────────────────────────
     private fun enqueue(op: () -> Unit) { opQueue.add(op); pump() }
+    /** Set while the opening burst is still being ENQUEUED. `enqueue` pumps on every add, so without this the
+     *  first op runs immediately — and an op the stack refuses completes synchronously, draining a queue whose
+     *  remaining ops have not been added yet. `pump()` then sees it empty and fires onSynced, putting the
+     *  mirror on the air with a cold read cache: the very thing `burstEnqueued` exists to prevent. */
+    @Volatile private var burstBuilding = false
     @Volatile private var opWatchdog: Runnable? = null
     private fun pump() {
+        if (burstBuilding) return   // nothing may run until the whole burst is queued — see burstBuilding
         if (opBusy.compareAndSet(false, true)) {
             val op = opQueue.poll()
             if (op == null) {

@@ -45,6 +45,10 @@ object ErgBias {
     /** The learned bias, in raw watts, to subtract from the ERG command. */
     val watts: Int get() = bias.roundToInt()
 
+    /** The raw ERG target currently being measured against, or null if none is active. Diagnostics only —
+     *  it is how a log answers "did the resistance button actually retire the command?". */
+    val commanded: Int? get() = commandedRaw
+
     /** Restore what a previous session learned, so a ride starts calibrated instead of re-converging. Also
      *  retires any active command: this is a session boundary, and a command left over from the last one
      *  would read as long settled and be measured against power from a different ride. */

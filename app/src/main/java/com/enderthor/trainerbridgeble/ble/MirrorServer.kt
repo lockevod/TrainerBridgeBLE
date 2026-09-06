@@ -64,10 +64,15 @@ class MirrorServer(
 
     private val ADV_RESTART_MS = 250L
     private val ADV_RETRY_MS = 1000L
-    private val ADV_MAX_RETRIES = 5
+    private val ADV_RETRY_MAX_MS = 30_000L   // backoff ceiling; there is no attempt cap (see scheduleAdvRetry)
     private val SERVICE_RETRY_MS = 300L
     private val SERVICE_MAX_RETRIES = 5
-    private val ADV_START_TIMEOUT_MS = 3000L
+    // Generous on purpose: this must only ever fire for a callback that is genuinely LOST (adapter off, BT
+    // process died). Firing it for one that is merely slow starts a second attempt against the same shared
+    // callback object — see scheduleAdvRetry's note.
+    private val ADV_START_TIMEOUT_MS = 8000L
+    private val SERVER_RETRY_MS = 2000L
+    private val SERVER_RETRY_MAX_MS = 30_000L   // Bluetooth off is a whole-ride failure, not a hiccup
     private val ADV_LATE_STOP_MS = 1500L
     /** How long after a control write the trainer's level is still settling on it. Observed on the 28-jul
      *  ride: every servo-driven level step landed 0.19-2.6 s after the write that caused it. */
@@ -85,7 +90,8 @@ class MirrorServer(
     @Volatile private var advBlueprint: AdvBlueprint? = null   // the trainer's real advertising, to clone
     @Volatile private var trainerLinked = false   // advertise only while a trainer is actually feeding us
     @Volatile private var servicesReady = false     // every mirrored service has been ADDED (built != added)
-    @Volatile private var advRetries = 0
+    @Volatile private var advRetries = 0        // diagnostic count only; the retry policy is advRetryMs
+    @Volatile private var advRetryMs = ADV_RETRY_MS
     @Volatile private var dropNameFromAdv = false   // set after DATA_TOO_LARGE: the packet won't fit the name
     @Volatile private var dropMfrFromAdv = false    // shed the cloned manufacturer data first
     @Volatile private var dropBlueprintFromAdv = false   // then the cloned UUIDs, falling back to the standard pair
@@ -96,6 +102,14 @@ class MirrorServer(
     fun setTrainerLinked(linked: Boolean) {
         if (trainerLinked == linked) return
         trainerLinked = linked
+        // Losing the trainer invalidates the level anchor (see [reanchorLevel]) AND any servo step we were
+        // still owed: the write that bought it may never have reached the trainer, and if it did, the step it
+        // caused is on the far side of the outage where the re-anchor absorbs it anyway. Leaving it armed
+        // means the rider's first press after a fast reconnect is eaten instead — and this codebase's settled
+        // bias is that eating a real press is the worse failure (pinning the byte killed the buttons).
+        // Getting the link back also deserves a fresh advertise backoff.
+        if (!linked) { reanchorLevel = true; servoStepOwed = false; lastControlWriteMs = 0L }
+        else { advRetries = 0; advRetryMs = ADV_RETRY_MS }
         FileLog.event("mirror trainer link=$linked -> ${if (linked) "advertise" else "stop advertising"}")
         handler.post { if (linked) startAdvertising() else stopAdvertising() }
     }
@@ -104,23 +118,58 @@ class MirrorServer(
      *  advertise an identical packet. If we're already advertising, restart to apply it. */
     fun setAdvBlueprint(bp: AdvBlueprint) {
         advBlueprint = bp
-        advRetries = 0   // a new blueprint deserves a fresh retry budget — but keep what we learned about size
+        // A new blueprint deserves a fresh retry budget — and that means the BACKOFF, not just the diagnostic
+        // count: at the 30 s ceiling, resetting only the counter changed nothing. Keep the size shedding.
+        advRetries = 0; advRetryMs = ADV_RETRY_MS
         FileLog.event("mirror adv blueprint: ${bp.serviceUuids.size} uuids, ${bp.manufacturerData.size} mfr")
         handler.post { if (advertising) restartAdvertising() }   // serialise onto the advertising thread
     }
 
     fun start() {
+        stopped = false
         // Kill any advertising set left running by a PREVIOUS instance: its stop may have been dropped
         // because a start was still in flight, and its callback died with the object.
         lastAdvCallback?.takeIf { it !== advCallback }?.let { orphan ->
             FileLog.event("stopping an advertising set left by a previous mirror")
             runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(orphan) }
         }
-        val srv = runCatching { mgr.openGattServer(context, serverCallback) }.getOrNull()
-        if (srv == null) { onStatus(context.getString(R.string.status_ble_server_failed)); onAdvState(false); return }
-        server = srv
-        renameAdapter()
+        openServer()
     }
+
+    /** Open the GATT server, retrying while emit is on. A null here is usually the stack restarting, and
+     *  returning on it left the whole emit half dead for the session with no path back — [build] had already
+     *  been called by then, so even a later recovery would have had nothing to serve. Hence [pendingProfile]. */
+    private fun openServer() {
+        if (stopped || server != null) return
+        val srv = runCatching { mgr.openGattServer(context, serverCallback) }.getOrNull()
+        if (srv == null) {
+            // Backoff, not a flat retry: the common cause (Bluetooth off, stack not coming back) lasts the
+            // whole ride, and at a fixed 2 s that is ~1800 attempts an hour, each one a log line — the same
+            // mistake RawAntLink.scheduleReopen already documents having made.
+            val wait = serverRetryMs
+            serverRetryMs = (wait * 2).coerceAtMost(SERVER_RETRY_MAX_MS)
+            FileLog.event("openGattServer returned null — retrying in ${wait}ms")
+            onStatus(context.getString(R.string.status_ble_server_failed)); onAdvState(false)
+            handler.removeCallbacks(serverRetryRunnable); handler.postDelayed(serverRetryRunnable, wait)
+            return
+        }
+        serverRetryMs = SERVER_RETRY_MS   // open: a later failure starts its backoff from scratch
+        // Publishing the server and claiming the held profile must be ONE step, under the same lock build()
+        // uses. As two independent volatiles they interleave: build() reads server==null on a binder thread,
+        // we publish and find pendingProfile still null, then build() stores it — and nobody ever replays it,
+        // leaving an open GATT server with no services that can never advertise.
+        val replay = synchronized(serverLock) { server = srv; pendingProfile.also { pendingProfile = null } }
+        renameAdapter()
+        replay?.let { FileLog.event("mirror server opened — building the profile we held"); build(it) }
+    }
+
+    private val serverRetryRunnable = Runnable { openServer() }
+    /** Guards the server/pendingProfile handover only — never held across a GATT call. */
+    private val serverLock = Any()
+    @Volatile private var serverRetryMs = SERVER_RETRY_MS
+    @Volatile private var stopped = false
+    /** A profile handed to [build] before the server existed, replayed once it does. */
+    @Volatile private var pendingProfile: GattProfile? = null
 
     /** Rename the adapter to our advertised name, persisting the ORIGINAL to prefs so a process kill (which
      *  skips stop()) doesn't lose the user's real Bluetooth name — and so we never capture our own rename. */
@@ -174,7 +223,10 @@ class MirrorServer(
      *  services + characteristics (re-adding them would strand apps still subscribed to the old instances
      *  and there is no clean live rebuild). */
     fun build(profile: GattProfile) {
-        val srv = server ?: return
+        // No server yet (it is being retried): hold the profile rather than drop it, or a server that opens
+        // on the second attempt would have no services and would therefore never advertise. Under the same
+        // lock openServer() claims it with, so the read and the store cannot straddle the handover.
+        val srv = synchronized(serverLock) { server ?: run { pendingProfile = profile; null } } ?: return
         // Atomic gate: build() is called from both the GATT binder thread (onServicesDiscovered) and the main
         // thread (Start) — a plain check-then-set could let both through and double-add the services.
         if (!built.compareAndSet(false, true)) return
@@ -247,6 +299,7 @@ class MirrorServer(
     fun stop() {
         // Stop the advertiser UNCONDITIONALLY: the `advertising` flag is transiently false mid-restart, so
         // trusting it here can leave the phone broadcasting with a closed GATT server.
+        stopped = true; pendingProfile = null
         advertising = false; servicesReady = false
         handler.removeCallbacksAndMessages(null)   // pending adv starts / service retries must not outlive us
         runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(advCallback) }
@@ -262,7 +315,7 @@ class MirrorServer(
         restoreName()
         built.set(false); advBlueprint = null
         chars.clear(); cache.clear(); subscribers.clear(); clients.clear(); pendingServices.clear()
-        shownZycleLevel = null; lastRawZycleLevel = null; lastControlWriteMs = 0L; servoStepOwed = false
+        shownZycleLevel = null; lastRawZycleLevel = null; lastControlWriteMs = 0L; servoStepOwed = false; reanchorLevel = false
     }
 
     /**
@@ -283,6 +336,16 @@ class MirrorServer(
     @Volatile private var lastRawZycleLevel: Int? = null  // what the trainer last reported, to difference against
     @Volatile private var lastControlWriteMs = 0L         // elapsedRealtime of the last control write we relayed
     @Volatile private var servoStepOwed = false           // that write has a level step coming; it is not the rider's
+    /** The trainer link dropped, so the next level we see must be RE-ANCHORED rather than differenced.
+     *  A drop does not stop the mirror (the GATT and the connected apps are deliberately kept), so without
+     *  this the pair above straddles the outage and the first frame back is differenced against a level from
+     *  before it — delivering the whole gap to the app in one step, as if the rider had made it. */
+    @Volatile private var reanchorLevel = false
+
+    /** For the service's periodic snapshot: how many apps are attached, and how far the level we report has
+     *  drifted from the machine's (shown/raw — they diverge by every servo step we absorbed, by design). */
+    val clientCount: Int get() = clients.size
+    val levelDebug: String get() = "${shownZycleLevel ?: "-"}/${lastRawZycleLevel ?: "-"}"
 
     /** A value arrived from the trainer: correct power, cache, and notify every subscribed client. */
     fun onZycleValue(charUuid: UUID, value: ByteArray) {
@@ -296,11 +359,31 @@ class MirrorServer(
             // one bridge must never hand one app two different numbers for the same instant.
             charUuid == GattUuids.ZYCLE_TELEMETRY -> {
                 PowerRewrite.zycleLevel(value)?.let { raw ->
+                    // First frame after a dropout: re-anchor onto whatever the trainer says now, so the gap it
+                    // moved through while we were blind is NOT differenced into the app's view. Deliberately
+                    // NOT by nulling shownZycleLevel — levelToShow's first-frame rule adopts the raw level,
+                    // which is the same jump by another route. A genuine press made during the outage is lost;
+                    // we could not have seen it.
+                    // ponytail: the flag has no expiry, so a press landing between the link coming back and
+                    // the first telemetry frame is absorbed into the anchor too. That window is one frame
+                    // (~250 ms at 4 Hz); bounding it with a timer would cost state and re-open the far worse
+                    // jump this exists to stop. Revisit only if a trainer is seen going quiet after reconnect.
+                    val reanchored = reanchorLevel
+                    if (reanchorLevel) { lastRawZycleLevel = raw; reanchorLevel = false }
+                    val prevRaw = lastRawZycleLevel; val prevShown = shownZycleLevel
                     // The budget expires: 57 of 169 writes moved no level at all, and an armed one left
                     // lying around would eat the rider's next press minutes later.
                     val owed = servoStepOwed && SystemClock.elapsedRealtime() - lastControlWriteMs < LEVEL_SETTLE_MS
                     val next = PowerRewrite.levelToShow(shownZycleLevel, lastRawZycleLevel, raw, owed)
                     shownZycleLevel = next.level; servoStepOwed = next.servoStepOwed; lastRawZycleLevel = raw
+                    // THE line that makes the servo-vs-rider rule auditable. Every claim in this file's
+                    // comments ("118 of 125", "111 of 169 writes → 1 step") came from reconstructing this by
+                    // hand out of hex dumps; logged directly, a ride answers it by counting lines. Only when
+                    // the level actually moved or we re-anchored — a few hundred lines a ride, not 4 Hz.
+                    if (FileLog.enabled && (reanchored || raw != prevRaw))
+                        FileLog.event("level raw=$prevRaw->$raw shown=$prevShown->${next.level} " +
+                            (if (reanchored) "REANCHOR" else if (owed) "SERVO(spent)" else "RIDER") +
+                            " owedAfter=${next.servoStepOwed}")
                 }
                 PowerRewrite.correctZycleTelemetry(value, correction(), shownZycleLevel)
             }
@@ -339,6 +422,9 @@ class MirrorServer(
 
     private val serverCallback = object : BluetoothGattServerCallback() {
         override fun onServiceAdded(status: Int, service: BluetoothGattService?) {
+            // A callback still in flight when stop() ran would otherwise find pendingServices empty, set
+            // servicesReady and post a start — putting us back on the air with a closed GATT server.
+            if (stopped || server == null) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 // don't poll it: retry the head rather than advertise a mirror missing a service
                 FileLog.event("mirror addService FAILED status=$status for ${shortUuid(service?.uuid)} — retrying head")
@@ -404,9 +490,10 @@ class MirrorServer(
                 (if (preparedWrite) " PREPARED off=$offset" else "") + (if (!responseNeeded) " noResp" else "")
             if (uuid != null && value != null) {
                 val out = if (GattUuids.carriesControl(uuid)) PowerRewrite.inverseTargetPower(value, correction()) else value
-                // Any control op can make the servo move the level; from here on that move is ours, not the
-                // rider's. Stamped before the relay, so the window covers the trip to the trainer too.
-                if (GattUuids.carriesControl(uuid)) { lastControlWriteMs = SystemClock.elapsedRealtime(); servoStepOwed = true }
+                // Any control op can make the servo move the level; from there on that move is ours, not the
+                // rider's. Read the clock HERE, before the relay, so the window still covers the trip to the
+                // trainer — but only commit it once we know the write was dispatched (below).
+                val stampAt = SystemClock.elapsedRealtime()
                 // what the client asked for, unless the trainer's characteristic can't take a Write Command
                 val withResponse = responseNeeded ||
                     (ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE == 0)
@@ -415,6 +502,12 @@ class MirrorServer(
                 // until onExecuteWrite. No FTMS/CPS characteristic exceeds one ATT payload, so this only
                 // matters if some app starts using long writes — the log line above says when it happens.
                 relayed = toZycle(uuid, out, withResponse)   // relay to the trainer
+                // Only a write that was actually dispatched buys the servo a step. A dropped one (no link,
+                // characteristic not found — the window right after a reconnect, before discovery repopulates
+                // g.services) moves no level, and an armed budget would silently eat the rider's next real
+                // button press within LEVEL_SETTLE_MS. `relayed` still only means QUEUED, so a write that
+                // fails later on the wire arms it anyway — no worse than before, and one less lost press.
+                if (relayed && GattUuids.carriesControl(uuid)) { lastControlWriteMs = stampAt; servoStepOwed = true }
                 if (!relayed) FileLog.event("app write $tag NOT RELAYED — answering failure")
             } else FileLog.event("app write $tag = <no value / unknown char>")
             // ATT response = "received", always. FTMS puts the OUTCOME in the control point indication.
@@ -482,31 +575,32 @@ class MirrorServer(
 
     // ── advertising ──────────────────────────────────────────────────────────────────────────────────
     private val advCallback = object : android.bluetooth.le.AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { handler.removeCallbacks(advStartWatchdog); advStarting = false; advertising = true; advRetries = 0; onAdvState(true); onStatus(context.getString(R.string.status_advertising, advertisedName)); FileLog.event("advertising as $advertisedName")
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { handler.removeCallbacks(advStartWatchdog); advStarting = false; advertising = true; advRetries = 0; advRetryMs = ADV_RETRY_MS; onAdvState(true); onStatus(context.getString(R.string.status_advertising, advertisedName)); FileLog.event("advertising as $advertisedName")
             // a stop issued while this start was in flight is dropped by the stack — reconcile now
             if (!trainerLinked || server == null) { FileLog.event("advertising with no trainer — stopping"); stopAdvertising() }
         }
         override fun onStartFailure(errorCode: Int) {
             handler.removeCallbacks(advStartWatchdog); advStarting = false; advertising = false; onAdvState(false)
             onStatus(context.getString(R.string.status_advertise_failed, errorCode))
-            FileLog.event("advertise failed $errorCode (retry ${advRetries + 1}/$ADV_MAX_RETRIES, name=${!dropNameFromAdv})")
+            FileLog.event("advertise failed $errorCode (attempt ${++advRetries}, name=${!dropNameFromAdv})")
             // 31-byte PDU: shed the cloned manufacturer data first (usually the culprit), the name only if
-            // that still isn't enough — apps find us BY the name, so it is the last thing to go.
+            // that still isn't enough — apps find us BY the name, so it is the last thing to go. Driven by
+            // the error code, not by the attempt counter, so it still walks its three steps in order.
             if (errorCode == ADVERTISE_FAILED_DATA_TOO_LARGE) when {
                 !dropMfrFromAdv -> dropMfrFromAdv = true          // the cloned manufacturer data usually is it
                 !dropBlueprintFromAdv -> dropBlueprintFromAdv = true   // then the cloned UUIDs (128-bit won't fit)
                 else -> dropNameFromAdv = true                    // last resort: apps find us BY the name
             }
-            if (advRetries++ < ADV_MAX_RETRIES) {
-                handler.removeCallbacks(startAdvRunnable); handler.postDelayed(startAdvRunnable, ADV_RETRY_MS)
-            }
+            scheduleAdvRetry("failure $errorCode")
         }
     }
 
     private fun startAdvertising() {
         // no trainer → stay off the air (see setTrainerLinked); not built → we'd advertise an empty GATT and
         // an app that connects in that window caches it. onServiceAdded calls back here once services land.
-        if (advertising || advStarting || !trainerLinked || !servicesReady) return
+        // `stopped`/`server` too: a callback still in flight when stop() ran must not put us back on the air
+        // with a closed GATT server behind the advert.
+        if (stopped || server == null || advertising || advStarting || !trainerLinked || !servicesReady) return
         val advertiser = adapter.bluetoothLeAdvertiser ?: run { onStatus(context.getString(R.string.status_ble_adv_unsupported)); onAdvState(false); return }
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
@@ -526,8 +620,12 @@ class MirrorServer(
         }
         advStarting = true
         lastAdvCallback = advCallback   // process-wide, so a later instance can still stop this set
-        if (runCatching { advertiser.startAdvertising(settings, builder.build(), advCallback) }.isFailure) advStarting = false
-        else {
+        if (runCatching { advertiser.startAdvertising(settings, builder.build(), advCallback) }.isFailure) {
+            // A synchronous throw answers with no callback at all, so this is the only place that can report
+            // it. Clearing the flag alone left health green and nothing scheduled.
+            advStarting = false; onAdvState(false)
+            scheduleAdvRetry("start threw")
+        } else {
             // An accepted start normally answers with exactly one callback — except when the adapter is
             // turned off or the BT process dies under it, which drops the callback silently. Without this
             // the flag latches and we never advertise again.
@@ -548,11 +646,44 @@ class MirrorServer(
     /** Force a fresh advertise (Android silently stopped it when a central connected, but our flag didn't
      *  know). Needed so more than one app can find us. */
     private val startAdvRunnable = Runnable { startAdvertising() }
+    /** A start that is accepted and then never answers. Clearing the latch is not enough: nothing else
+     *  retries, and `bleAdvOk` would stay at its optimistic true — a mirror off the air behind a green UI,
+     *  which is strictly worse to diagnose than a visible failure. Do what onStartFailure does, minus the
+     *  size-shedding (there is no error code to shed for). */
     private val advStartWatchdog = Runnable {
-        if (advStarting) { FileLog.event("advertise start never answered — clearing in-flight flag"); advStarting = false }
+        if (advStarting) {
+            FileLog.event("advertise start never answered — clearing in-flight flag and retrying")
+            advStarting = false; advertising = false; onAdvState(false)
+            scheduleAdvRetry("start never answered")
+        }
+    }
+
+    /**
+     * The one place that re-arms advertising. A capped ATTEMPT COUNT was the bug this replaces: five
+     * transient failures took the mirror off the air for the whole ride. A flat 1 s retry is the opposite
+     * mistake — a revoked BLUETOOTH_ADVERTISE or a stack that throws every time would retry ~3600 times an
+     * hour, each one a log line, across a 4-12 h ride. So: backoff, no cap. The budget resets on a real
+     * success and when the trainer link comes back.
+     *
+     * ponytail: every attempt shares ONE AdvertiseCallback, because that object is also the handle
+     * stopAdvertising needs. So if a start's callback arrives after [ADV_START_TIMEOUT_MS] the watchdog can
+     * have already started a second attempt, and the two callbacks are indistinguishable — a late success
+     * for A cancels B's watchdog, a late failure for B clears `advertising` while A is really on air. The
+     * timeout is set well past any plausible stack latency so this needs a genuinely lost callback AND a
+     * slow one; closing it properly means a fresh callback object per attempt plus tracking which one owns
+     * the live set. Backoff bounds the damage to a self-healing flap.
+     */
+    private fun scheduleAdvRetry(why: String) {
+        if (stopped) return
+        val wait = advRetryMs
+        advRetryMs = (wait * 2).coerceAtMost(ADV_RETRY_MAX_MS)
+        FileLog.event("advertise retry in ${wait}ms: $why")
+        handler.removeCallbacks(startAdvRunnable); handler.postDelayed(startAdvRunnable, wait)
     }
 
     private fun restartAdvertising() {
+        // an app connecting/disconnecting is a fresh chance, not a continuation of old failures
+        advRetries = 0; advRetryMs = ADV_RETRY_MS
         stopAdvertising()
         // The stop is async and only frees this callback when it completes; starting in the same turn
         // answers ADVERTISE_FAILED_ALREADY_STARTED. Give it a turn — and collapse duplicate restarts

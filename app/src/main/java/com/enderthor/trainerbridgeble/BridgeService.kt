@@ -59,8 +59,10 @@ class BridgeService : Service() {
     @Volatile var lastSpeedKmh: Double? = null; private set
     @Volatile var lastCadence: Int? = null; private set
     @Volatile var lastControl: String? = null; private set
-    @Volatile var lastSampleMs: Long = 0L; private set   // wall-clock of the last trainer sample, for UI staleness
-    @Volatile var lastPowerMs: Long = 0L; private set    // ...and of the last packet that actually CARRIED power
+    // elapsedRealtime, NOT wall-clock, for both — the reason CorrectedFeed already documents: the Karoo
+    // re-syncs its clock mid-ride, and a jump either blanks live data or hides a real dropout.
+    @Volatile var lastSampleMs: Long = 0L; private set   // last trainer sample, for UI staleness
+    @Volatile var lastPowerMs: Long = 0L; private set    // ...and the last packet that actually CARRIED power
 
     // FTMS says Instantaneous Speed is 0.01 km/h. Some trainers (the Zycle among them) report 0.1 km/h,
     // which silently makes speed AND the recorded distance ten times too small. Rather than hardcode either,
@@ -87,10 +89,20 @@ class BridgeService : Service() {
 
     /** Power specifically — a packet can arrive without the power field, and a sticky last value must not be
      *  reported as live to ANT, the Karoo recording, or the tiles. A short grace covers one dropped frame. */
-    val powerFresh: Boolean get() = lastPowerMs != 0L && System.currentTimeMillis() - lastPowerMs <= POWER_STALE_MS
+    val powerFresh: Boolean get() = lastPowerMs != 0L && android.os.SystemClock.elapsedRealtime() - lastPowerMs <= POWER_STALE_MS
     private fun freshPowerOrNull(): Int? = if (powerFresh) lastCorrectedW else null
     @Volatile private var lastResistance: Int? = null
     @Volatile private var sawIndoorBikeData = false   // NOT `lastRawW == null`: that is set by the fallback itself
+    @Volatile private var pendingErgBiasW: Int? = null   // learned but not yet written to prefs (see learnErgBias)
+    @Volatile private var lastBiasPersistMs = 0L
+    /** Bumped by every start AND stop of the receive half. The source's callbacks capture the value they were
+     *  created with and no-op once it moves: a GATT callback already past its own `gatt === g` check when a
+     *  source switch lands would otherwise write this session's state (and take the wake lock) on behalf of a
+     *  source that no longer exists. */
+    @Volatile private var receiveGen = 0
+    /** How many callbacks the generation guard rejected. Zero all ride means the races the guard exists for
+     *  never happened; a climbing number is itself the finding. Reported by the periodic snapshot. */
+    private val staleCallbacks = java.util.concurrent.atomic.AtomicInteger(0)
     @Volatile private var antEnabled = false
     @Volatile var antOk = false; private set
     @Volatile var antStatus: String = ""; private set
@@ -126,7 +138,18 @@ class BridgeService : Service() {
             // rider, exactly like the bike's own, and the level move it causes SHOULD reach the app.
             // optimistic, and only if the write was at least QUEUED (no link / unknown char → don't move the
             // tile). A stack refusal after queueing still shows briefly; the trainer's own IBD corrects it.
-            if (client?.write(com.enderthor.trainerbridgeble.ble.GattUuids.FTMS_CONTROL_POINT, byteArrayOf(0x04, target.toByte()), true) == true) {
+            val bytes = byteArrayOf(0x04, target.toByte())
+            if (client?.write(com.enderthor.trainerbridgeble.ble.GattUuids.FTMS_CONTROL_POINT, bytes, true) == true) {
+                // The mirror's toZycle lambda is where ErgBias sees control ops, and this path deliberately
+                // bypasses it — so tell the learner directly. 0x04 takes the trainer OUT of ERG, and without
+                // this its commandedRaw stays pinned to the app's last target: every later reading is then
+                // measured against a command no longer in force, saturating the bias and PERSISTING it.
+                // ponytail: `write() == true` means QUEUED, not accepted by the stack, so a 0x04 that dies in
+                // the queue still retires the command here. That only makes the learner stop learning until
+                // the next 0x05 — it cannot poison the bias, which is what this fix is for. Closing it needs
+                // the write path to report terminal completion back (the same plumbing an FTMS failure
+                // indication would need); do both together or neither.
+                ErgBias.onControl(bytes, android.os.SystemClock.elapsedRealtime())
                 lastResistance = target
                 lastControl = getString(R.string.control_resistance_target, target)
                 FileLog.event("UI button → resistance target=$target")
@@ -195,6 +218,19 @@ class BridgeService : Service() {
         // Before the try, not after: the catch below logs WHY startForeground failed, and FileLog silently
         // drops anything written before init. One File object is not what blows the 5 s window.
         FileLog.init(this); FileLog.enabled = Config(this).loggingEnabled
+        // Session header. Two builds are now in play and a log with no version is a log you cannot trust to
+        // be about the code you think it is; the correction values matter because every wattage below is
+        // relative to them.
+        Config(this).let { c ->
+            // via PackageManager rather than BuildConfig: AGP 8 does not generate that class unless
+            // buildFeatures.buildConfig is turned on, and one log line does not justify a build change.
+            val ver = runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull()
+            FileLog.event("=== session start v$ver " +
+                "${android.os.Build.MODEL} api${android.os.Build.VERSION.SDK_INT} — " +
+                "scale=+${c.scaleAdjustPercent}% offset=${c.offsetW}W floor=${c.invertFloorW}W " +
+                "ergBias=${c.ergBiasW}W advName='${c.advertisedName}' sim=${c.simulate} ant=${c.antOutputEnabled}")
+        }
+
         try {
             // connectedDevice only: dataSync would add a ~6h/24h cumulative FGS timeout on Android 14+ that
             // could kill the bridge mid-ride, and the BLE companion link doesn't need it.
@@ -206,7 +242,10 @@ class BridgeService : Service() {
             status = getString(R.string.status_missing_bt_permission); listener?.invoke(); stopSelf(); return false
         }
         foreground = true
-        acquireWakeLock()
+        handler.removeCallbacks(snapshot); handler.post(snapshot)   // stops itself once foreground goes false
+        // NOT here: the wake lock follows the TRAINER LINK, not the master switch (see the onState callback in
+        // startReceive). Held from here it blocked suspend for every hour the master was left on with no
+        // trainer in the room — which is most of the day, and the single biggest idle drain in the app.
         return true
     }
 
@@ -265,29 +304,64 @@ class BridgeService : Service() {
         if (client != null || simSource != null) return   // idempotent
         val config = Config(this)
         config.lastSeenAddress = ""; config.lastSeenName = ""   // runtime state; a process kill leaves it stale
+        pendingErgBiasW = null; lastBiasPersistMs = 0L   // 0 = the first learned value of the ride writes at once
         ErgBias.seed(config.ergBiasW)   // start calibrated; there is no live command to measure against yet
         FileLog.event("receive start paired=${config.pairedAddress.ifEmpty { "any" }} sim=${config.simulate} ergBias=${config.ergBiasW}W")
-        val onProfile: (GattProfile) -> Unit = { profile -> lastProfile = profile; mirror?.build(profile) }
+        val gen = ++receiveGen
+        // Hopping to main is what makes the generation check MEAN anything: read on a binder thread it is
+        // check-then-act, and a source switch landing between the check and the body would let a replaced
+        // source drive the live one. startReceive/stopReceive both run on main, so validating there is
+        // genuinely serialised against them. Only for the callbacks that can LATCH something.
+        val onProfile: (GattProfile) -> Unit = { profile ->
+            // The worst of them: MirrorServer.build() is a one-shot latch, so a late profile from the source
+            // we just replaced wins it and the new source's real profile is then ignored for the session.
+            handler.post { if (gen == receiveGen) { lastProfile = profile; mirror?.build(profile) } }
+        }
         val onValue: (java.util.UUID, ByteArray) -> Unit = { uuid, value ->
-            cacheForUi(config, uuid, value)
-            lastValues[uuid] = value      // the one-shot reads happen long before Broadcast is pressed
-            mirror?.onZycleValue(uuid, value)
+            // NOT posted: this is the 4 Hz relay path and a main-looper hop is exactly the latency R2 is
+            // about. A plain volatile compare is free, and the residue of check-then-act here is one stale
+            // sample relayed — nothing latches, unlike onProfile above.
+            if (gen == receiveGen) {
+                cacheForUi(config, uuid, value)
+                lastValues[uuid] = value      // the one-shot reads happen long before Broadcast is pressed
+                mirror?.onZycleValue(uuid, value)
+            } else staleCallbacks.incrementAndGet()   // counted, not logged: it would be per-packet
         }
         val onState: (Boolean) -> Unit = { connected ->
+          handler.post { if (gen == receiveGen) {   // see onProfile: validated on main, so it is atomic
             zycleConnected = connected
+            // The wake lock lives HERE, not in goForeground(): there is data to keep the CPU awake for only
+            // while a trainer is actually feeding us.
+            // On the DROP it lingers instead of releasing at once. The reconnect is a postDelayed 2 s away,
+            // and postDelayed does not wake a suspended CPU — releasing immediately can leave us suspended
+            // with NO scan running, and then the trainer's advertising has nothing to arrive at. Once a scan
+            // is actually up the controller wakes the AP on a match, so the lock is only needed to bridge
+            // that gap. (Residual: if startScan itself keeps failing, its backoff windows are unscanned.)
+            if (connected) acquireWakeLock() else {
+                handler.removeCallbacks(releaseWakeLockLater)
+                handler.postDelayed(releaseWakeLockLater, WAKELOCK_LINGER_MS)
+            }
             // Only the DROP is immediate; going on the air waits for onSynced below.
             if (!connected) { zycleSynced = false; mirror?.setTrainerLinked(false); ErgBias.forget() }
             if (!connected) { config.lastSeenAddress = ""; config.lastSeenName = "" }   // the config screen offers it only while live
-            status = if (connected) getString(R.string.status_trainer_connected) else getString(R.string.status_searching_trainer); listener?.invoke() }
-        val onSynced: () -> Unit = { zycleSynced = true; mirror?.setTrainerLinked(true) }
+            status = if (connected) getString(R.string.status_trainer_connected) else getString(R.string.status_searching_trainer); listener?.invoke()
+          } }
+        }
+        // Same treatment: a stale onSynced would put the mirror on the air with no trainer behind it, and
+        // setTrainerLinked is edge-triggered, so it would STAY there.
+        val onSynced: () -> Unit = { handler.post { if (gen == receiveGen) { zycleSynced = true; mirror?.setTrainerLinked(true) } } }
         val c: TrainerSource = if (config.simulate) SimSource(onProfile, onValue, onState, onSynced).also { simSource = it }
         else ZycleClient(this, config.pairedAddress, onProfile, onValue, onState, onSynced,
-            onAdv = { bp -> lastAdvBlueprint = bp; mirror?.setAdvBlueprint(bp) },   // clone the trainer's real advertising
-            onFound = { name, addr -> config.lastSeenName = name ?: ""; config.lastSeenAddress = addr })
+            // Guarded too, or the replaced source's advertising blueprint and address get written over the
+            // live one's. Plain compare: neither latches anything, so the post is not worth the hop.
+            onAdv = { bp -> if (gen == receiveGen) { lastAdvBlueprint = bp; mirror?.setAdvBlueprint(bp) } },
+            onFound = { name, addr -> if (gen == receiveGen) { config.lastSeenName = name ?: ""; config.lastSeenAddress = addr } })
         currentSourceKey = sourceKey(config)
         c.start()
         client = c
-        // after start(): SimSource reports connected synchronously, so don't overwrite it with "searching"
+        // SimSource reports connected synchronously inside start(), but onState now hops to main (see the
+        // lambdas above), so zycleConnected is still false here and this reads "searching". The posted body
+        // runs right after and corrects it — a one-frame flash, not a wrong end state.
         status = getString(if (zycleConnected) R.string.status_trainer_connected else R.string.status_searching_trainer)
         updateNotification(); listener?.invoke()
     }
@@ -295,10 +369,17 @@ class BridgeService : Service() {
     private fun stopReceive() {
         if (client == null && simSource == null) return
         FileLog.event("receive stop")
-        ErgBias.forget()
+        receiveGen++        // invalidate this source's callbacks BEFORE anything else reads or writes state
+        releaseWakeLock()   // no source → nothing to stay awake for (the master switch keeps the FGS alive)
         mirror?.setTrainerLinked(false)   // no source → nothing to advertise, whatever the call order
         Config(this).let { it.lastSeenAddress = ""; it.lastSeenName = "" }
         client?.stop(); client = null; simSource = null; lastProfile = null; lastAdvBlueprint = null; currentSourceKey = null
+        // Flush after client.stop() — but note stop() is NOT a callback barrier: a notification already past
+        // its `stopped` check can still publish a pending value after this runs, and that last whole-watt
+        // step is then lost. Immaterial (the EMA moves ~0.05 W a sample and is re-seeded next ride) and it is
+        // the SAFE direction: the dangerous half — a stale sample being persisted into the NEXT session — is
+        // closed by the receiveGen guard on onValue, which is what feeds learnErgBias.
+        persistErgBias(Config(this)); ErgBias.forget()
         lastValues.clear()
         CorrectedFeed.clear()
         speedUnit = 0.01; speedUnitLocked = false; prevDistM = 0; prevElapsedS = 0
@@ -408,7 +489,7 @@ class BridgeService : Service() {
     private fun cacheForUi(config: Config, uuid: java.util.UUID, value: ByteArray) {
         if (client == null && simSource == null) return   // a late BLE callback after stopReceive() — no phantom
         if (uuid == com.enderthor.trainerbridgeble.ble.GattUuids.INDOOR_BIKE_DATA ||
-            uuid == com.enderthor.trainerbridgeble.ble.GattUuids.CYCLING_POWER_MEASUREMENT) lastSampleMs = System.currentTimeMillis()
+            uuid == com.enderthor.trainerbridgeble.ble.GattUuids.CYCLING_POWER_MEASUREMENT) lastSampleMs = android.os.SystemClock.elapsedRealtime()
         when (uuid) {
             com.enderthor.trainerbridgeble.ble.GattUuids.INDOOR_BIKE_DATA -> {
                 if (value.size < 2) return
@@ -447,7 +528,7 @@ class BridgeService : Service() {
                 // dropout would be transmitted as live. Speed/cadence still flow to the Karoo sensor.
                 if (havePower) {
                     sawIndoorBikeData = true       // IBD really carries power — only now disable the CPM fallback
-                    lastPowerMs = System.currentTimeMillis()   // the clock powerFresh/freshPowerOrNull read
+                    lastPowerMs = android.os.SystemClock.elapsedRealtime()   // the clock powerFresh/freshPowerOrNull read
                 }
                 // ALWAYS report to ANT, with a null power once it has gone stale: gating the CALL froze
                 // speed and cadence too and starved ANT on a trainer whose IBD carries no power field.
@@ -457,16 +538,19 @@ class BridgeService : Service() {
                 // A single truncated frame must not punch a hole in the recording, and a real dropout must
                 // not be recorded as live watts: the grace window decides, not this one packet.
                 CorrectedFeed.push(freshPowerOrNull(), lastSpeedKmh?.let { it / 3.6 }, lastCadence, android.os.SystemClock.elapsedRealtime())
-                listener?.invoke()
+                // NOT listener?.invoke(): the Monitor already polls at 1 Hz, and driving it from here re-ran a
+                // full render (a fresh GradientDrawable + autosize on seven TextViews) at the trainer's ~4 Hz —
+                // on the same main looper the mirror's notify fan-out posts to. State CHANGES still notify
+                // immediately (connect/disconnect, control write, status, adv state); only the tiles wait.
             }
             com.enderthor.trainerbridgeble.ble.GattUuids.CYCLING_POWER_MEASUREMENT -> {
                 if (!sawIndoorBikeData && value.size >= 4) {   // fallback only if the trainer sends no IBD
                     val raw = le16signed(value, 2); lastRawW = raw; lastCorrectedW = config.correction().correct(raw)
                     learnErgBias(config, raw)
-                    lastPowerMs = System.currentTimeMillis()
+                    lastPowerMs = android.os.SystemClock.elapsedRealtime()
                     antTx?.setLatest(PowerSample(freshPowerOrNull(), lastCadence, lastSpeedKmh?.let { it / 3.6 }))   // ANT too, or FE-C stays blank
                     CorrectedFeed.push(freshPowerOrNull(), lastSpeedKmh?.let { it / 3.6 }, lastCadence, android.os.SystemClock.elapsedRealtime())
-                    listener?.invoke()
+                    // same as the IBD branch above: the 1 Hz poller owns the tiles
                 }
             }
         }
@@ -478,10 +562,27 @@ class BridgeService : Service() {
         // SimSource tracks the ERG target exactly, so it would teach a bias of ~0 and PERSIST it — running
         // the simulator for three minutes would quietly wipe the real trainer's calibration.
         if (config.simulate) return
-        ErgBias.onPower(raw, android.os.SystemClock.elapsedRealtime())?.let {
-            config.ergBiasW = it
-            FileLog.event("ERG bias learned: ${it}W (trainer settles above its command)")
-        }
+        val w = ErgBias.onPower(raw, android.os.SystemClock.elapsedRealtime()) ?: return
+        pendingErgBiasW = w
+        // Rate-limited: onPower is fed at 4 Hz, and a converged bias sitting near an integer boundary (the
+        // measured overshoot is ~8 W) flips across it over and over — each flip a full rewrite+fsync of the
+        // prefs XML, in flash. The stated goal ("start the next ride where this one finished") is met just as
+        // well at one-minute granularity, and stopReceive flushes whatever is still pending.
+        val now = android.os.SystemClock.elapsedRealtime()
+        // `!= 0L` matters: elapsedRealtime is measured from BOOT, so in the first minute of uptime — which on
+        // a Karoo that reboots daily and auto-starts this extension is a real moment — `now - 0` is under the
+        // interval and the FIRST learned value of the ride would be held back rather than written at once.
+        if (lastBiasPersistMs != 0L && now - lastBiasPersistMs < ERG_BIAS_PERSIST_MS) return
+        lastBiasPersistMs = now
+        persistErgBias(config)
+    }
+
+    /** Write out the latest learned bias, if it moved since the last write. */
+    private fun persistErgBias(config: Config) {
+        val w = pendingErgBiasW ?: return
+        pendingErgBiasW = null
+        config.ergBiasW = w
+        FileLog.event("ERG bias learned: ${w}W (trainer settles above its command)")
     }
 
     private fun le16(b: ByteArray, i: Int) = (b[i].toInt() and 0xFF) or ((b[i + 1].toInt() and 0xFF) shl 8)
@@ -497,13 +598,46 @@ class BridgeService : Service() {
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf()
     }
 
-    private fun acquireWakeLock() {
+    // Synchronized since the trainer link drives these: onState fires from the GATT binder thread AND from
+    // the client's main-thread heartbeat, and two concurrent acquires would strand a lock nothing releases.
+    @Synchronized private fun acquireWakeLock() {
+        handler.removeCallbacks(releaseWakeLockLater)   // a reconnect inside the linger window keeps the lock
         if (wakeLock?.isHeld == true) return
         wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TrainerBridgeBLE:session").also { runCatching { it.acquire() } }
+        FileLog.event("wakelock ACQUIRED (trainer linked)")   // the two lines that make E1 verifiable
     }
 
-    private fun releaseWakeLock() { wakeLock?.let { if (it.isHeld) runCatching { it.release() } }; wakeLock = null }
+    @Synchronized private fun releaseWakeLock() {
+        handler.removeCallbacks(releaseWakeLockLater)
+        val held = wakeLock?.isHeld == true
+        wakeLock?.let { if (it.isHeld) runCatching { it.release() } }; wakeLock = null
+        if (held) FileLog.event("wakelock RELEASED — the CPU may suspend from here")
+    }
+
+    /** Deferred release after a trainer drop — see the onState callback in [startReceive]. Re-checks, so a
+     *  reconnect inside the linger window keeps the lock. */
+    private val releaseWakeLockLater = Runnable { if (!zycleConnected) releaseWakeLock() }
+
+    /**
+     * One compact state line a minute. Without it a quiet stretch of log is ambiguous — nothing happened, or
+     * the bridge stalled? — and every "permanent death" bug in this project's history looked exactly like
+     * silence. It also carries the values you would otherwise have to reconstruct: whether ERG is live, what
+     * the learner has settled on, and how far the level we SHOW has drifted from the machine's.
+     */
+    private val snapshot = object : Runnable {
+        override fun run() {
+            if (!foreground) return   // master off / service dying: stop the loop, don't outlive it
+            if (FileLog.enabled) FileLog.event(
+                "state master=${Config(this@BridgeService).masterEnabled} recv=$receiving emit=$emitting " +
+                "trainer=${if (zycleSynced) "synced" else if (zycleConnected) "connected" else "-"} " +
+                "adv=$bleAdvOk apps=${mirror?.clientCount ?: 0} " +
+                "powerFresh=$powerFresh raw=$lastRawW corr=$lastCorrectedW cad=$lastCadence res=$resistance " +
+                "erg=${ErgBias.commanded} bias=${ErgBias.watts}W " +
+                "level=${mirror?.levelDebug ?: "-"} ant=${if (antEnabled) antOk else null} stale=${staleCallbacks.get()}")
+            handler.postDelayed(this, SNAPSHOT_MS)
+        }
+    }
 
     private fun createChannel() {
         val mgr = getSystemService(NotificationManager::class.java)
@@ -533,6 +667,9 @@ class BridgeService : Service() {
         private const val BT_RESTART_SETTLE_MS = 2000L   // let the BT stack settle before reopening the server
         private const val POWER_STALE_MS = 2000L   // ~8 missed frames at 4 Hz: covers a hiccup, not a dropout
         private const val ANT_RESTART_DELAY_MS = 1500L   // let the ANT service release the channel first
+        private const val ERG_BIAS_PERSIST_MS = 60_000L  // at most one prefs write a minute; stopReceive flushes
+        private const val WAKELOCK_LINGER_MS = 6000L     // hold past the reconnect delay, until a scan is up
+        private const val SNAPSHOT_MS = 60_000L          // one state line a minute while the service is up
         const val ACTION_MASTER_ON = "com.enderthor.trainerbridgeble.MASTER_ON"
         const val ACTION_MASTER_OFF = "com.enderthor.trainerbridgeble.MASTER_OFF"
         const val ACTION_EMIT_START = "com.enderthor.trainerbridgeble.EMIT_START"

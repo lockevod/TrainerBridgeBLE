@@ -143,7 +143,7 @@ class MonitorActivity : Activity() {
         startBtn.isEnabled = canEmit; startBtn.alpha = if (canEmit) 1f else 0.4f
         // Fresh = a sample arrived within the last 3s. A brief (<3s) blip keeps showing the last value
         // (the mirror is re-emitting it too); a longer gap blanks the tiles to "—".
-        val fresh = s != null && s.lastSampleMs != 0L && System.currentTimeMillis() - s.lastSampleMs <= STALE_MS
+        val fresh = s != null && s.lastSampleMs != 0L && android.os.SystemClock.elapsedRealtime() - s.lastSampleMs <= STALE_MS
         // Banner shows the TRAINER (receive) link when master is on; "Off" when master is off.
         val (bText, bColor) = when {
             !master -> getString(R.string.monitor_off) to Palette.MUTED
