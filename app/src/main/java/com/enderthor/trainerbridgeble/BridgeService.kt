@@ -228,7 +228,8 @@ class BridgeService : Service() {
         Config(this).let { c ->
             // via PackageManager rather than BuildConfig: AGP 8 does not generate that class unless
             // buildFeatures.buildConfig is turned on, and one log line does not justify a build change.
-            val ver = runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull()
+            // versionName is nullable and the lookup can throw: both used to read as "vnull" in the header.
+            val ver = runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull() ?: "?"
             FileLog.event("=== session start v$ver " +
                 "${android.os.Build.MODEL} api${android.os.Build.VERSION.SDK_INT} — " +
                 "scale=+${c.scaleAdjustPercent}% offset=${c.offsetW}W floor=${c.invertFloorW}W " +

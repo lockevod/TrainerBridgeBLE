@@ -72,11 +72,8 @@ class RuntimeHardeningTest {
         var mutated = false
         assertTrue(emitOwner.runIfCurrent(oldToken) { mutated = true; captured = "old source" })
         assertEquals("old source", captured)
-        // The dispatch is deliberately outside the section, so clear() must not wait on it. (That the
-        // PRODUCTION lambda dispatches outside is a call-shape this test cannot check — KDoc gap 3.)
-        assertNull(emitOwner.clear().let { null })
-
-        emitOwner.clear()                       // stopEmit()
+        // stopEmit()'s barrier hands back exactly the token it retired.
+        assertEquals(oldToken, emitOwner.clear())
         emitOwner.replace(Any())                // startEmit() with a replacement source
         captured = null; mutated = false
         assertFalse(emitOwner.runIfCurrent(oldToken) { mutated = true; captured = "new source" })
