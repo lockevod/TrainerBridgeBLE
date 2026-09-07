@@ -10,7 +10,9 @@ import android.bluetooth.BluetoothGattServerCallback
 import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.AdvertiseData
+import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseSettings
+import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
 import android.os.Build
 import android.os.Handler
@@ -18,6 +20,7 @@ import android.os.Looper
 import android.os.ParcelUuid
 import android.os.SystemClock
 import android.util.Log
+import com.enderthor.trainerbridgeble.AdvertisingAttemptCoordinator
 import com.enderthor.trainerbridgeble.FileLog
 import com.enderthor.trainerbridgeble.R
 import com.enderthor.trainerbridgeble.correction.PowerCorrection
@@ -73,7 +76,10 @@ class MirrorServer(
     private val ADV_START_TIMEOUT_MS = 8000L
     private val SERVER_RETRY_MS = 2000L
     private val SERVER_RETRY_MAX_MS = 30_000L   // Bluetooth off is a whole-ride failure, not a hiccup
-    private val ADV_LATE_STOP_MS = 1500L
+    /** First re-stop of an orphan; doubles to [ADV_SWEEP_MAX_MS] while any remain. Not a bound on when the
+     *  stack answers a start — there is none — just the rate at which we keep asking. */
+    private val ADV_SWEEP_MS = 1000L
+    private val ADV_SWEEP_MAX_MS = 30000L
     /** How long after a control write the trainer's level is still settling on it. Observed on the 28-jul
      *  ride: every servo-driven level step landed 0.19-2.6 s after the write that caused it. */
     private val LEVEL_SETTLE_MS = 3000L
@@ -86,6 +92,7 @@ class MirrorServer(
     private var originalName: String? = null
     @Volatile private var advertising = false
     @Volatile private var advStarting = false   // a start is in flight; `advertising` only flips in the callback
+    private val advAttempts = AdvertisingAttemptCoordinator<AdvertiseCallback>()
     private val built = java.util.concurrent.atomic.AtomicBoolean(false)   // build the mirrored GATT once; a trainer reconnect keeps it
     @Volatile private var advBlueprint: AdvBlueprint? = null   // the trainer's real advertising, to clone
     @Volatile private var trainerLinked = false   // advertise only while a trainer is actually feeding us
@@ -129,9 +136,19 @@ class MirrorServer(
         stopped = false
         // Kill any advertising set left running by a PREVIOUS instance: its stop may have been dropped
         // because a start was still in flight, and its callback died with the object.
-        lastAdvCallback?.takeIf { it !== advCallback }?.let { orphan ->
-            FileLog.event("stopping an advertising set left by a previous mirror")
-            runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(orphan) }
+        lastAdvCallback?.let { orphan ->
+            FileLog.event("stopping an advertising set left by a previous mirror (unresolved=$lastAdvUnresolved)")
+            // Only an unresolved start can have its stop dropped, so only that one needs the sweep. A
+            // resolved one is stopped once, reliably — adopting it would strand it in advOrphans forever.
+            if (lastAdvUnresolved) orphanAdvCallback(orphan)
+            else {
+                runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(orphan) }
+                if (lastAdvCallback === orphan) lastAdvCallback = null
+            }
+        }
+        if (advOrphans.isNotEmpty()) {   // orphans from an earlier instance keep being swept by this one
+            advSweepMs = ADV_SWEEP_MS
+            orphanHandler.removeCallbacks(advSweep); orphanHandler.postDelayed(advSweep, advSweepMs)
         }
         openServer()
     }
@@ -299,17 +316,9 @@ class MirrorServer(
     fun stop() {
         // Stop the advertiser UNCONDITIONALLY: the `advertising` flag is transiently false mid-restart, so
         // trusting it here can leave the phone broadcasting with a closed GATT server.
-        stopped = true; pendingProfile = null
-        advertising = false; servicesReady = false
+        stopped = true; pendingProfile = null; servicesReady = false
+        stopAdvertising()
         handler.removeCallbacksAndMessages(null)   // pending adv starts / service retries must not outlive us
-        runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(advCallback) }
-        if (advStarting) {
-            // The stop we just issued is dropped when a start is still in flight. Try once more after it
-            // has had time to complete — on a Handler that stop() has NOT just drained.
-            val cb = advCallback; val adv = adapter.bluetoothLeAdvertiser
-            Handler(Looper.getMainLooper()).postDelayed({ runCatching { adv?.stopAdvertising(cb) } }, ADV_LATE_STOP_MS)
-        }
-        advStarting = false
         runCatching { server?.close() }
         server = null
         restoreName()
@@ -574,25 +583,63 @@ class MirrorServer(
     }
 
     // ── advertising ──────────────────────────────────────────────────────────────────────────────────
-    private val advCallback = object : android.bluetooth.le.AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) { handler.removeCallbacks(advStartWatchdog); advStarting = false; advertising = true; advRetries = 0; advRetryMs = ADV_RETRY_MS; onAdvState(true); onStatus(context.getString(R.string.status_advertising, advertisedName)); FileLog.event("advertising as $advertisedName")
-            // a stop issued while this start was in flight is dropped by the stack — reconcile now
-            if (!trainerLinked || server == null) { FileLog.event("advertising with no trainer — stopping"); stopAdvertising() }
-        }
-        override fun onStartFailure(errorCode: Int) {
-            handler.removeCallbacks(advStartWatchdog); advStarting = false; advertising = false; onAdvState(false)
-            onStatus(context.getString(R.string.status_advertise_failed, errorCode))
-            FileLog.event("advertise failed $errorCode (attempt ${++advRetries}, name=${!dropNameFromAdv})")
-            // 31-byte PDU: shed the cloned manufacturer data first (usually the culprit), the name only if
-            // that still isn't enough — apps find us BY the name, so it is the last thing to go. Driven by
-            // the error code, not by the attempt counter, so it still walks its three steps in order.
-            if (errorCode == ADVERTISE_FAILED_DATA_TOO_LARGE) when {
-                !dropMfrFromAdv -> dropMfrFromAdv = true          // the cloned manufacturer data usually is it
-                !dropBlueprintFromAdv -> dropBlueprintFromAdv = true   // then the cloned UUIDs (128-bit won't fit)
-                else -> dropNameFromAdv = true                    // last resort: apps find us BY the name
+    private fun newAdvAttempt(advertiser: BluetoothLeAdvertiser): Pair<AdvertiseCallback, Runnable> {
+        lateinit var callback: AdvertiseCallback
+        lateinit var watchdog: Runnable
+        callback = object : AdvertiseCallback() {
+            override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+                handler.removeCallbacks(watchdog)
+                resolveAdvOrphan(this)   // our one callback arrived: resolved, current or not
+                if (!advAttempts.runIfCurrent(this) {
+                    advStarting = false; advertising = true; advRetries = 0; advRetryMs = ADV_RETRY_MS
+                    onAdvState(true); onStatus(context.getString(R.string.status_advertising, advertisedName))
+                    FileLog.event("advertising as $advertisedName")
+                    if (!trainerLinked || server == null) {
+                        FileLog.event("advertising with no trainer — stopping")
+                        stopAdvertising()
+                    }
+                }) {
+                    // Late success for a retired attempt: its registration is real, so stop it. Resolved
+                    // above, so this stop can no longer be dropped by the stack.
+                    runCatching { advertiser.stopAdvertising(this) }
+                }
             }
-            scheduleAdvRetry("failure $errorCode")
+
+            override fun onStartFailure(errorCode: Int) {
+                handler.removeCallbacks(watchdog)
+                resolveAdvOrphan(this)   // no registration exists for a failed start, orphaned or not
+                advAttempts.failIfCurrent(
+                    this,
+                    stop = { runCatching { advertiser.stopAdvertising(it) } },
+                    markFailed = {
+                        if (lastAdvCallback === this) lastAdvCallback = null
+                        advStarting = false; advertising = false; onAdvState(false)
+                        onStatus(context.getString(R.string.status_advertise_failed, errorCode))
+                        FileLog.event("advertise failed $errorCode (attempt ${++advRetries}, name=${!dropNameFromAdv})")
+                        if (errorCode == ADVERTISE_FAILED_DATA_TOO_LARGE) when {
+                            !dropMfrFromAdv -> dropMfrFromAdv = true
+                            !dropBlueprintFromAdv -> dropBlueprintFromAdv = true
+                            else -> dropNameFromAdv = true
+                        }
+                    },
+                    retry = { scheduleAdvRetry("failure $errorCode") },
+                )
+            }
         }
+        watchdog = Runnable {
+            advAttempts.retireIfCurrent(
+                callback,
+                // Unresolved by definition — that is what the watchdog fires on. One stop is not enough:
+                // if the start is still in flight the stack drops it, so hand it to the orphan sweep.
+                retire = { orphanAdvCallback(it) },
+                after = {
+                    advStarting = false; advertising = false; onAdvState(false)
+                    FileLog.event("advertise start never answered — retiring attempt and retrying")
+                    scheduleAdvRetry("start never answered")
+                },
+            )
+        }
+        return callback to watchdog
     }
 
     private fun startAdvertising() {
@@ -619,17 +666,32 @@ class MirrorServer(
                 .addServiceUuid(ParcelUuid(GattUuids.uuid16(0x1826)))
         }
         advStarting = true
-        lastAdvCallback = advCallback   // process-wide, so a later instance can still stop this set
-        if (runCatching { advertiser.startAdvertising(settings, builder.build(), advCallback) }.isFailure) {
+        // One callback is one controller registration. Retire any orphan before publishing the new owner.
+        val (callback, watchdog) = newAdvAttempt(advertiser)
+        // A previous owner still here means its start never resolved (a resolved one is retired by its own
+        // callback), so it is an orphan, not a plain stop.
+        advAttempts.begin(callback) { old -> orphanAdvCallback(old) }
+        lastAdvCallback = callback   // process-wide, so a later instance can still stop this set
+        lastAdvUnresolved = true     // ...and know whether that stop can be dropped by the stack
+        if (runCatching { advertiser.startAdvertising(settings, builder.build(), callback) }.isFailure) {
             // A synchronous throw answers with no callback at all, so this is the only place that can report
             // it. Clearing the flag alone left health green and nothing scheduled.
-            advStarting = false; onAdvState(false)
-            scheduleAdvRetry("start threw")
+            advAttempts.failIfCurrent(
+                callback,
+                // The start was never accepted, so there is no registration to chase: a plain stop, and
+                // deliberately NOT an orphan — an entry nothing can ever resolve would be swept forever.
+                stop = { runCatching { advertiser.stopAdvertising(it) } },
+                markFailed = {
+                    if (lastAdvCallback === callback) lastAdvCallback = null
+                    advStarting = false; advertising = false; onAdvState(false)
+                },
+                retry = { scheduleAdvRetry("start threw") },
+            )
         } else {
             // An accepted start normally answers with exactly one callback — except when the adapter is
             // turned off or the BT process dies under it, which drops the callback silently. Without this
             // the flag latches and we never advertise again.
-            handler.removeCallbacks(advStartWatchdog); handler.postDelayed(advStartWatchdog, ADV_START_TIMEOUT_MS)
+            handler.postDelayed(watchdog, ADV_START_TIMEOUT_MS)
         }
     }
 
@@ -637,27 +699,65 @@ class MirrorServer(
      *  onStartSuccess, so an early return here can leave a pending advert running with no trainer behind it. */
     private fun stopAdvertising() {
         handler.removeCallbacks(startAdvRunnable)
-        advertising = false
-        // NOT advStarting: a stop issued while a start is in flight is dropped by the stack, so the start
-        // is still coming. Only its callback may clear the flag, or we let a second start through.
-        runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(advCallback) }
+        val wasStarting = advStarting
+        // Clear waits for a callback already admitted by runIfCurrent; finalize flags only after it exits.
+        val callback = advAttempts.clear()
+        // advStarting IS cleared here now, unlike before. A stop issued while a start is in flight is dropped
+        // by the stack, so that start is still coming and a second one can get through — but it now builds a
+        // NEW callback, i.e. a separate registration, while this one is retired from the owner (its late
+        // callback is rejected) and handed to the orphan sweep, which keeps stopping it until its own
+        // callback arrives. So the extra registration is chased until it is provably gone, rather than
+        // stopped once on a delay that no Android contract actually bounds.
+        advertising = false; advStarting = false
+        callback ?: return
+        // Only an UNRESOLVED start needs the sweep: its stop can be dropped and nothing else holds the
+        // handle. A resolved attempt is stopped once, reliably, right here.
+        if (wasStarting) orphanAdvCallback(callback)
+        else {
+            if (lastAdvCallback === callback) lastAdvCallback = null
+            runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(callback) }
+        }
+    }
+
+    /** Retire a callback whose start never resolved: stop it now, and keep stopping it until its own
+     *  callback proves the registration is gone. [resolved] callbacks skip this — their result is known. */
+    private fun orphanAdvCallback(cb: AdvertiseCallback) {
+        advOrphans.add(cb)
+        if (lastAdvCallback === cb) lastAdvCallback = null
+        runCatching { adapter.bluetoothLeAdvertiser?.stopAdvertising(cb) }
+        advSweepMs = ADV_SWEEP_MS
+        orphanHandler.removeCallbacks(advSweep); orphanHandler.postDelayed(advSweep, advSweepMs)
+    }
+
+    /** An orphan's own callback finally arrived: that is the only proof the registration resolved. Also
+     *  the one place that can mark the process-wide handle resolved, for a later instance's handoff. */
+    private fun resolveAdvOrphan(cb: AdvertiseCallback) {
+        advOrphans.remove(cb)
+        if (lastAdvCallback === cb) lastAdvUnresolved = false
+    }
+
+    private var advSweepMs = ADV_SWEEP_MS
+    private val advSweep = object : Runnable {
+        override fun run() {
+            val advertiser = adapter.bluetoothLeAdvertiser
+            if (advertiser == null) {   // adapter off: every prior registration died with it
+                if (advOrphans.isNotEmpty()) FileLog.event("adapter off — dropping ${advOrphans.size} orphan advertising set(s)")
+                advOrphans.clear(); advSweepMs = ADV_SWEEP_MS
+                return
+            }
+            val current = advAttempts.current
+            // Snapshot under the lock, call the advertiser outside it. NEVER the current attempt.
+            val targets = synchronized(advOrphans) { advOrphans.toList() }.filter { it !== current }
+            for (cb in targets) runCatching { advertiser.stopAdvertising(cb) }
+            if (advOrphans.isEmpty()) { advSweepMs = ADV_SWEEP_MS; return }
+            advSweepMs = (advSweepMs * 2).coerceAtMost(ADV_SWEEP_MAX_MS)
+            orphanHandler.postDelayed(this, advSweepMs)
+        }
     }
 
     /** Force a fresh advertise (Android silently stopped it when a central connected, but our flag didn't
      *  know). Needed so more than one app can find us. */
     private val startAdvRunnable = Runnable { startAdvertising() }
-    /** A start that is accepted and then never answers. Clearing the latch is not enough: nothing else
-     *  retries, and `bleAdvOk` would stay at its optimistic true — a mirror off the air behind a green UI,
-     *  which is strictly worse to diagnose than a visible failure. Do what onStartFailure does, minus the
-     *  size-shedding (there is no error code to shed for). */
-    private val advStartWatchdog = Runnable {
-        if (advStarting) {
-            FileLog.event("advertise start never answered — clearing in-flight flag and retrying")
-            advStarting = false; advertising = false; onAdvState(false)
-            scheduleAdvRetry("start never answered")
-        }
-    }
-
     /**
      * The one place that re-arms advertising. A capped ATTEMPT COUNT was the bug this replaces: five
      * transient failures took the mirror off the air for the whole ride. A flat 1 s retry is the opposite
@@ -665,13 +765,8 @@ class MirrorServer(
      * hour, each one a log line, across a 4-12 h ride. So: backoff, no cap. The budget resets on a real
      * success and when the trainer link comes back.
      *
-     * ponytail: every attempt shares ONE AdvertiseCallback, because that object is also the handle
-     * stopAdvertising needs. So if a start's callback arrives after [ADV_START_TIMEOUT_MS] the watchdog can
-     * have already started a second attempt, and the two callbacks are indistinguishable — a late success
-     * for A cancels B's watchdog, a late failure for B clears `advertising` while A is really on air. The
-     * timeout is set well past any plausible stack latency so this needs a genuinely lost callback AND a
-     * slow one; closing it properly means a fresh callback object per attempt plus tracking which one owns
-     * the live set. Backoff bounds the damage to a self-healing flap.
+     * Each attempt owns a distinct callback. Its watchdog retires that registration before scheduling the
+     * retry, so callbacks from an old attempt cannot cancel or mutate the current one.
      */
     private fun scheduleAdvRetry(why: String) {
         if (stopped) return
@@ -704,7 +799,34 @@ class MirrorServer(
     }
 
     private companion object {
+        /**
+         * Callbacks retired while their start was STILL UNRESOLVED — and only those. The callback IS the
+         * controller registration, and a stop issued while its start is in flight is dropped by the stack,
+         * so such an attempt can stay registered with nothing holding its handle: an advertiser slot burnt,
+         * or an obsolete mirror on the air, until Bluetooth restarts. Membership ends only when that
+         * attempt's OWN callback is finally delivered, because nothing else proves the registration is gone.
+         *
+         * Deliberately NOT every started attempt: a sweep must never stop the live one. An attempt whose
+         * result is already known (onStartFailure, a synchronous throw — the start was never accepted) is
+         * not an orphan either.
+         *
+         * Process-wide: an orphan has to outlive the MirrorServer that created it, which is the whole point.
+         *
+         * ponytail: stopAdvertising() does not confirm removal and a start can stay in flight past
+         * ADV_START_TIMEOUT_MS, so NO finite delay can guarantee the retirement lands. The sweep backs off
+         * to ADV_SWEEP_MAX_MS and keeps trying while the set is non-empty; a null advertiser (adapter off)
+         * is the one piece of evidence that every prior registration is definitively gone.
+         */
+        private val advOrphans: MutableSet<android.bluetooth.le.AdvertiseCallback> =
+            java.util.Collections.synchronizedSet(mutableSetOf())
+        /** NOT the instance handler: stop() drains that one, and an orphan must outlive its mirror. */
+        private val orphanHandler by lazy { Handler(Looper.getMainLooper()) }
         @Volatile private var lastAdvCallback: android.bluetooth.le.AdvertiseCallback? = null
+        /** Whether [lastAdvCallback]'s start is still UNRESOLVED. A bare reference cannot say: a callback
+         *  that already got its onStartSuccess is registered but RESOLVED, so the next instance must stop it
+         *  once — never adopt it as an orphan, which nothing could ever resolve and the sweep would chase
+         *  every 30 s for the life of the process. */
+        @Volatile private var lastAdvUnresolved = false
         const val KEY_ADV_NAMES = "advertisedNamesUsed"
         const val KEY_ORIG_NAME = "origBtName"
     }
