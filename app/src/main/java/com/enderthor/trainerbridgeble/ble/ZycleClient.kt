@@ -126,18 +126,20 @@ class ZycleClient(
 
     override fun stop() {
         stopped = true
-        // BEFORE anything reads `gatt`: an in-flight connectGatt() then fails its ownership check and closes
-        // its own handle. Both paths cross this monitor, and this clear precedes the `gatt` read below, so
+        // BEFORE clearing the GATT session: an in-flight connectGatt() then fails its ownership check and closes
+        // its own handle. Both paths cross this monitor, and this clear precedes the session clear below, so
         // either the attempt published first (and the read closes it) or it never publishes at all.
         connectAttempts.clear()
         connecting.set(false)
+        // Session ownership is the admission barrier: enqueueWrite either registers its ticket before this
+        // clear returns, or observes no current session and completes false itself.
+        val session = gattSessions.clear()
         completePendingWrites(false)
         inFlightWrite = null
         stopScan()
         handler.removeCallbacksAndMessages(null)   // heartbeat, rescan, connect/op watchdogs, write retries
         opQueue.clear(); opBusy.set(false)
-        gatt?.let { runCatching { it.disconnect() }; runCatching { it.close() } }
-        gatt = null
+        session?.let { runCatching { it.disconnect() }; runCatching { it.close() } }
     }
 
     /** ANT-learned: a GATT link can stay "connected" while notifications silently stop (no disconnect

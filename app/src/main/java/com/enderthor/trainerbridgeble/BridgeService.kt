@@ -154,6 +154,7 @@ class BridgeService : Service() {
                 true,
             ) { success ->
                 handler.post {
+                    if (client !== source) return@post
                     if (success) {
                         // This path bypasses the mirror, so retire ERG learning only after the trainer write.
                         ErgBias.onControl(bytes, android.os.SystemClock.elapsedRealtime())
