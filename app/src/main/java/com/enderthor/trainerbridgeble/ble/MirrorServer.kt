@@ -23,6 +23,7 @@ import android.util.Log
 import com.enderthor.trainerbridgeble.AdvertisingAttemptCoordinator
 import com.enderthor.trainerbridgeble.FileLog
 import com.enderthor.trainerbridgeble.FtmsControlCoordinator
+import com.enderthor.trainerbridgeble.IdentityOwner
 import com.enderthor.trainerbridgeble.R
 import com.enderthor.trainerbridgeble.correction.PowerCorrection
 import java.util.ArrayDeque
@@ -75,6 +76,9 @@ class MirrorServer(
     private val ADV_RETRY_MAX_MS = 30_000L   // backoff ceiling; there is no attempt cap (see scheduleAdvRetry)
     private val SERVICE_RETRY_MS = 300L
     private val SERVICE_MAX_RETRIES = 5
+    private val SERVICE_ADD_TIMEOUT_MS = 8000L
+    private val SERVICE_REBUILD_MS = 2000L
+    private val SERVICE_REBUILD_MAX_MS = 30_000L
     // Generous on purpose: this must only ever fire for a callback that is genuinely LOST (adapter off, BT
     // process died). Firing it for one that is merely slow starts a second attempt against the same shared
     // callback object — see scheduleAdvRetry's note.
@@ -90,6 +94,9 @@ class MirrorServer(
     private val LEVEL_SETTLE_MS = 3000L
     @Volatile private var serviceRetries = 0
     private val serviceRetryRunnable = Runnable { if (server != null) addNextService() }
+    private val serviceAddOwner = IdentityOwner<BluetoothGattService>()
+    @Volatile private var serviceAddWatchdog: Runnable? = null
+    @Volatile private var serviceRebuildMs = SERVICE_REBUILD_MS
     private val ADVERTISE_FAILED_DATA_TOO_LARGE = 1
     private val cccd: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     private val ATT_UNLIKELY_ERROR = 0x0E
@@ -203,6 +210,7 @@ class MirrorServer(
     @Volatile private var stopped = false
     /** A profile handed to [build] before the server existed, replayed once it does. */
     @Volatile private var pendingProfile: GattProfile? = null
+    @Volatile private var latestProfile: GattProfile? = null
 
     /** Rename the adapter to our advertised name, persisting the ORIGINAL to prefs so a process kill (which
      *  skips stop()) doesn't lose the user's real Bluetooth name — and so we never capture our own rename. */
@@ -256,6 +264,7 @@ class MirrorServer(
      *  services + characteristics (re-adding them would strand apps still subscribed to the old instances
      *  and there is no clean live rebuild). */
     fun build(profile: GattProfile) {
+        latestProfile = profile
         // No server yet (it is being retried): hold the profile rather than drop it, or a server that opens
         // on the second attempt would have no services and would therefore never advertise. Under the same
         // lock openServer() claims it with, so the read and the store cannot straddle the handover.
@@ -316,12 +325,20 @@ class MirrorServer(
     /** PEEK, don't poll: the service stays at the head until its own onServiceAdded confirms it. Removing it
      *  up front let a late success (the stack had queued the "refused" add after all) and the retry both
      *  drive the chain — adding a service twice and letting `servicesReady` fire with an add still in flight. */
-    private fun addNextService() {
+    @Synchronized private fun addNextService() {
+        if (serviceAddOwner.current != null) return
         val svc = pendingServices.peek() ?: return
-        if (runCatching { server?.addService(svc) }.getOrNull() != true) {
+        if (runCatching { server?.addService(svc) }.getOrNull() == true) {
+            serviceAddOwner.replace(svc)
+            val watchdog = Runnable {
+                if (serviceAddOwner.clearIfCurrent(svc) { serviceAddWatchdog = null })
+                    rebuildServer("addService callback timeout for ${shortUuid(svc.uuid)}")
+            }
+            serviceAddWatchdog = watchdog
+            handler.postDelayed(watchdog, SERVICE_ADD_TIMEOUT_MS)
+        } else {
             if (serviceRetries++ >= SERVICE_MAX_RETRIES) {
-                FileLog.event("mirror addService REFUSED for ${shortUuid(svc.uuid)} — giving up, releasing build latch")
-                built.set(false)   // so the next discovery can rebuild instead of staying silent forever
+                rebuildServer("addService refused for ${shortUuid(svc.uuid)}")
                 return
             }
             FileLog.event("mirror addService REFUSED for ${shortUuid(svc.uuid)} — retry ${serviceRetries}")
@@ -329,10 +346,38 @@ class MirrorServer(
         }
     }
 
+    private fun rebuildServer(reason: String) {
+        if (stopped) return
+        val wait = serviceRebuildMs
+        serviceRebuildMs = (wait * 2).coerceAtMost(SERVICE_REBUILD_MAX_MS)
+        FileLog.event("mirror service build failed: $reason — reopening in ${wait}ms")
+        servicesReady = false
+        built.set(false)
+        serviceAddOwner.clear()
+        serviceAddWatchdog?.let { handler.removeCallbacks(it) }
+        serviceAddWatchdog = null
+        handler.removeCallbacks(serviceRetryRunnable)
+        pendingServices.clear()
+        chars.clear()
+        val failedServer = synchronized(serverLock) {
+            server.also {
+                server = null
+                pendingProfile = latestProfile
+            }
+        }
+        runCatching { failedServer?.close() }
+        onAdvState(false)
+        handler.removeCallbacks(serverRetryRunnable)
+        handler.postDelayed(serverRetryRunnable, wait)
+    }
+
     fun stop() {
         // Stop the advertiser UNCONDITIONALLY: the `advertising` flag is transiently false mid-restart, so
         // trusting it here can leave the phone broadcasting with a closed GATT server.
-        stopped = true; pendingProfile = null; servicesReady = false
+        stopped = true; pendingProfile = null; latestProfile = null; servicesReady = false
+        serviceAddOwner.clear()
+        serviceAddWatchdog?.let { handler.removeCallbacks(it) }
+        serviceAddWatchdog = null
         ftmsControl.clear()
         stopAdvertising()
         handler.removeCallbacksAndMessages(null)   // pending adv starts / service retries must not outlive us
@@ -479,15 +524,20 @@ class MirrorServer(
 
     private val serverCallback = object : BluetoothGattServerCallback() {
         override fun onServiceAdded(status: Int, service: BluetoothGattService?) {
+            val added = service ?: return
+            if (!serviceAddOwner.clearIfCurrent(added) {
+                    serviceAddWatchdog?.let { handler.removeCallbacks(it) }
+                    serviceAddWatchdog = null
+                }) return
             // A callback still in flight when stop() ran would otherwise find pendingServices empty, set
             // servicesReady and post a start — putting us back on the air with a closed GATT server.
             if (stopped || server == null) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 // don't poll it: retry the head rather than advertise a mirror missing a service
-                FileLog.event("mirror addService FAILED status=$status for ${shortUuid(service?.uuid)} — retrying head")
+                FileLog.event("mirror addService FAILED status=$status for ${shortUuid(added.uuid)} — retrying head")
                 if (serviceRetries++ < SERVICE_MAX_RETRIES) {
                     handler.removeCallbacks(serviceRetryRunnable); handler.postDelayed(serviceRetryRunnable, SERVICE_RETRY_MS)
-                } else { FileLog.event("mirror giving up on ${shortUuid(service?.uuid)} — releasing build latch"); built.set(false) }
+                } else rebuildServer("addService callback status=$status for ${shortUuid(added.uuid)}")
                 return
             }
             handler.removeCallbacks(serviceRetryRunnable)   // a stale retry would add the NEXT service twice
@@ -495,6 +545,7 @@ class MirrorServer(
             serviceRetries = 0
             if (pendingServices.isEmpty()) {   // the mirrored GATT is complete
                 servicesReady = true
+                serviceRebuildMs = SERVICE_REBUILD_MS
                 handler.post { startAdvertising() }
             } else addNextService()
         }

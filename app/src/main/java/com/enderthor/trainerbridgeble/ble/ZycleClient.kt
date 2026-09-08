@@ -16,6 +16,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import com.enderthor.trainerbridgeble.FileLog
+import com.enderthor.trainerbridgeble.FtmsBootstrapReadiness
 import com.enderthor.trainerbridgeble.GattSessionCoordinator
 import com.enderthor.trainerbridgeble.IdentityOwner
 import com.enderthor.trainerbridgeble.TrainerWriteTicket
@@ -58,6 +59,7 @@ class ZycleClient(
             onState(false)
             completePendingWrites(false)
             opQueue.clear(); opBusy.set(false); syncOwed.set(false); burstEnqueued = false
+            bootstrapReadiness = null
             connecting.set(false); inFlightWrite = null
         },
         disconnect = { runCatching { it.disconnect() } },
@@ -89,12 +91,14 @@ class ZycleClient(
     private val opBusy = AtomicBoolean(false)
     private val syncOwed = AtomicBoolean(false)      // onSynced not yet delivered for THIS connection
     @Volatile private var burstEnqueued = false      // the opening read/subscribe burst is in the queue
+    @Volatile private var bootstrapReadiness: FtmsBootstrapReadiness? = null
 
     /** Deliver [onSynced] at most once per connection, on the main thread, and never for a link that has
      *  dropped in the meantime: a stale delivery would put the mirror on the air with no trainer behind it,
      *  and setTrainerLinked is edge-triggered, so it would STAY there. */
     private fun fireSynced(g: BluetoothGatt) {
         gattSessions.runIfCurrent(g) {
+            if (bootstrapReadiness?.ready != true) return@runIfCurrent
             if (!syncOwed.compareAndSet(true, false)) return@runIfCurrent
             handler.post { if (!stopped) gattSessions.runIfCurrent(g) { onSynced() } }
         }
@@ -138,7 +142,7 @@ class ZycleClient(
         inFlightWrite = null
         stopScan()
         handler.removeCallbacksAndMessages(null)   // heartbeat, rescan, connect/op watchdogs, write retries
-        opQueue.clear(); opBusy.set(false)
+        opQueue.clear(); opBusy.set(false); bootstrapReadiness = null
         session?.let { runCatching { it.disconnect() }; runCatching { it.close() } }
     }
 
@@ -412,15 +416,19 @@ class ZycleClient(
                     retryMs = SCAN_RETRY_MS   // a good connection resets the backoff
                     everConnected = true      // ...and promotes every later scan to the reacquisition duty cycle
                     lastMessageMs = android.os.SystemClock.elapsedRealtime()   // start the silent-link window at connect
-                    syncOwed.set(true); burstEnqueued = false
+                    syncOwed.set(true); burstEnqueued = false; bootstrapReadiness = null
                     onState(true)
                     handler.post { runCatching { g.discoverServices() } }
-                    // Floor under the mirror going on the air. Discovery can fail, be refused by the stack, or
-                    // yield a profile with nothing to read; and a lost GATT callback costs OP_TIMEOUT_MS each.
-                    // Waiting forever for a perfect sync is worse than advertising with a partial cache.
+                    // A fallback may shorten a slow queue only after every required bootstrap result exists.
+                    // Advertising a controllable profile without Feature/control or any power stream makes
+                    // the client cache a broken trainer for the whole session.
                     handler.postDelayed({
-                        if (syncOwed.get()) FileLog.event("Zycle sync fallback ${SYNC_FALLBACK_MS}ms -> advertising anyway")
-                        fireSynced(g)
+                        gattSessions.runIfCurrent(g) {
+                            if (syncOwed.get() && bootstrapReadiness?.ready == true) {
+                                FileLog.event("Zycle sync fallback ${SYNC_FALLBACK_MS}ms -> required bootstrap ready")
+                                fireSynced(g)
+                            }
+                        }
                     }, SYNC_FALLBACK_MS)
                 }) runCatching { g.close() }   // orphaned handle — drop it
             } else {
@@ -440,10 +448,16 @@ class ZycleClient(
             gattSessions.runIfCurrent(g) {
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     Log.w(tag, "discover failed $status"); FileLog.event("Zycle discover FAILED status=$status")
+                    recycleGatt(g, "service discovery failed status=$status")
                     return@runIfCurrent
                 }
                 lastMessageMs = android.os.SystemClock.elapsedRealtime()
                 val profile = buildProfile(g)
+                bootstrapReadiness = FtmsBootstrapReadiness(
+                    controllable = profile.services.any { service ->
+                        service.chars.any { it.uuid == GattUuids.FTMS_CONTROL_POINT }
+                    },
+                )
                 FileLog.event("Zycle profile: " + profile.services.joinToString("; ") { s ->
                     "${s.uuid}[" + s.chars.joinToString(",") { "${shortUuid(it.uuid)}(p=${it.properties})" } + "]"
                 })
@@ -467,7 +481,9 @@ class ZycleClient(
                     for (svc in svcs) for (ch in svc.characteristics)
                         if (ch.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) enqueueRead(g, ch)
                     for (svc in svcs) for (ch in svc.characteristics)
-                        if (ch.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0)
+                        if (ch.uuid != GattUuids.INDOOR_BIKE_DATA &&
+                            ch.uuid != GattUuids.CYCLING_POWER_MEASUREMENT &&
+                            ch.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0)
                             enqueueSubscribe(g, ch)
                 } finally { burstBuilding = false }
                 // Also drains a profile with nothing readable/notifiable instead of hanging the sync latch.
@@ -478,6 +494,7 @@ class ZycleClient(
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             gattSessions.runIfCurrent(g) {
                 val u = descriptor.characteristic.uuid
+                if (descriptor.uuid == cccd) markBootstrapSubscription(u, status == BluetoothGatt.GATT_SUCCESS)
                 if (status != BluetoothGatt.GATT_SUCCESS)
                     FileLog.event("Zycle subscribe ${shortUuid(u)} FAILED status=$status")
                 lastMessageMs = android.os.SystemClock.elapsedRealtime()
@@ -497,6 +514,7 @@ class ZycleClient(
                     FileLog.event("Zycle read ${shortUuid(ch.uuid)} = ${FileLog.hex(v)}")   // identity/feature/ranges values
                     onValue(ch.uuid, v)
                 } else FileLog.event("Zycle read ${shortUuid(ch.uuid)} failed status=$status")
+                if (ch.uuid == FTMS_FEATURE) bootstrapReadiness?.featureRead = status == BluetoothGatt.GATT_SUCCESS
                 lastMessageMs = android.os.SystemClock.elapsedRealtime()
                 opDone()
             }
@@ -561,7 +579,12 @@ class ZycleClient(
     private fun enqueueSubscribe(g: BluetoothGatt, ch: BluetoothGattCharacteristic, retry: Boolean = true): Unit = enqueue {
         g.setCharacteristicNotification(ch, true)
         val d = ch.getDescriptor(cccd)
-        if (d == null) { FileLog.event("Zycle subscribe ${shortUuid(ch.uuid)} — no CCCD"); opDone(); return@enqueue }
+        if (d == null) {
+            markBootstrapSubscription(ch.uuid, false)
+            FileLog.event("Zycle subscribe ${shortUuid(ch.uuid)} — no CCCD")
+            opDone()
+            return@enqueue
+        }
         FileLog.event("Zycle subscribe ${shortUuid(ch.uuid)}")
         @Suppress("DEPRECATION")
         run {
@@ -569,8 +592,15 @@ class ZycleClient(
                 BluetoothGattDescriptor.ENABLE_INDICATION_VALUE else BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
             if (g.writeDescriptor(d) != true) {
                 FileLog.event("Zycle subscribe ${shortUuid(ch.uuid)} REFUSED by stack" + if (retry) " — requeueing" else " — giving up")
-                if (retry) handler.postDelayed({ if (!stopped && gatt === g) enqueueSubscribe(g, ch, retry = false) }, OP_REQUEUE_MS)
-                opDone()
+                if (retry) handler.postDelayed({
+                    gattSessions.runIfCurrent(g) {
+                        enqueueSubscribe(g, ch, retry = false)
+                        opDone()
+                    }
+                }, OP_REQUEUE_MS) else {
+                    markBootstrapSubscription(ch.uuid, false)
+                    opDone()
+                }
             }
         }
     }
@@ -578,8 +608,23 @@ class ZycleClient(
     private fun enqueueRead(g: BluetoothGatt, ch: BluetoothGattCharacteristic, retry: Boolean = true): Unit = enqueue {
         if (g.readCharacteristic(ch) != true) {
             FileLog.event("Zycle read ${shortUuid(ch.uuid)} REFUSED by stack" + if (retry) " — requeueing" else " — giving up")
-            if (retry) handler.postDelayed({ if (!stopped && gatt === g) enqueueRead(g, ch, retry = false) }, OP_REQUEUE_MS)
-            opDone()
+            if (retry) handler.postDelayed({
+                gattSessions.runIfCurrent(g) {
+                    enqueueRead(g, ch, retry = false)
+                    opDone()
+                }
+            }, OP_REQUEUE_MS) else {
+                if (ch.uuid == FTMS_FEATURE) bootstrapReadiness?.featureRead = false
+                opDone()
+            }
+        }
+    }
+
+    private fun markBootstrapSubscription(uuid: UUID, success: Boolean) {
+        when (uuid) {
+            GattUuids.FTMS_CONTROL_POINT -> bootstrapReadiness?.controlPointSubscribed = success
+            GattUuids.INDOOR_BIKE_DATA -> bootstrapReadiness?.indoorBikeSubscribed = success
+            GattUuids.CYCLING_POWER_MEASUREMENT -> bootstrapReadiness?.cyclingPowerSubscribed = success
         }
     }
 
@@ -599,7 +644,15 @@ class ZycleClient(
             if (op == null) {
                 opBusy.set(false)
                 // Drained: the opening burst is done, so the mirror now has every readable value we can give it.
-                if (burstEnqueued) gatt?.let { fireSynced(it) }
+                if (burstEnqueued && syncOwed.get()) gatt?.let { session ->
+                    val readiness = bootstrapReadiness
+                    if (readiness?.ready == true) fireSynced(session)
+                    else {
+                        val missing = readiness?.missingRequirements?.joinToString() ?: "service discovery"
+                        FileLog.event("Zycle bootstrap incomplete: $missing -> reconnect")
+                        recycleGatt(session, "bootstrap missing $missing")
+                    }
+                }
                 return
             }
             val session = gatt
@@ -633,6 +686,7 @@ class ZycleClient(
         const val CONTROL_WRITE_RETRIES = 2       // resend a control write that NAKs (status 133) up to twice
         const val CONTROL_RETRY_DELAY_MS = 250L
         const val OP_TIMEOUT_MS = 4000L           // unstick the GATT queue if a callback is ever lost (flaky link)
-        const val SYNC_FALLBACK_MS = 6000L        // go on the air with a partial cache rather than never
+        const val SYNC_FALLBACK_MS = 6000L        // only shorten a slow queue after required bootstrap is ready
+        val FTMS_FEATURE: UUID = GattUuids.uuid16(0x2ACC)
     }
 }

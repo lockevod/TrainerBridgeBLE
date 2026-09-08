@@ -17,6 +17,25 @@ internal fun encodeTargetResistance(target: Int): ByteArray {
     return byteArrayOf(0x04, (value and 0xFF).toByte(), ((value ushr 8) and 0xFF).toByte())
 }
 
+internal class FtmsBootstrapReadiness(
+    val controllable: Boolean,
+) {
+    var featureRead = false
+    var controlPointSubscribed = false
+    var indoorBikeSubscribed = false
+    var cyclingPowerSubscribed = false
+
+    val ready: Boolean get() =
+        (!controllable || featureRead && controlPointSubscribed) &&
+            (indoorBikeSubscribed || cyclingPowerSubscribed)
+
+    val missingRequirements: List<String> get() = buildList {
+        if (controllable && !featureRead) add("FTMS Feature read")
+        if (controllable && !controlPointSubscribed) add("FTMS Control Point subscription")
+        if (!indoorBikeSubscribed && !cyclingPowerSubscribed) add("Indoor Bike or Cycling Power subscription")
+    }
+}
+
 internal class FtmsControlCoordinator {
     data class Client(val address: String, val generation: Long)
     data class Procedure(val client: Client?, val opcode: Int)

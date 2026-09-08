@@ -215,6 +215,70 @@ class RuntimeHardeningTest {
     }
 
     // ── emit ownership (BridgeService.toZycle / stopEmit) ─────────────────────────────────────────
+    @Test fun controllableFtmsRequiresFeatureControlPointAndOnePowerStream() {
+        val readiness = FtmsBootstrapReadiness(controllable = true)
+
+        assertFalse(readiness.ready)
+        assertEquals(
+            listOf(
+                "FTMS Feature read",
+                "FTMS Control Point subscription",
+                "Indoor Bike or Cycling Power subscription",
+            ),
+            readiness.missingRequirements,
+        )
+        readiness.featureRead = true
+        assertFalse(readiness.ready)
+        assertEquals(
+            listOf("FTMS Control Point subscription", "Indoor Bike or Cycling Power subscription"),
+            readiness.missingRequirements,
+        )
+        readiness.controlPointSubscribed = true
+        assertFalse(readiness.ready)
+        assertEquals(listOf("Indoor Bike or Cycling Power subscription"), readiness.missingRequirements)
+        readiness.indoorBikeSubscribed = true
+        assertTrue(readiness.ready)
+        assertTrue(readiness.missingRequirements.isEmpty())
+    }
+
+    @Test fun eitherIndoorBikeOrCyclingPowerSubscriptionSatisfiesPower() {
+        val indoorBike = FtmsBootstrapReadiness(controllable = true).apply {
+            featureRead = true
+            controlPointSubscribed = true
+            indoorBikeSubscribed = true
+        }
+        val cyclingPower = FtmsBootstrapReadiness(controllable = true).apply {
+            featureRead = true
+            controlPointSubscribed = true
+            cyclingPowerSubscribed = true
+        }
+
+        assertTrue(indoorBike.ready)
+        assertTrue(cyclingPower.ready)
+    }
+
+    @Test fun readOnlyProfileDoesNotRequireControlPoint() {
+        val readiness = FtmsBootstrapReadiness(controllable = false).apply {
+            indoorBikeSubscribed = true
+        }
+
+        assertTrue(readiness.ready)
+    }
+
+    @Test fun staleServiceAddCallbackCannotCompleteReplacementAttempt() {
+        val attempts = IdentityOwner<Any>()
+        val staleService = Any()
+        val replacementService = Any()
+        var completed: Any? = null
+        attempts.replace(staleService)
+        attempts.replace(replacementService)
+
+        assertFalse(attempts.clearIfCurrent(staleService) { completed = staleService })
+        assertNull(completed)
+        assertTrue(attempts.clearIfCurrent(replacementService) { completed = replacementService })
+        assertEquals(replacementService, completed)
+    }
+
     /** The point of the emit token: a write admitted by the OLD mirror must never capture the NEW source. */
     @Test fun aStaleMirrorWriteCannotCaptureTheReplacementSource() {
         val emitOwner = IdentityOwner<Any>()
