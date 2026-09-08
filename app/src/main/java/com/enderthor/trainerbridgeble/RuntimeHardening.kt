@@ -18,44 +18,59 @@ internal fun encodeTargetResistance(target: Int): ByteArray {
 }
 
 internal class FtmsControlCoordinator {
-    data class Procedure(val client: String, val opcode: Int)
+    data class Client(val address: String, val generation: Long)
+    data class Procedure(val client: Client?, val opcode: Int)
 
     sealed interface Admission {
         data class Admitted(val procedure: Procedure) : Admission
         data class Rejected(val result: Int) : Admission
     }
 
-    private var owner: String? = null
+    private var owner: Client? = null
     private var pending: Procedure? = null
+    private var invalidSession = false
 
-    @Synchronized fun admit(client: String, opcode: Int): Admission {
-        if (pending != null) return Admission.Rejected(OPERATION_FAILED)
+    @Synchronized fun admit(client: Client, opcode: Int): Admission {
+        if (invalidSession || pending != null) return Admission.Rejected(OPERATION_FAILED)
         if (if (opcode == REQUEST_CONTROL) owner != null && owner != client else owner != client)
             return Admission.Rejected(CONTROL_NOT_PERMITTED)
         return Procedure(client, opcode).let { pending = it; Admission.Admitted(it) }
     }
 
-    @Synchronized fun transportFailed(client: String, opcode: Int): String? {
+    @Synchronized fun admitLocal(opcode: Int): Boolean {
+        if (invalidSession || owner != null || pending != null) return false
+        pending = Procedure(null, opcode)
+        return true
+    }
+
+    @Synchronized fun transportFailed(client: Client?, opcode: Int): Client? {
         if (pending != Procedure(client, opcode)) return null
         pending = null
         return client
     }
 
-    @Synchronized fun response(opcode: Int, result: Int): String? {
+    @Synchronized fun response(opcode: Int, result: Int): Client? {
+        if (invalidSession) return null
         val procedure = pending?.takeIf { it.opcode == opcode } ?: return null
         pending = null
-        if (opcode == REQUEST_CONTROL && result == SUCCESS) owner = procedure.client
+        if (procedure.client != null && opcode == REQUEST_CONTROL && result == SUCCESS) owner = procedure.client
         return procedure.client
     }
 
-    @Synchronized fun disconnect(client: String) {
+    @Synchronized fun disconnect(client: Client): Boolean {
+        val lostPending = pending?.client == client
         if (owner == client) owner = null
-        if (pending?.client == client) pending = null
+        if (lostPending) { pending = null; invalidSession = true }
+        return lostPending
     }
 
-    @Synchronized fun trainerDropped(): String? = owner.also { owner = null; pending = null }
+    @Synchronized fun trainerDropped(): Client? = owner.also {
+        owner = null; pending = null
+    }
 
-    @Synchronized fun clear() { owner = null; pending = null }
+    @Synchronized fun trainerReady() { invalidSession = false }
+
+    @Synchronized fun clear() { owner = null; pending = null; invalidSession = false }
 
     companion object {
         const val SUCCESS = 0x01

@@ -44,6 +44,7 @@ class MirrorServer(
     private val advertisedName: String,
     private val correction: () -> PowerCorrection,
     private val toZycle: (charUuid: UUID, bytes: ByteArray, withResponse: Boolean, onComplete: (Boolean) -> Unit) -> Boolean,
+    private val onTrainerRecycle: () -> Unit = {},
     private val onStatus: (String) -> Unit = {},
     /** Health report to the UI: true once we're actually advertising; false if the server/advertising fails. */
     private val onAdvState: (Boolean) -> Unit = {},
@@ -62,6 +63,8 @@ class MirrorServer(
     private val cache = ConcurrentHashMap<UUID, ByteArray>()                            // last value (power corrected)
     private val subscribers = ConcurrentHashMap<UUID, MutableSet<String>>()             // char uuid → subscribed client addrs
     private val clients = ConcurrentHashMap<String, BluetoothDevice>()                  // connected centrals
+    private val clientKeys = ConcurrentHashMap<String, FtmsControlCoordinator.Client>()
+    private val clientGeneration = java.util.concurrent.atomic.AtomicLong()
     private val ftmsControl = FtmsControlCoordinator()
     // touched from the GATT server binder thread, the client's binder thread and main — a plain ArrayDeque
     // can throw mid-poll when stop() clears it, and an exception on a binder callback kills the process
@@ -91,6 +94,8 @@ class MirrorServer(
     private val cccd: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     private val ATT_UNLIKELY_ERROR = 0x0E
     private val ATT_INVALID_OFFSET = 0x07
+    private val ATT_REQUEST_NOT_SUPPORTED = 0x06
+    private val ATT_INVALID_ATTRIBUTE_VALUE_LENGTH = 0x0D
     private var originalName: String? = null
     @Volatile private var advertising = false
     @Volatile private var advStarting = false   // a start is in flight; `advertising` only flips in the callback
@@ -109,9 +114,10 @@ class MirrorServer(
      *  starts advertising again the moment it drops — so advertising with no trainer behind us puts two
      *  identical devices in the air and lets an app bind to a bridge that has no data to give it. */
     fun setTrainerLinked(linked: Boolean) {
+        if (linked) ftmsControl.trainerReady()
         val controller = if (linked) null else ftmsControl.trainerDropped()
         if (trainerLinked == linked) {
-            controller?.let { address -> handler.post { clients[address]?.let { server?.cancelConnection(it) } } }
+            controller?.let { handler.post { cancelClient(it) } }
             return
         }
         trainerLinked = linked
@@ -127,7 +133,7 @@ class MirrorServer(
         handler.post {
             if (linked) startAdvertising() else {
                 stopAdvertising()
-                controller?.let { address -> clients[address]?.let { server?.cancelConnection(it) } }
+                controller?.let { cancelClient(it) }
             }
         }
     }
@@ -335,7 +341,7 @@ class MirrorServer(
         server = null
         restoreName()
         built.set(false); advBlueprint = null
-        chars.clear(); cache.clear(); subscribers.clear(); clients.clear(); pendingServices.clear()
+        chars.clear(); cache.clear(); subscribers.clear(); clients.clear(); clientKeys.clear(); pendingServices.clear()
         shownZycleLevel = null; lastRawZycleLevel = null; lastControlWriteMs = 0L; servoStepOwed = false; reanchorLevel = false
     }
 
@@ -367,6 +373,9 @@ class MirrorServer(
      *  drifted from the machine's (shown/raw — they diverge by every servo step we absorbed, by design). */
     val clientCount: Int get() = clients.size
     val levelDebug: String get() = "${shownZycleLevel ?: "-"}/${lastRawZycleLevel ?: "-"}"
+
+    fun admitLocalControl(opcode: Int): Boolean = ftmsControl.admitLocal(opcode)
+    fun localControlTransportFailed(opcode: Int) { ftmsControl.transportFailed(null, opcode) }
 
     /** A value arrived from the trainer: correct power, cache, and notify every subscribed client. */
     fun onZycleValue(charUuid: UUID, value: ByteArray) {
@@ -448,18 +457,24 @@ class MirrorServer(
         }
     }
 
-    private fun notifyControlResult(client: String, value: ByteArray) {
+    private fun notifyControlResult(client: FtmsControlCoordinator.Client, value: ByteArray) {
         val uuid = GattUuids.FTMS_CONTROL_POINT
         val ch = chars[uuid] ?: return
         val subs = subscribers[uuid] ?: return
-        if (!synchronized(subs) { subs.contains(client) }) return
+        if (clientKeys[client.address] != client || !synchronized(subs) { subs.contains(client.address) }) return
         handler.post {
             val srv = server ?: return@post
-            val dev = clients[client] ?: return@post
+            if (clientKeys[client.address] != client) return@post
+            val dev = clients[client.address] ?: return@post
             val currentSubs = subscribers[uuid] ?: return@post
-            if (!synchronized(currentSubs) { currentSubs.contains(client) }) return@post
+            if (!synchronized(currentSubs) { currentSubs.contains(client.address) }) return@post
             notify(srv, dev, ch, value, ch.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)
         }
+    }
+
+    private fun cancelClient(client: FtmsControlCoordinator.Client) {
+        if (clientKeys[client.address] != client) return
+        clients[client.address]?.let { server?.cancelConnection(it) }
     }
 
     private val serverCallback = object : BluetoothGattServerCallback() {
@@ -491,16 +506,19 @@ class MirrorServer(
                 return
             }
             if (newState == android.bluetooth.BluetoothProfile.STATE_CONNECTED) {
-                clients[device.address] = device; onStatus(context.getString(R.string.status_app_connected, clients.size))
+                clientKeys[device.address] = FtmsControlCoordinator.Client(device.address, clientGeneration.incrementAndGet())
+                clients[device.address] = device
+                onStatus(context.getString(R.string.status_app_connected, clients.size))
                 FileLog.event("app connected ${device.address} status=$status (${clients.size} total)")
                 // Android stops connectable advertising once a central connects — restart it so a SECOND
                 // central (e.g. the Garmin) can still discover us.
                 handler.post { restartAdvertising() }
             } else {
-                ftmsControl.disconnect(device.address)
+                val lostPending = clientKeys.remove(device.address)?.let { ftmsControl.disconnect(it) } == true
                 clients.remove(device.address); subscribers.values.forEach { it.remove(device.address) }
                 onStatus(context.getString(R.string.status_app_disconnected, clients.size))
                 FileLog.event("app disconnected ${device.address} status=$status (${clients.size} left)")
+                if (lostPending) handler.post(onTrainerRecycle)
                 handler.post { restartAdvertising() }   // the controller stopped our advert when it connected
             }
         }
@@ -528,6 +546,20 @@ class MirrorServer(
         override fun onCharacteristicWriteRequest(device: BluetoothDevice?, requestId: Int, ch: BluetoothGattCharacteristic?,
             preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray?) {
             val uuid = ch?.uuid
+            if (preparedWrite && uuid == GattUuids.FTMS_CONTROL_POINT) {
+                FileLog.event("app write ${shortUuid(uuid)} <- ${device?.address} PREPARED rejected")
+                if (responseNeeded) runCatching {
+                    server?.sendResponse(device, requestId, ATT_REQUEST_NOT_SUPPORTED, offset, null)
+                }
+                return
+            }
+            if (uuid == GattUuids.FTMS_CONTROL_POINT && value?.isEmpty() == true) {
+                FileLog.event("app write ${shortUuid(uuid)} <- ${device?.address} empty rejected")
+                if (responseNeeded) runCatching {
+                    server?.sendResponse(device, requestId, ATT_INVALID_ATTRIBUTE_VALUE_LENGTH, offset, null)
+                }
+                return
+            }
             var relayed = false
             val tag = "${shortUuid(uuid)} <- ${device?.address}" +
                 (if (preparedWrite) " PREPARED off=$offset" else "") + (if (!responseNeeded) " noResp" else "")
@@ -542,9 +574,11 @@ class MirrorServer(
                 // matters if some app starts using long writes — the log line above says when it happens.
                 if (!preparedWrite && uuid == GattUuids.FTMS_CONTROL_POINT && device != null && value.isNotEmpty()) {
                     val opcode = value[0].toInt() and 0xFF
-                    when (val admission = ftmsControl.admit(device.address, opcode)) {
+                    val client = clientKeys[device.address]
+                    when (val admission = client?.let { ftmsControl.admit(it, opcode) }) {
+                        null -> Unit
                         is FtmsControlCoordinator.Admission.Rejected ->
-                            notifyControlResult(device.address, byteArrayOf(0x80.toByte(), opcode.toByte(), admission.result.toByte()))
+                            notifyControlResult(client, byteArrayOf(0x80.toByte(), opcode.toByte(), admission.result.toByte()))
                         is FtmsControlCoordinator.Admission.Admitted -> {
                             val procedure = admission.procedure
                             relayed = toZycle(uuid, out, withResponse) { success ->

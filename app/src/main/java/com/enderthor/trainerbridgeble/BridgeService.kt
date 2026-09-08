@@ -140,12 +140,16 @@ class BridgeService : Service() {
         }
         else {
             val target = ((lastResistance ?: 0) + delta).coerceIn(0, 200)   // 0..200 per the Zycle's 0x2AD6 range
-            // ponytail: 0x04+level% Set Target Resistance, no Request Control first — shares the FTMS control point with the app
-            // Deliberately NOT routed through the mirror, so it arms no servo-step budget: this button is the
-            // rider, exactly like the bike's own, and the level move it causes SHOULD reach the app.
             val bytes = encodeTargetResistance(target)
+            val localMirror = mirror
+            if (localMirror != null && !localMirror.admitLocalControl(0x04)) {
+                FileLog.event("UI button → resistance target=$target BLOCKED — FTMS control busy")
+                listener?.invoke()
+                return
+            }
             val source = client
             if (source == null) {
+                localMirror?.localControlTransportFailed(0x04)
                 FileLog.event("UI button → resistance target=$target FAILED")
                 listener?.invoke()
             } else source.write(
@@ -153,6 +157,7 @@ class BridgeService : Service() {
                 bytes,
                 true,
             ) { success ->
+                if (!success) localMirror?.localControlTransportFailed(0x04)
                 handler.post {
                     if (client !== source) return@post
                     if (success) {
@@ -430,6 +435,15 @@ class BridgeService : Service() {
                     }
                     onComplete(success)
                     if (moved) listener?.invoke()
+                }
+            },
+            onTrainerRecycle = {
+                var current = false
+                emitOwner.runIfCurrent(emitToken) { current = true }
+                if (current && receiving) {
+                    FileLog.event("FTMS origin disconnected mid-procedure — recycling trainer link")
+                    stopReceive()
+                    maybeStartReceive()
                 }
             },
             onStatus = { s -> status = s; listener?.invoke() },
