@@ -260,7 +260,11 @@ class BridgeService : Service() {
             status = getString(R.string.status_missing_bt_permission); listener?.invoke(); stopSelf(); return false
         }
         foreground = true
-        acquireWakeLock()
+        if (!acquireWakeLock()) {
+            foreground = false
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf()
+            return false
+        }
         handler.removeCallbacks(snapshot); handler.post(snapshot)   // stops itself once foreground goes false
         return true
     }
@@ -638,17 +642,32 @@ class BridgeService : Service() {
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf()
     }
 
-    @Synchronized private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
-            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TrainerBridgeBLE:session").also { runCatching { it.acquire() } }
+    @Synchronized private fun acquireWakeLock(): Boolean {
+        if (wakeLock?.isHeld == true) return true
+        val candidate = (getSystemService(POWER_SERVICE) as PowerManager)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TrainerBridgeBLE:session")
+        val failure = runCatching { candidate.acquire(); check(candidate.isHeld) { "lock not held" } }.exceptionOrNull()
+        if (failure != null) {
+            runCatching { if (candidate.isHeld) candidate.release() }
+            FileLog.event("wakelock ACQUIRE FAILED (master active): ${failure.message ?: failure.javaClass.simpleName}")
+            return false
+        }
+        wakeLock = candidate
         FileLog.event("wakelock ACQUIRED (master active)")
+        return true
     }
 
     @Synchronized private fun releaseWakeLock() {
-        val held = wakeLock?.isHeld == true
-        wakeLock?.let { if (it.isHeld) runCatching { it.release() } }; wakeLock = null
-        if (held) FileLog.event("wakelock RELEASED (master inactive)")
+        val lock = wakeLock ?: return
+        val failure = runCatching { if (lock.isHeld) lock.release() }.exceptionOrNull()
+        val heldAfter = runCatching { lock.isHeld }
+        if (heldAfter.getOrNull() == false) {
+            wakeLock = null
+            FileLog.event("wakelock RELEASED (master inactive)")
+        } else {
+            val reason = failure ?: heldAfter.exceptionOrNull()
+            FileLog.event("wakelock RELEASE FAILED (master inactive): ${reason?.message ?: "lock still held"}")
+        }
     }
 
     /**
