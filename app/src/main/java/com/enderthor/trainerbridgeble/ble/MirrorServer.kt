@@ -114,7 +114,6 @@ class MirrorServer(
      *  starts advertising again the moment it drops — so advertising with no trainer behind us puts two
      *  identical devices in the air and lets an app bind to a bridge that has no data to give it. */
     fun setTrainerLinked(linked: Boolean) {
-        if (linked) ftmsControl.trainerReady()
         val controller = if (linked) null else ftmsControl.trainerDropped()
         if (trainerLinked == linked) {
             controller?.let { handler.post { cancelClient(it) } }
@@ -376,6 +375,7 @@ class MirrorServer(
 
     fun admitLocalControl(opcode: Int): Boolean = ftmsControl.admitLocal(opcode)
     fun localControlTransportFailed(opcode: Int) { ftmsControl.transportFailed(null, opcode) }
+    fun releaseFtmsQuarantine() { ftmsControl.trainerReady() }
 
     /** A value arrived from the trainer: correct power, cache, and notify every subscribed client. */
     fun onZycleValue(charUuid: UUID, value: ByteArray) {

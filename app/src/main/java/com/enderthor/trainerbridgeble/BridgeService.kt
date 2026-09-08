@@ -104,6 +104,8 @@ class BridgeService : Service() {
      *  writeCharacteristic is a Binder call into the Bluetooth process and stopEmit() waits on this monitor
      *  from the main thread. */
     private val emitOwner = IdentityOwner<Any>()
+    private var receiveGeneration = 0L
+    private var ftmsReleaseGeneration: Long? = null
     /** How many callbacks the generation guard rejected. Zero all ride means the races the guard exists for
      *  never happened; a climbing number is itself the finding. Reported by the periodic snapshot. */
     private val staleCallbacks = java.util.concurrent.atomic.AtomicInteger(0)
@@ -324,6 +326,7 @@ class BridgeService : Service() {
         ErgBias.seed(config.ergBiasW)   // start calibrated; there is no live command to measure against yet
         FileLog.event("receive start paired=${config.pairedAddress.ifEmpty { "any" }} sim=${config.simulate} ergBias=${config.ergBiasW}W")
         val owner = Any()
+        val sourceGeneration = ++receiveGeneration
         receiveOwner.replace(owner)
         // Low-rate callbacks still hop to main; onValue stays on the BLE thread and uses receiveOwner's
         // monitor to make validation + mutation atomic with stopReceive().
@@ -363,7 +366,15 @@ class BridgeService : Service() {
         }
         // Same treatment: a stale onSynced would put the mirror on the air with no trainer behind it, and
         // setTrainerLinked is edge-triggered, so it would STAY there.
-        val onSynced: () -> Unit = { handler.post { receiveOwner.runIfCurrent(owner) { zycleSynced = true; mirror?.setTrainerLinked(true) } } }
+        val onSynced: () -> Unit = { handler.post { receiveOwner.runIfCurrent(owner) {
+            val activeMirror = mirror
+            if (activeMirror != null && ftmsReleaseGeneration?.let { sourceGeneration >= it } == true) {
+                activeMirror.releaseFtmsQuarantine()
+                ftmsReleaseGeneration = null
+            }
+            zycleSynced = true
+            activeMirror?.setTrainerLinked(true)
+        } } }
         val c: TrainerSource = if (config.simulate) SimSource(onProfile, onValue, onState, onSynced).also { simSource = it }
         else ZycleClient(this, config.pairedAddress, onProfile, onValue, onState, onSynced,
             // Guarded too, or the replaced source's advertising blueprint and address get written over the
@@ -442,6 +453,7 @@ class BridgeService : Service() {
                 emitOwner.runIfCurrent(emitToken) { current = true }
                 if (current && receiving) {
                     FileLog.event("FTMS origin disconnected mid-procedure — recycling trainer link")
+                    ftmsReleaseGeneration = receiveGeneration + 1
                     stopReceive()
                     maybeStartReceive()
                 }
@@ -500,6 +512,7 @@ class BridgeService : Service() {
         // Before the early return: a mirror whose construction or start() failed still left callbacks able
         // to run against this token.
         emitOwner.clear()
+        ftmsReleaseGeneration = null
         if (mirror == null) return
         FileLog.event("emit stop")
         mirror?.stop(); mirror = null
