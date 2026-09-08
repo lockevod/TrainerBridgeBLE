@@ -9,5 +9,10 @@ interface TrainerSource {
     fun stop()
     /** @return false if the write could not be dispatched (no link, unknown characteristic) — the mirror
      *  must NOT then answer the app with success. */
-    fun write(charUuid: UUID, bytes: ByteArray, withResponse: Boolean): Boolean
+    fun write(
+        charUuid: UUID,
+        bytes: ByteArray,
+        withResponse: Boolean,
+        onComplete: (Boolean) -> Unit = {},
+    ): Boolean
 }

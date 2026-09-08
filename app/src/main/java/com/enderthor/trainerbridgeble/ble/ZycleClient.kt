@@ -18,9 +18,12 @@ import android.util.Log
 import com.enderthor.trainerbridgeble.FileLog
 import com.enderthor.trainerbridgeble.GattSessionCoordinator
 import com.enderthor.trainerbridgeble.IdentityOwner
+import com.enderthor.trainerbridgeble.TrainerWriteTicket
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * BLE central to the trainer (Zycle). Scans filtered by FTMS/address, connects, discovers the FULL GATT, subscribes
@@ -53,6 +56,7 @@ class ZycleClient(
         resetRuntime = {
             lastMessageMs = 0L
             onState(false)
+            completePendingWrites(false)
             opQueue.clear(); opBusy.set(false); syncOwed.set(false); burstEnqueued = false
             connecting.set(false); inFlightWrite = null
         },
@@ -97,9 +101,18 @@ class ZycleClient(
     }
     private val opToken = java.util.concurrent.atomic.AtomicInteger(0)   // guards the per-op watchdog vs a stale timeout
 
-    private class WriteReq(val uuid: UUID, val bytes: ByteArray, val withResponse: Boolean, val retriesLeft: Int, val seq: Int)
+    private data class WriteReq(
+        val session: BluetoothGatt,
+        val characteristic: BluetoothGattCharacteristic,
+        val uuid: UUID,
+        val bytes: ByteArray,
+        val withResponse: Boolean,
+        val retriesLeft: Int,
+        val ticket: TrainerWriteTicket,
+    )
     @Volatile private var inFlightWrite: WriteReq? = null   // the write currently on the wire, for retry on failure
-    private val writeSeq = java.util.concurrent.atomic.AtomicInteger(0)  // bumps per write; a retry is dropped if superseded
+    private val pendingWrites = ConcurrentHashMap.newKeySet<TrainerWriteTicket>()
+    private val writeSeq = AtomicLong(0)  // bumps per write; a retry is dropped if superseded
 
     private val cccd: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
@@ -118,6 +131,7 @@ class ZycleClient(
         // either the attempt published first (and the read closes it) or it never publishes at all.
         connectAttempts.clear()
         connecting.set(false)
+        completePendingWrites(false)
         inFlightWrite = null
         stopScan()
         handler.removeCallbacksAndMessages(null)   // heartbeat, rescan, connect/op watchdogs, write retries
@@ -155,29 +169,101 @@ class ZycleClient(
     }
 
     /** Forward a write to the trainer's characteristic [charUuid] (control relay). Queued. */
-    override fun write(charUuid: UUID, bytes: ByteArray, withResponse: Boolean): Boolean =
-        writeInternal(charUuid, bytes, withResponse, CONTROL_WRITE_RETRIES)
-
-    private fun writeInternal(charUuid: UUID, bytes: ByteArray, withResponse: Boolean, retriesLeft: Int): Boolean {
-        val g = gatt ?: run { FileLog.event("Zycle write ${shortUuid(charUuid)} DROPPED — no trainer link"); return false }
+    override fun write(
+        charUuid: UUID,
+        bytes: ByteArray,
+        withResponse: Boolean,
+        onComplete: (Boolean) -> Unit,
+    ): Boolean {
+        val ticket = TrainerWriteTicket(writeSeq.incrementAndGet(), onComplete)
+        if (stopped) {
+            FileLog.event("Zycle write ${shortUuid(charUuid)} DROPPED — client stopped")
+            ticket.complete(false)
+            return false
+        }
+        val g = gatt ?: run {
+            FileLog.event("Zycle write ${shortUuid(charUuid)} DROPPED — no trainer link")
+            ticket.complete(false)
+            return false
+        }
         // g.services is repopulated by discovery while this runs on the GATT-server binder thread
         val ch = runCatching { g.services.firstNotNullOfOrNull { s -> s.getCharacteristic(charUuid) } }.getOrNull()
-            ?: run { FileLog.event("Zycle write ${shortUuid(charUuid)} DROPPED — characteristic not found"); return false }
+            ?: run {
+                FileLog.event("Zycle write ${shortUuid(charUuid)} DROPPED — characteristic not found")
+                ticket.complete(false)
+                return false
+            }
         FileLog.event("Zycle write ${shortUuid(charUuid)} = ${FileLog.hex(bytes)}")
-        val seq = writeSeq.incrementAndGet()
-        enqueue {
+        return enqueueWrite(WriteReq(g, ch, charUuid, bytes, withResponse, CONTROL_WRITE_RETRIES, ticket))
+    }
+
+    private fun enqueueWrite(request: WriteReq): Boolean {
+        var queued = false
+        gattSessions.runIfCurrent(request.session) {
+            pendingWrites.add(request.ticket)
+            opQueue.add { executeWrite(request) }
+            queued = true
+        }
+        if (!queued) {
+            completeWrite(request, false)
+            return false
+        }
+        pump()
+        return true
+    }
+
+    private fun executeWrite(request: WriteReq) {
+        if (stopped || gattSessions.current !== request.session) {
+            completeWrite(request, false)
+            opDone()
+            return
+        }
+        runCatching {
             @Suppress("DEPRECATION")
             run {
-                inFlightWrite = WriteReq(charUuid, bytes, withResponse, retriesLeft, seq)
-                ch.writeType = if (withResponse) BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                inFlightWrite = request
+                request.characteristic.writeType = if (request.withResponse) BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
                 else BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                ch.value = bytes
-                if (g.writeCharacteristic(ch) != true) {
-                    FileLog.event("Zycle write ${shortUuid(charUuid)} REFUSED by stack"); inFlightWrite = null; opDone()
+                request.characteristic.value = request.bytes
+                if (request.session.writeCharacteristic(request.characteristic) != true) {
+                    FileLog.event("Zycle write ${shortUuid(request.uuid)} REFUSED by stack" +
+                        if (canRetry(request)) " — retry ${request.retriesLeft}" else "")
+                    inFlightWrite = null
+                    if (canRetry(request)) scheduleWriteRetry(request) else completeWrite(request, false)
+                    opDone()
                 }
             }
+        }.onFailure {
+            FileLog.event("Zycle write ${shortUuid(request.uuid)} FAILED before dispatch")
+            inFlightWrite = null
+            completeWrite(request, false)
+            opDone()
         }
-        return true
+    }
+
+    private fun canRetry(request: WriteReq): Boolean =
+        request.retriesLeft > 0 && GattUuids.carriesControl(request.uuid)
+
+    private fun scheduleWriteRetry(request: WriteReq) {
+        handler.postDelayed({
+            if (!stopped && writeSeq.get() == request.ticket.sequence && gattSessions.current === request.session) {
+                enqueueWrite(request.copy(retriesLeft = request.retriesLeft - 1))
+            } else completeWrite(request, false)
+        }, CONTROL_RETRY_DELAY_MS)
+    }
+
+    private fun completeWrite(request: WriteReq, success: Boolean) {
+        pendingWrites.remove(request.ticket)
+        runCatching { request.ticket.complete(success) }
+            .onFailure { FileLog.event("Zycle write ${shortUuid(request.uuid)} completion callback FAILED") }
+    }
+
+    private fun completePendingWrites(success: Boolean) {
+        pendingWrites.forEach { ticket ->
+            pendingWrites.remove(ticket)
+            runCatching { ticket.complete(success) }
+                .onFailure { FileLog.event("Zycle write completion callback FAILED") }
+        }
     }
 
     // ── scan ────────────────────────────────────────────────────────────────────────────────────────
@@ -340,6 +426,7 @@ class ZycleClient(
                 runCatching { g.close() }
                 if (gattSessions.clearIfCurrent(g) {
                     onState(false)
+                    completePendingWrites(false)
                     opQueue.clear(); opBusy.set(false); syncOwed.set(false); burstEnqueued = false
                     connecting.set(false); inFlightWrite = null; lastMessageMs = 0L
                 }) scheduleReconnect()
@@ -418,13 +505,16 @@ class ZycleClient(
                 lastMessageMs = android.os.SystemClock.elapsedRealtime()
                 // Attribute a status only to the write this callback names. A late callback must not retry
                 // whichever newer ERG target happens to occupy the slot.
-                val w = inFlightWrite?.takeIf { it.uuid == ch.uuid }
+                val w = inFlightWrite?.takeIf { it.session === g && it.uuid == ch.uuid }
                 if (w != null) inFlightWrite = null
-                if (status != BluetoothGatt.GATT_SUCCESS) {
-                    // Retry only a still-current control write; never resurrect a superseded target.
-                    val retry = w != null && w.retriesLeft > 0 && GattUuids.carriesControl(w.uuid) && w.seq == writeSeq.get() && !stopped
+                if (w != null && status == BluetoothGatt.GATT_SUCCESS) {
+                    completeWrite(w, true)
+                } else if (status != BluetoothGatt.GATT_SUCCESS) {
+                    // Decide supersession when the delayed retry runs. A newer command must not relabel a
+                    // write the Android stack already accepted while this callback was outstanding.
+                    val retry = w != null && canRetry(w)
                     FileLog.event("Zycle write ${shortUuid(ch.uuid)} status=$status" + if (retry) " — retry ${w!!.retriesLeft}" else "")
-                    if (retry) handler.postDelayed({ writeInternal(w!!.uuid, w.bytes, w.withResponse, w.retriesLeft - 1) }, CONTROL_RETRY_DELAY_MS)
+                    if (retry) scheduleWriteRetry(w!!) else if (w != null) completeWrite(w, false)
                 }
                 opDone()
             }

@@ -108,9 +108,14 @@ class SimSource(
 
     override fun stop() { handler.removeCallbacks(ticker); onState(false); FileLog.event("SIM trainer stopped") }
 
-    override fun write(charUuid: UUID, bytes: ByteArray, withResponse: Boolean): Boolean {
+    override fun write(
+        charUuid: UUID,
+        bytes: ByteArray,
+        withResponse: Boolean,
+        onComplete: (Boolean) -> Unit,
+    ): Boolean {
         FileLog.event("SIM write ${bytes.joinToString("") { "%02X".format(it) }}")
-        if (charUuid != CONTROL || bytes.isEmpty()) return true
+        if (charUuid != CONTROL || bytes.isEmpty()) { onComplete(true); return true }
         val op = bytes[0].toInt() and 0xFF
         when (op) {
             0x05 -> if (bytes.size >= 3) ergTarget = (bytes[1].toInt() and 0xFF) or ((bytes[2].toInt() and 0xFF) shl 8)  // Set Target Power
@@ -124,6 +129,7 @@ class SimSource(
         // down 0x13): answer "op code not supported" (0x02) for those instead of a success an app would
         // then wait on — a slope-mode app would otherwise watch power ignore the grade forever.
         val result: Byte = if (op in IMPLEMENTED_OPS) 0x01 else 0x02
+        onComplete(true)
         onValue(CONTROL, byteArrayOf(0x80.toByte(), (op and 0xFF).toByte(), result))
         return true
     }

@@ -1,5 +1,22 @@
 package com.enderthor.trainerbridgeble
 
+internal class TrainerWriteTicket(
+    val sequence: Long,
+    private val onComplete: (Boolean) -> Unit,
+) {
+    private val completed = java.util.concurrent.atomic.AtomicBoolean(false)
+    fun complete(success: Boolean): Boolean {
+        if (!completed.compareAndSet(false, true)) return false
+        onComplete(success)
+        return true
+    }
+}
+
+internal fun encodeTargetResistance(target: Int): ByteArray {
+    val value = target.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+    return byteArrayOf(0x04, (value and 0xFF).toByte(), ((value ushr 8) and 0xFF).toByte())
+}
+
 internal class IdentityOwner<T : Any> {
     @Volatile private var value: T? = null
 

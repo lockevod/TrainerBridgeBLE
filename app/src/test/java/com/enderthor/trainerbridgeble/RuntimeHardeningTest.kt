@@ -3,6 +3,7 @@ package com.enderthor.trainerbridgeble
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -28,6 +29,19 @@ import org.junit.Test
  *     ownership rejection is checked below; the call shape is not.
  */
 class RuntimeHardeningTest {
+
+    @Test fun trainerWriteCompletesExactlyOnce() {
+        val results = mutableListOf<Boolean>()
+        val ticket = TrainerWriteTicket(7L) { results += it }
+        assertTrue(ticket.complete(true))
+        assertFalse(ticket.complete(false))
+        assertEquals(listOf(true), results)
+    }
+
+    @Test fun targetResistanceUsesSigned16LittleEndian() {
+        assertArrayEquals(byteArrayOf(0x04, 0x24, 0x00), encodeTargetResistance(36))
+        assertArrayEquals(byteArrayOf(0x04, 0x10, 0x00), encodeTargetResistance(16))
+    }
 
     // ── connect-attempt ownership (ZycleClient.connect / stop) ────────────────────────────────────
     /** An attempt invalidated while connectGatt() blocks must not publish its handle. NOT the `stopped`

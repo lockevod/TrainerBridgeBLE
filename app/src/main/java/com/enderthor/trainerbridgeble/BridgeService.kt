@@ -134,32 +134,37 @@ class BridgeService : Service() {
     fun buttonDown() = nudgeResistance(-5)
     private fun nudgeResistance(delta: Int) {
         val sim = simSource
-        if (sim != null) { if (delta > 0) sim.buttonUp() else sim.buttonDown() }
+        if (sim != null) {
+            if (delta > 0) sim.buttonUp() else sim.buttonDown()
+            listener?.invoke()
+        }
         else {
             val target = ((lastResistance ?: 0) + delta).coerceIn(0, 200)   // 0..200 per the Zycle's 0x2AD6 range
             // ponytail: 0x04+level% Set Target Resistance, no Request Control first — shares the FTMS control point with the app
             // Deliberately NOT routed through the mirror, so it arms no servo-step budget: this button is the
             // rider, exactly like the bike's own, and the level move it causes SHOULD reach the app.
-            // optimistic, and only if the write was at least QUEUED (no link / unknown char → don't move the
-            // tile). A stack refusal after queueing still shows briefly; the trainer's own IBD corrects it.
-            val bytes = byteArrayOf(0x04, target.toByte())
-            if (client?.write(com.enderthor.trainerbridgeble.ble.GattUuids.FTMS_CONTROL_POINT, bytes, true) == true) {
-                // The mirror's toZycle lambda is where ErgBias sees control ops, and this path deliberately
-                // bypasses it — so tell the learner directly. 0x04 takes the trainer OUT of ERG, and without
-                // this its commandedRaw stays pinned to the app's last target: every later reading is then
-                // measured against a command no longer in force, saturating the bias and PERSISTING it.
-                // ponytail: `write() == true` means QUEUED, not accepted by the stack, so a 0x04 that dies in
-                // the queue still retires the command here. That only makes the learner stop learning until
-                // the next 0x05 — it cannot poison the bias, which is what this fix is for. Closing it needs
-                // the write path to report terminal completion back (the same plumbing an FTMS failure
-                // indication would need); do both together or neither.
-                ErgBias.onControl(bytes, android.os.SystemClock.elapsedRealtime())
-                lastResistance = target
-                lastControl = getString(R.string.control_resistance_target, target)
-                FileLog.event("UI button → resistance target=$target")
-            } else FileLog.event("UI button → resistance target=$target NOT DISPATCHED")
+            val bytes = encodeTargetResistance(target)
+            val source = client
+            if (source == null) {
+                FileLog.event("UI button → resistance target=$target FAILED")
+                listener?.invoke()
+            } else source.write(
+                com.enderthor.trainerbridgeble.ble.GattUuids.FTMS_CONTROL_POINT,
+                bytes,
+                true,
+            ) { success ->
+                handler.post {
+                    if (success) {
+                        // This path bypasses the mirror, so retire ERG learning only after the trainer write.
+                        ErgBias.onControl(bytes, android.os.SystemClock.elapsedRealtime())
+                        lastResistance = target
+                        lastControl = getString(R.string.control_resistance_target, target)
+                        FileLog.event("UI button → resistance target=$target")
+                    } else FileLog.event("UI button → resistance target=$target FAILED")
+                    listener?.invoke()
+                }
+            }
         }
-        listener?.invoke()
     }
 
     /** The BLE stack does not survive a Bluetooth off/on (or a crash of com.android.bluetooth): the GATT
