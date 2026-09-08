@@ -407,24 +407,30 @@ class BridgeService : Service() {
             context = this,
             advertisedName = config.advertisedName,
             correction = { config.correction() },
-            toZycle = { uuid, bytes, withResponse ->
-                // Mutate and CAPTURE the source under the owner; dispatch outside it (see [emitOwner]). A
-                // callback from a stopped mirror captures nothing and relays nothing; one admitted before the
-                // clear still targets the source it was admitted for, never the replacement.
+            toZycle = { uuid, bytes, withResponse, onComplete ->
+                // CAPTURE the source under the owner; dispatch outside it (see [emitOwner]). A callback from
+                // a stopped mirror captures nothing and relays nothing; one admitted before the clear still
+                // targets the source it was admitted for, never the replacement.
                 var target: com.enderthor.trainerbridgeble.ble.TrainerSource? = null
-                var moved = false
-                emitOwner.runIfCurrent(emitToken) {
-                    if (com.enderthor.trainerbridgeble.ble.GattUuids.carriesControl(uuid)) {
-                        // `bytes` is already inverse-corrected: exactly the raw watts the trainer is told to hold,
-                        // which is what the measured power has to be compared against.
-                        ErgBias.onControl(bytes, android.os.SystemClock.elapsedRealtime())
-                        lastControl = describeControl(bytes); moved = true
+                emitOwner.runIfCurrent(emitToken) { target = client }
+                val source = target
+                if (source == null) {
+                    onComplete(false)
+                    false
+                } else source.write(uuid, bytes, withResponse) { success ->
+                    var moved = false
+                    if (success) emitOwner.runIfCurrent(emitToken) {
+                        if (com.enderthor.trainerbridgeble.ble.GattUuids.carriesControl(uuid)) {
+                            // `bytes` is already inverse-corrected: exactly the raw watts the trainer is told
+                            // to hold, which is what measured power has to be compared against.
+                            ErgBias.onControl(bytes, android.os.SystemClock.elapsedRealtime())
+                            lastControl = describeControl(bytes)
+                            moved = true
+                        }
                     }
-                    target = client
+                    onComplete(success)
+                    if (moved) listener?.invoke()
                 }
-                val relayed = target?.write(uuid, bytes, withResponse) ?: false   // false → the mirror answers failure
-                if (moved) listener?.invoke()   // an arbitrary UI callback has no business inside the monitor
-                relayed
             },
             onStatus = { s -> status = s; listener?.invoke() },
             onAdvState = { ok -> bleAdvOk = ok; listener?.invoke() },

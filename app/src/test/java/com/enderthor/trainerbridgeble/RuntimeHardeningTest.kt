@@ -30,6 +30,91 @@ import org.junit.Test
  */
 class RuntimeHardeningTest {
 
+    @Test fun firstSuccessfulRequestControlOwnsFtms() {
+        val coordinator = FtmsControlCoordinator()
+
+        assertEquals(
+            FtmsControlCoordinator.Admission.Admitted(FtmsControlCoordinator.Procedure("A", 0x00)),
+            coordinator.admit("A", 0x00),
+        )
+        assertEquals("A", coordinator.response(0x00, FtmsControlCoordinator.SUCCESS))
+        assertEquals(
+            FtmsControlCoordinator.Admission.Admitted(FtmsControlCoordinator.Procedure("A", 0x05)),
+            coordinator.admit("A", 0x05),
+        )
+    }
+
+    @Test fun secondClientCannotControlOrStealOwnership() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.admit("A", 0x00)
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
+
+        assertEquals(
+            FtmsControlCoordinator.Admission.Rejected(FtmsControlCoordinator.CONTROL_NOT_PERMITTED),
+            coordinator.admit("B", 0x05),
+        )
+        assertEquals(
+            FtmsControlCoordinator.Admission.Rejected(FtmsControlCoordinator.CONTROL_NOT_PERMITTED),
+            coordinator.admit("B", 0x00),
+        )
+    }
+
+    @Test fun onlyOneProcedureCanBePending() {
+        val coordinator = FtmsControlCoordinator()
+
+        coordinator.admit("A", 0x00)
+        assertEquals(
+            FtmsControlCoordinator.Admission.Rejected(FtmsControlCoordinator.OPERATION_FAILED),
+            coordinator.admit("A", 0x00),
+        )
+        assertNull(coordinator.transportFailed("B", 0x00))
+        assertEquals("A", coordinator.transportFailed("A", 0x00))
+        assertEquals(
+            FtmsControlCoordinator.Admission.Admitted(FtmsControlCoordinator.Procedure("A", 0x00)),
+            coordinator.admit("A", 0x00),
+        )
+    }
+
+    @Test fun responseRoutesOnlyToMatchingOrigin() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.admit("A", 0x00)
+
+        assertNull(coordinator.response(0x05, FtmsControlCoordinator.SUCCESS))
+        assertEquals("A", coordinator.response(0x00, FtmsControlCoordinator.SUCCESS))
+        assertEquals(
+            FtmsControlCoordinator.Admission.Admitted(FtmsControlCoordinator.Procedure("A", 0x05)),
+            coordinator.admit("A", 0x05),
+        )
+    }
+
+    @Test fun failedRequestControlDoesNotAcquireOwnership() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.admit("A", 0x00)
+
+        assertEquals("A", coordinator.response(0x00, FtmsControlCoordinator.OPERATION_FAILED))
+        assertEquals(
+            FtmsControlCoordinator.Admission.Admitted(FtmsControlCoordinator.Procedure("B", 0x00)),
+            coordinator.admit("B", 0x00),
+        )
+    }
+
+    @Test fun ownerDisconnectAndTrainerDropClearOwnership() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.admit("A", 0x00)
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
+
+        coordinator.admit("A", 0x05)
+        coordinator.disconnect("A")
+        coordinator.admit("B", 0x00)
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
+        coordinator.admit("B", 0x05)
+        assertEquals("B", coordinator.trainerDropped())
+        assertEquals(
+            FtmsControlCoordinator.Admission.Admitted(FtmsControlCoordinator.Procedure("A", 0x00)),
+            coordinator.admit("A", 0x00),
+        )
+    }
+
     @Test fun trainerWriteCompletesExactlyOnce() {
         val results = mutableListOf<Boolean>()
         val ticket = TrainerWriteTicket(7L) { results += it }

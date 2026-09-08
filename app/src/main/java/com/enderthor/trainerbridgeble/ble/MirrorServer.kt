@@ -22,6 +22,7 @@ import android.os.SystemClock
 import android.util.Log
 import com.enderthor.trainerbridgeble.AdvertisingAttemptCoordinator
 import com.enderthor.trainerbridgeble.FileLog
+import com.enderthor.trainerbridgeble.FtmsControlCoordinator
 import com.enderthor.trainerbridgeble.R
 import com.enderthor.trainerbridgeble.correction.PowerCorrection
 import java.util.ArrayDeque
@@ -35,14 +36,14 @@ import java.util.concurrent.ConcurrentHashMap
  * ERG target inverse-corrected on control writes). Serves multiple centrals at once.
  *
  * @param correction supplies the LIVE correction (config may change mid-session).
- * @param toZycle    forwards an app write to the trainer's matching characteristic.
+ * @param toZycle    forwards an app write to the trainer's matching characteristic and reports its terminal result.
  */
 @SuppressLint("MissingPermission")
 class MirrorServer(
     private val context: Context,
     private val advertisedName: String,
     private val correction: () -> PowerCorrection,
-    private val toZycle: (charUuid: UUID, bytes: ByteArray, withResponse: Boolean) -> Boolean,
+    private val toZycle: (charUuid: UUID, bytes: ByteArray, withResponse: Boolean, onComplete: (Boolean) -> Unit) -> Boolean,
     private val onStatus: (String) -> Unit = {},
     /** Health report to the UI: true once we're actually advertising; false if the server/advertising fails. */
     private val onAdvState: (Boolean) -> Unit = {},
@@ -61,6 +62,7 @@ class MirrorServer(
     private val cache = ConcurrentHashMap<UUID, ByteArray>()                            // last value (power corrected)
     private val subscribers = ConcurrentHashMap<UUID, MutableSet<String>>()             // char uuid → subscribed client addrs
     private val clients = ConcurrentHashMap<String, BluetoothDevice>()                  // connected centrals
+    private val ftmsControl = FtmsControlCoordinator()
     // touched from the GATT server binder thread, the client's binder thread and main — a plain ArrayDeque
     // can throw mid-poll when stop() clears it, and an exception on a binder callback kills the process
     private val pendingServices = java.util.concurrent.ConcurrentLinkedDeque<BluetoothGattService>()
@@ -107,7 +109,11 @@ class MirrorServer(
      *  starts advertising again the moment it drops — so advertising with no trainer behind us puts two
      *  identical devices in the air and lets an app bind to a bridge that has no data to give it. */
     fun setTrainerLinked(linked: Boolean) {
-        if (trainerLinked == linked) return
+        val controller = if (linked) null else ftmsControl.trainerDropped()
+        if (trainerLinked == linked) {
+            controller?.let { address -> handler.post { clients[address]?.let { server?.cancelConnection(it) } } }
+            return
+        }
         trainerLinked = linked
         // Losing the trainer invalidates the level anchor (see [reanchorLevel]) AND any servo step we were
         // still owed: the write that bought it may never have reached the trainer, and if it did, the step it
@@ -118,7 +124,12 @@ class MirrorServer(
         if (!linked) { reanchorLevel = true; servoStepOwed = false; lastControlWriteMs = 0L }
         else { advRetries = 0; advRetryMs = ADV_RETRY_MS }
         FileLog.event("mirror trainer link=$linked -> ${if (linked) "advertise" else "stop advertising"}")
-        handler.post { if (linked) startAdvertising() else stopAdvertising() }
+        handler.post {
+            if (linked) startAdvertising() else {
+                stopAdvertising()
+                controller?.let { address -> clients[address]?.let { server?.cancelConnection(it) } }
+            }
+        }
     }
 
     /** Adopt the trainer's own advertised service UUIDs + manufacturer data (captured by the client) so we
@@ -317,6 +328,7 @@ class MirrorServer(
         // Stop the advertiser UNCONDITIONALLY: the `advertising` flag is transiently false mid-restart, so
         // trusting it here can leave the phone broadcasting with a closed GATT server.
         stopped = true; pendingProfile = null; servicesReady = false
+        ftmsControl.clear()
         stopAdvertising()
         handler.removeCallbacksAndMessages(null)   // pending adv starts / service retries must not outlive us
         runCatching { server?.close() }
@@ -358,6 +370,13 @@ class MirrorServer(
 
     /** A value arrived from the trainer: correct power, cache, and notify every subscribed client. */
     fun onZycleValue(charUuid: UUID, value: ByteArray) {
+        if (charUuid == GattUuids.FTMS_CONTROL_POINT && value.size >= 3 &&
+            value[0].toInt() and 0xFF == 0x80) {
+            val opcode = value[1].toInt() and 0xFF
+            val result = value[2].toInt() and 0xFF
+            ftmsControl.response(opcode, result)?.let { notifyControlResult(it, value) }
+            return
+        }
         val out = when {
             charUuid == GattUuids.INDOOR_BIKE_DATA -> PowerRewrite.correctIndoorBikeData(value, correction())
             charUuid == GattUuids.CYCLING_POWER_MEASUREMENT -> PowerRewrite.correctCyclingPower(value, correction())
@@ -429,6 +448,20 @@ class MirrorServer(
         }
     }
 
+    private fun notifyControlResult(client: String, value: ByteArray) {
+        val uuid = GattUuids.FTMS_CONTROL_POINT
+        val ch = chars[uuid] ?: return
+        val subs = subscribers[uuid] ?: return
+        if (!synchronized(subs) { subs.contains(client) }) return
+        handler.post {
+            val srv = server ?: return@post
+            val dev = clients[client] ?: return@post
+            val currentSubs = subscribers[uuid] ?: return@post
+            if (!synchronized(currentSubs) { currentSubs.contains(client) }) return@post
+            notify(srv, dev, ch, value, ch.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)
+        }
+    }
+
     private val serverCallback = object : BluetoothGattServerCallback() {
         override fun onServiceAdded(status: Int, service: BluetoothGattService?) {
             // A callback still in flight when stop() ran would otherwise find pendingServices empty, set
@@ -464,6 +497,7 @@ class MirrorServer(
                 // central (e.g. the Garmin) can still discover us.
                 handler.post { restartAdvertising() }
             } else {
+                ftmsControl.disconnect(device.address)
                 clients.remove(device.address); subscribers.values.forEach { it.remove(device.address) }
                 onStatus(context.getString(R.string.status_app_disconnected, clients.size))
                 FileLog.event("app disconnected ${device.address} status=$status (${clients.size} left)")
@@ -499,10 +533,6 @@ class MirrorServer(
                 (if (preparedWrite) " PREPARED off=$offset" else "") + (if (!responseNeeded) " noResp" else "")
             if (uuid != null && value != null) {
                 val out = if (GattUuids.carriesControl(uuid)) PowerRewrite.inverseTargetPower(value, correction()) else value
-                // Any control op can make the servo move the level; from there on that move is ours, not the
-                // rider's. Read the clock HERE, before the relay, so the window still covers the trip to the
-                // trainer — but only commit it once we know the write was dispatched (below).
-                val stampAt = SystemClock.elapsedRealtime()
                 // what the client asked for, unless the trainer's characteristic can't take a Write Command
                 val withResponse = responseNeeded ||
                     (ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE == 0)
@@ -510,32 +540,37 @@ class MirrorServer(
                 // ponytail: a prepared (long) write is relayed fragment-by-fragment rather than buffered
                 // until onExecuteWrite. No FTMS/CPS characteristic exceeds one ATT payload, so this only
                 // matters if some app starts using long writes — the log line above says when it happens.
-                relayed = toZycle(uuid, out, withResponse)   // relay to the trainer
-                // Only a write that was actually dispatched buys the servo a step. A dropped one (no link,
-                // characteristic not found — the window right after a reconnect, before discovery repopulates
-                // g.services) moves no level, and an armed budget would silently eat the rider's next real
-                // button press within LEVEL_SETTLE_MS. `relayed` still only means QUEUED, so a write that
-                // fails later on the wire arms it anyway — no worse than before, and one less lost press.
-                if (relayed && GattUuids.carriesControl(uuid)) { lastControlWriteMs = stampAt; servoStepOwed = true }
+                if (!preparedWrite && uuid == GattUuids.FTMS_CONTROL_POINT && device != null && value.isNotEmpty()) {
+                    val opcode = value[0].toInt() and 0xFF
+                    when (val admission = ftmsControl.admit(device.address, opcode)) {
+                        is FtmsControlCoordinator.Admission.Rejected ->
+                            notifyControlResult(device.address, byteArrayOf(0x80.toByte(), opcode.toByte(), admission.result.toByte()))
+                        is FtmsControlCoordinator.Admission.Admitted -> {
+                            val procedure = admission.procedure
+                            relayed = toZycle(uuid, out, withResponse) { success ->
+                                if (success) {
+                                    lastControlWriteMs = SystemClock.elapsedRealtime()
+                                    servoStepOwed = true
+                                } else ftmsControl.transportFailed(procedure.client, procedure.opcode)?.let {
+                                    notifyControlResult(it, byteArrayOf(
+                                        0x80.toByte(), procedure.opcode.toByte(),
+                                        FtmsControlCoordinator.OPERATION_FAILED.toByte(),
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                } else relayed = toZycle(uuid, out, withResponse) { success ->
+                    if (success && GattUuids.carriesControl(uuid)) {
+                        lastControlWriteMs = SystemClock.elapsedRealtime()
+                        servoStepOwed = true
+                    }
+                }
                 if (!relayed) FileLog.event("app write $tag NOT RELAYED — answering failure")
             } else FileLog.event("app write $tag = <no value / unknown char>")
             // ATT response = "received", always. FTMS puts the OUTCOME in the control point indication.
             if (responseNeeded) runCatching {
                 server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
-            }
-            // ...and if we could not hand it to the trainer, say so the way a trainer would: Response Code
-            // 0x80, <op>, 0x04 Operation Failed. Without this the app waits forever for an indication.
-            if (!relayed && uuid != null && device != null && value != null && value.isNotEmpty() &&
-                !preparedWrite && GattUuids.carriesControl(uuid)) {
-                // ONLY to the client that wrote, and NOT into the read cache: the response belongs to one
-                // FTMS procedure, and fanning it out tells the other app its own request failed.
-                val resp = byteArrayOf(0x80.toByte(), value[0], 0x04)
-                val cp = ch
-                // only if this client actually enabled the control point — never indicate unsolicited
-                if (subscribers[uuid]?.contains(device.address) == true) handler.post {
-                    val srv = server ?: return@post
-                    notify(srv, device, cp, resp, cp.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)
-                }
             }
         }
 

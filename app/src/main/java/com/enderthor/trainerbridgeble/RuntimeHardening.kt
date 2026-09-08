@@ -17,6 +17,54 @@ internal fun encodeTargetResistance(target: Int): ByteArray {
     return byteArrayOf(0x04, (value and 0xFF).toByte(), ((value ushr 8) and 0xFF).toByte())
 }
 
+internal class FtmsControlCoordinator {
+    data class Procedure(val client: String, val opcode: Int)
+
+    sealed interface Admission {
+        data class Admitted(val procedure: Procedure) : Admission
+        data class Rejected(val result: Int) : Admission
+    }
+
+    private var owner: String? = null
+    private var pending: Procedure? = null
+
+    @Synchronized fun admit(client: String, opcode: Int): Admission {
+        if (pending != null) return Admission.Rejected(OPERATION_FAILED)
+        if (if (opcode == REQUEST_CONTROL) owner != null && owner != client else owner != client)
+            return Admission.Rejected(CONTROL_NOT_PERMITTED)
+        return Procedure(client, opcode).let { pending = it; Admission.Admitted(it) }
+    }
+
+    @Synchronized fun transportFailed(client: String, opcode: Int): String? {
+        if (pending != Procedure(client, opcode)) return null
+        pending = null
+        return client
+    }
+
+    @Synchronized fun response(opcode: Int, result: Int): String? {
+        val procedure = pending?.takeIf { it.opcode == opcode } ?: return null
+        pending = null
+        if (opcode == REQUEST_CONTROL && result == SUCCESS) owner = procedure.client
+        return procedure.client
+    }
+
+    @Synchronized fun disconnect(client: String) {
+        if (owner == client) owner = null
+        if (pending?.client == client) pending = null
+    }
+
+    @Synchronized fun trainerDropped(): String? = owner.also { owner = null; pending = null }
+
+    @Synchronized fun clear() { owner = null; pending = null }
+
+    companion object {
+        const val SUCCESS = 0x01
+        const val OPERATION_FAILED = 0x04
+        const val CONTROL_NOT_PERMITTED = 0x05
+        private const val REQUEST_CONTROL = 0x00
+    }
+}
+
 internal class IdentityOwner<T : Any> {
     @Volatile private var value: T? = null
 
