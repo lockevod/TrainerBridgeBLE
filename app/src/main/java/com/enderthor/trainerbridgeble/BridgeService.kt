@@ -260,10 +260,8 @@ class BridgeService : Service() {
             status = getString(R.string.status_missing_bt_permission); listener?.invoke(); stopSelf(); return false
         }
         foreground = true
+        acquireWakeLock()
         handler.removeCallbacks(snapshot); handler.post(snapshot)   // stops itself once foreground goes false
-        // NOT here: the wake lock follows the TRAINER LINK, not the master switch (see the onState callback in
-        // startReceive). Held from here it blocked suspend for every hour the master was left on with no
-        // trainer in the room — which is most of the day, and the single biggest idle drain in the app.
         return true
     }
 
@@ -347,17 +345,6 @@ class BridgeService : Service() {
         val onState: (Boolean) -> Unit = { connected ->
           handler.post { receiveOwner.runIfCurrent(owner) {
             zycleConnected = connected
-            // The wake lock lives HERE, not in goForeground(): there is data to keep the CPU awake for only
-            // while a trainer is actually feeding us.
-            // On the DROP it lingers instead of releasing at once. The reconnect is a postDelayed 2 s away,
-            // and postDelayed does not wake a suspended CPU — releasing immediately can leave us suspended
-            // with NO scan running, and then the trainer's advertising has nothing to arrive at. Once a scan
-            // is actually up the controller wakes the AP on a match, so the lock is only needed to bridge
-            // that gap. (Residual: if startScan itself keeps failing, its backoff windows are unscanned.)
-            if (connected) acquireWakeLock() else {
-                handler.removeCallbacks(releaseWakeLockLater)
-                handler.postDelayed(releaseWakeLockLater, WAKELOCK_LINGER_MS)
-            }
             // Only the DROP is immediate; going on the air waits for onSynced below.
             if (!connected) { zycleSynced = false; mirror?.setTrainerLinked(false); ErgBias.forget() }
             if (!connected) { config.lastSeenAddress = ""; config.lastSeenName = "" }   // the config screen offers it only while live
@@ -395,7 +382,6 @@ class BridgeService : Service() {
         if (client == null && simSource == null) return
         FileLog.event("receive stop")
         receiveOwner.clear()   // waits for an admitted callback, then rejects every later one
-        releaseWakeLock()   // no source → nothing to stay awake for (the master switch keeps the FGS alive)
         mirror?.setTrainerLinked(false)   // no source → nothing to advertise, whatever the call order
         Config(this).let { it.lastSeenAddress = ""; it.lastSeenName = "" }
         client?.stop(); client = null; simSource = null; lastProfile = null; lastAdvBlueprint = null; currentSourceKey = null
@@ -652,26 +638,18 @@ class BridgeService : Service() {
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf()
     }
 
-    // Synchronized since the trainer link drives these: onState fires from the GATT binder thread AND from
-    // the client's main-thread heartbeat, and two concurrent acquires would strand a lock nothing releases.
     @Synchronized private fun acquireWakeLock() {
-        handler.removeCallbacks(releaseWakeLockLater)   // a reconnect inside the linger window keeps the lock
         if (wakeLock?.isHeld == true) return
         wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TrainerBridgeBLE:session").also { runCatching { it.acquire() } }
-        FileLog.event("wakelock ACQUIRED (trainer linked)")   // the two lines that make E1 verifiable
+        FileLog.event("wakelock ACQUIRED (master active)")
     }
 
     @Synchronized private fun releaseWakeLock() {
-        handler.removeCallbacks(releaseWakeLockLater)
         val held = wakeLock?.isHeld == true
         wakeLock?.let { if (it.isHeld) runCatching { it.release() } }; wakeLock = null
-        if (held) FileLog.event("wakelock RELEASED — the CPU may suspend from here")
+        if (held) FileLog.event("wakelock RELEASED (master inactive)")
     }
-
-    /** Deferred release after a trainer drop — see the onState callback in [startReceive]. Re-checks, so a
-     *  reconnect inside the linger window keeps the lock. */
-    private val releaseWakeLockLater = Runnable { if (!zycleConnected) releaseWakeLock() }
 
     /**
      * One compact state line a minute. Without it a quiet stretch of log is ambiguous — nothing happened, or
@@ -722,7 +700,6 @@ class BridgeService : Service() {
         private const val POWER_STALE_MS = 2000L   // ~8 missed frames at 4 Hz: covers a hiccup, not a dropout
         private const val ANT_RESTART_DELAY_MS = 1500L   // let the ANT service release the channel first
         private const val ERG_BIAS_PERSIST_MS = 60_000L  // at most one prefs write a minute; stopReceive flushes
-        private const val WAKELOCK_LINGER_MS = 6000L     // hold past the reconnect delay, until a scan is up
         private const val SNAPSHOT_MS = 60_000L          // one state line a minute while the service is up
         const val ACTION_MASTER_ON = "com.enderthor.trainerbridgeble.MASTER_ON"
         const val ACTION_MASTER_OFF = "com.enderthor.trainerbridgeble.MASTER_OFF"
