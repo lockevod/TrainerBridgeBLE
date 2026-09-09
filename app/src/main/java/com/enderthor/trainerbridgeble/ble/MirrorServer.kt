@@ -610,14 +610,22 @@ class MirrorServer(
         }.getOrDefault(false)
     }
 
-    /** EVERY path that fails to hand a TERMINAL result to its origin must release that origin's claim:
-     *  a controller waiting for a response it will never see would otherwise keep ERG locked for everyone.
+    /** The origin is GONE or the stack refused the indication outright: it will never see the terminal
+     *  result, so drop its claim or it keeps ERG locked for everyone.
      *  A rejection is not terminal for an admitted procedure and carries no such authority — a stale one
      *  could otherwise revoke ownership the same client legitimately acquired in the meantime. */
     private fun undeliverable(client: FtmsControlCoordinator.Client, why: String, terminal: Boolean) {
         if (!terminal || !ftmsControl.owns(client)) return
         if (ftmsControl.releaseOwner(client))
             FileLog.event("ftms terminal result undeliverable ($why) -> ${client.address}#${client.generation} — owner released")
+    }
+
+    /** NOT the same thing: the client is still connected and can still drive the trainer, it just has no
+     *  CCCD on the Control Point yet. Real controllers (Bestcycling) send Request Control BEFORE they
+     *  subscribe, so revoking ownership here refused every command they sent afterwards — a lost
+     *  indication turned into no ERG at all. Log it and leave the claim standing. */
+    private fun undelivered(client: FtmsControlCoordinator.Client, why: String) {
+        FileLog.event("ftms result not delivered ($why) -> ${client.address}#${client.generation} — control kept")
     }
 
     private fun notifyControlResult(
@@ -627,16 +635,16 @@ class MirrorServer(
     ) {
         val uuid = GattUuids.FTMS_CONTROL_POINT
         val ch = chars[uuid] ?: return undeliverable(client, "no local characteristic", terminal)
-        val subs = subscribers[uuid] ?: return undeliverable(client, "no subscriber set", terminal)
+        val subs = subscribers[uuid] ?: return undelivered(client, "nobody subscribed to 0x2AD9 yet")
         if (ftmsControl.identity(client.address) != client) return undeliverable(client, "stale generation", terminal)
-        if (!synchronized(subs) { subs.contains(client.address) }) return undeliverable(client, "not subscribed", terminal)
+        if (!synchronized(subs) { subs.contains(client.address) }) return undelivered(client, "not subscribed yet")
         handler.post {
             val srv = server ?: return@post undeliverable(client, "server closed", terminal)
             if (ftmsControl.identity(client.address) != client) return@post undeliverable(client, "stale generation", terminal)
             val dev = clients[client.address] ?: return@post undeliverable(client, "device gone", terminal)
-            val currentSubs = subscribers[uuid] ?: return@post undeliverable(client, "no subscriber set", terminal)
+            val currentSubs = subscribers[uuid] ?: return@post undelivered(client, "nobody subscribed to 0x2AD9 yet")
             if (!synchronized(currentSubs) { currentSubs.contains(client.address) })
-                return@post undeliverable(client, "unsubscribed before send", terminal)
+                return@post undelivered(client, "unsubscribed before send")
             if (terminal) terminalIndication = client
             if (!notify(srv, dev, ch, value, ch.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)) {
                 terminalIndication = null
