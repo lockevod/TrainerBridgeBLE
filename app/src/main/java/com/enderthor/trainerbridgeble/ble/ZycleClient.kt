@@ -78,6 +78,7 @@ class ZycleClient(
     private val connecting = AtomicBoolean(false)   // CAS: scan results arrive on a binder thread pool
     @Volatile private var stopped = false
     @Volatile private var scanning = false
+    override val searching: Boolean get() = scanning
     // elapsedRealtime, not wall-clock: a mid-ride clock re-sync would otherwise either trip the watchdog on
     // a healthy link or delay it past a real one, by the size of the correction.
     @Volatile private var lastMessageMs = 0L   // last notification, for the silent-link watchdog

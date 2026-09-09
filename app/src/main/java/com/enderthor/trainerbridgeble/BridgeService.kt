@@ -42,7 +42,7 @@ class BridgeService : Service() {
     @Volatile private var simSource: SimSource? = null       // read from GATT binder / server callback
     @Volatile private var mirror: MirrorServer? = null       // threads, so the reference itself must be
     @Volatile private var antTx: AntFecTx? = null            // safely published
-    private var wakeLock: PowerManager.WakeLock? = null
+    @Volatile private var wakeLock: PowerManager.WakeLock? = null
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
 
     private val lastValues = java.util.concurrent.ConcurrentHashMap<java.util.UUID, ByteArray>()   // every value seen, for a late mirror
@@ -274,6 +274,7 @@ class BridgeService : Service() {
             status = getString(R.string.status_missing_bt_permission); listener?.invoke(); stopSelf(); return false
         }
         foreground = true
+        lastTrainerLinkMs = android.os.SystemClock.elapsedRealtime()
         if (!acquireWakeLock()) {
             foreground = false
             status = getString(R.string.status_wakelock_failed); listener?.invoke()
@@ -364,6 +365,7 @@ class BridgeService : Service() {
         val onState: (Boolean) -> Unit = { connected ->
           handler.post { receiveOwner.runIfCurrent(owner) {
             zycleConnected = connected
+            if (connected) noteTrainerLink()
             // Only the DROP is immediate; going on the air waits for onSynced below.
             if (!connected) { zycleSynced = false; mirror?.setTrainerLinked(false); ErgBias.forget() }
             if (!connected) { config.lastSeenAddress = ""; config.lastSeenName = "" }   // the config screen offers it only while live
@@ -379,6 +381,7 @@ class BridgeService : Service() {
                 ftmsReleaseGeneration = null
             }
             zycleSynced = true
+            noteTrainerLink()
             activeMirror?.setTrainerLinked(true)
         } } }
         val c: TrainerSource = if (config.simulate) SimSource(onProfile, onValue, onState, onSynced).also { simSource = it }
@@ -386,7 +389,13 @@ class BridgeService : Service() {
             // Guarded too, or the replaced source's advertising blueprint and address get written over the
             // live one's. Neither needs a main-looper hop; the owner monitor provides the ordering.
             onAdv = { bp -> receiveOwner.runIfCurrent(owner) { lastAdvBlueprint = bp; mirror?.setAdvBlueprint(bp) } },
-            onFound = { name, addr -> receiveOwner.runIfCurrent(owner) { config.lastSeenName = name ?: ""; config.lastSeenAddress = addr } })
+            onFound = { name, addr -> receiveOwner.runIfCurrent(owner) {
+                // Binder thread: touch the @Volatile stamp only, never noteTrainerLink() — that would
+                // block a binder thread on the service monitor. A trainer stuck in a connect flap
+                // (status=133) is present, and must not be counted as absent by the idle guard.
+                lastTrainerLinkMs = android.os.SystemClock.elapsedRealtime()
+                config.lastSeenName = name ?: ""; config.lastSeenAddress = addr
+            } })
         currentSourceKey = sourceKey(config)
         c.start()
         client = c
@@ -655,7 +664,10 @@ class BridgeService : Service() {
 
     override fun onDestroy() {
         runCatching { unregisterReceiver(btStateReceiver) }
-        stopEmit(); stopReceive(); releaseWakeLock(); super.onDestroy()
+        stopEmit(); stopReceive(); releaseWakeLock()
+        foreground = false   // ...or the snapshot keeps reposting itself and holds the Service alive
+        handler.removeCallbacks(snapshot)
+        super.onDestroy()
     }
     override fun onTimeout(startId: Int) {
         stopEmit(); stopReceive(); releaseWakeLock()
@@ -663,31 +675,44 @@ class BridgeService : Service() {
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf()
     }
 
-    @Synchronized private fun acquireWakeLock(): Boolean {
+    /** elapsedRealtime of the last moment a trainer was linked, or of master-on. The lock is for an
+     *  ACTIVE session: it must survive a trainer drop mid-ride, but not an evening of the master being
+     *  left on with no trainer in the room, where it would block suspend for hours. */
+    @Volatile private var lastTrainerLinkMs = 0L
+
+    /** Called on every trainer link and once a minute while one is up. Re-takes the lock if the idle
+     *  guard released it. A failure here only degrades the session — never tears it down, unlike the
+     *  acquisition at master-on, because by this point a ride is already in progress. */
+    private fun noteTrainerLink() {
+        lastTrainerLinkMs = android.os.SystemClock.elapsedRealtime()
+        if (foreground && wakeLock?.isHeld != true) acquireWakeLock("trainer back after idle release")
+    }
+
+    @Synchronized private fun acquireWakeLock(why: String = "master active"): Boolean {
         if (wakeLock?.isHeld == true) return true
         val candidate = (getSystemService(POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TrainerBridgeBLE:session")
         val failure = runCatching { candidate.acquire(); check(candidate.isHeld) { "lock not held" } }.exceptionOrNull()
         if (failure != null) {
             runCatching { if (candidate.isHeld) candidate.release() }
-            FileLog.event("wakelock ACQUIRE FAILED (master active): ${failure.message ?: failure.javaClass.simpleName}")
+            FileLog.event("wakelock ACQUIRE FAILED ($why): ${failure.message ?: failure.javaClass.simpleName}")
             return false
         }
         wakeLock = candidate
-        FileLog.event("wakelock ACQUIRED (master active)")
+        FileLog.event("wakelock ACQUIRED ($why)")
         return true
     }
 
-    @Synchronized private fun releaseWakeLock() {
+    @Synchronized private fun releaseWakeLock(why: String = "master inactive") {
         val lock = wakeLock ?: return
         val failure = runCatching { if (lock.isHeld) lock.release() }.exceptionOrNull()
         val heldAfter = runCatching { lock.isHeld }
         if (heldAfter.getOrNull() == false) {
             wakeLock = null
-            FileLog.event("wakelock RELEASED (master inactive)")
+            FileLog.event("wakelock RELEASED ($why)")
         } else {
-            val reason = failure ?: heldAfter.exceptionOrNull()
-            FileLog.event("wakelock RELEASE FAILED (master inactive): ${reason?.message ?: "lock still held"}")
+            val cause = failure ?: heldAfter.exceptionOrNull()
+            FileLog.event("wakelock RELEASE FAILED ($why): ${cause?.message ?: "lock still held"}")
         }
     }
 
@@ -700,6 +725,17 @@ class BridgeService : Service() {
     private val snapshot = object : Runnable {
         override fun run() {
             if (!foreground) return   // master off / service dying: stop the loop, don't outlive it
+            // Idle guard. A trainer drop mid-ride is seconds to minutes, so the whole-session hold that
+            // recovers from one is untouched; the master left on all afternoon is not, and that case used
+            // to block CPU suspend until someone remembered. Runs before the log line: it must not depend
+            // on diagnostics being switched on.
+            if (zycleConnected || zycleSynced) noteTrainerLink()
+            // Release ONLY once the controller is holding the search for us. With no scan registered, a
+            // postDelayed retry cannot wake a suspended CPU and the trainer's advertising has nowhere to
+            // land — the guard would trade battery drain for a bridge that never comes back.
+            else if (wakeLock?.isHeld == true && client?.searching == true &&
+                android.os.SystemClock.elapsedRealtime() - lastTrainerLinkMs > WAKELOCK_IDLE_MS)
+                releaseWakeLock("idle: no trainer seen for ${WAKELOCK_IDLE_MS / 60_000}m")
             if (FileLog.enabled) FileLog.event(
                 "state master=${Config(this@BridgeService).masterEnabled} recv=$receiving emit=$emitting " +
                 "trainer=${if (zycleSynced) "synced" else if (zycleConnected) "connected" else "-"} " +
@@ -741,6 +777,11 @@ class BridgeService : Service() {
         private const val ANT_RESTART_DELAY_MS = 1500L   // let the ANT service release the channel first
         private const val ERG_BIAS_PERSIST_MS = 60_000L  // at most one prefs write a minute; stopReceive flushes
         private const val SNAPSHOT_MS = 60_000L          // one state line a minute while the service is up
+        // Deliberately generous: a mechanical stop, a phone call or a bathroom break must NOT cost the
+        // lock mid-session. Only "left on and walked away" reaches this. NOT 30 min: that is exactly where
+        // Android 12 silently downgrades a long-running scan to opportunistic, and a device test could not
+        // then tell that apart from this release breaking rediscovery.
+        private const val WAKELOCK_IDLE_MS = 45 * 60_000L
         const val ACTION_MASTER_ON = "com.enderthor.trainerbridgeble.MASTER_ON"
         const val ACTION_MASTER_OFF = "com.enderthor.trainerbridgeble.MASTER_OFF"
         const val ACTION_EMIT_START = "com.enderthor.trainerbridgeble.EMIT_START"
