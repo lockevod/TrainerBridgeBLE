@@ -133,7 +133,17 @@ class MonitorActivity : Activity() {
         render()
     }
 
+    /** Only while the master is ON: leaving the app open with the bridge idle should not pin the screen.
+     *  This is the whole mitigation — the Karoo's shutdown is armed by the screen going off, so a screen
+     *  that never sleeps never arms it. Nothing an app can do can veto the shutdown once it starts. */
+    private fun applyKeepScreenOn() {
+        val hold = config.keepScreenOn && config.masterEnabled
+        if (hold) window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
     private fun render() {
+        applyKeepScreenOn()
         val s = service
         val master = config.masterEnabled
         val emitting = s?.emitting == true

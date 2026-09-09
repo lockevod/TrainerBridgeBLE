@@ -193,6 +193,110 @@ class BridgeService : Service() {
      *  server and the advertising set die with it, and nothing reopens them — the mirror goes silently mute
      *  for the rest of the ride. The central half recovers on its own (its scan retries), so only the emit
      *  half is cycled here. */
+    // ── Karoo idle-shutdown keep-alive ──────────────────────────────────────────────────────────────
+    /** `persist.hx.idle_shutdown_delay` is 600000 ms on this firmware. Poke at 5 min, not 8: a single
+     *  missed tick (Karoo system briefly unbound, a late handler) would otherwise eat the whole margin
+     *  and the device powers off anyway. Hard-coded because the property is not readable from an app. */
+    private val KEEP_AWAKE_MS = 5 * 60_000L
+    /** A dispatch that did not reach the host retries in seconds, not at the next 5-minute slot. */
+    private val KEEP_AWAKE_RETRY_MS = 20_000L
+    private var karooSystem: io.hammerhead.karooext.KarooSystemService? = null
+    /** Recording (or paused) already prevents the idle shutdown, so poking then is pure cost — and it
+     *  relights a display the rider deliberately let sleep. */
+    @Volatile private var rideActive = false
+
+    private val keepAwakeTick = object : Runnable {
+        override fun run() {
+            if (!foreground || !Config(this@BridgeService).keepAwake) { karooDisconnect(); return }
+            // ONE policy with the wakelock idle guard. That guard releases the lock after
+            // WAKELOCK_IDLE_MS with no trainer, precisely so an abandoned session can sleep; keeping the
+            // whole DEVICE alive past that point would defeat it with a costlier resource. It is also the
+            // self-healing signal: noteTrainerLink() re-takes the lock the moment a trainer returns.
+            // (And once the lock is gone the CPU can suspend, which freezes this postDelayed anyway —
+            // uptimeMillis does not advance in suspend — so the poke could not be trusted regardless.)
+            val next = when {
+                wakeLock?.isHeld != true -> { FileLog.event("keep-awake: session idle — not poking"); KEEP_AWAKE_MS }
+                rideActive -> { FileLog.event("keep-awake: ride active — shutdown already suppressed"); KEEP_AWAKE_MS }
+                // Nothing to disarm while the screen is already awake — the countdown only starts when it
+                // sleeps. Matters when "keep this screen on" is also enabled: without this the poke fired
+                // every interval doing nothing, and the log said it had done something.
+                screenOn() -> { FileLog.event("keep-awake: screen already on — nothing to disarm"); KEEP_AWAKE_MS }
+                else -> pokeScreen()
+            }
+            handler.postDelayed(this, next)
+        }
+    }
+
+    private fun screenOn(): Boolean = runCatching {
+        (getSystemService(POWER_SERVICE) as PowerManager).isInteractive
+    }.getOrDefault(false)   // unknown -> poke anyway; a wasted wake beats a missed deadline
+
+    /** @return the delay until the next attempt: a short retry if the host did not take the call. */
+    private fun pokeScreen(): Long {
+        val ks = karooSystem
+        if (ks == null) { karooConnect(); return KEEP_AWAKE_RETRY_MS }
+        // dispatch() returns whether a controller RECEIVED the call — it is still no acknowledgement
+        // that the host acted on it, so this line says "submitted", never "the screen woke".
+        val taken = runCatching { ks.dispatch(io.hammerhead.karooext.models.TurnScreenOn) }
+            .onFailure { FileLog.event("keep-awake: TurnScreenOn threw — ${it.message}") }
+            .getOrDefault(false)
+        FileLog.event("keep-awake: TurnScreenOn submitted=$taken")
+        return if (taken) KEEP_AWAKE_MS else KEEP_AWAKE_RETRY_MS
+    }
+
+    private fun karooConnect() {
+        if (karooSystem != null) return
+        val ks = io.hammerhead.karooext.KarooSystemService(this)
+        karooSystem = ks
+        runCatching {
+            ks.connect { ok ->
+                FileLog.event("keep-awake: Karoo system connected=$ok")
+                if (ok) runCatching {
+                    ks.addConsumer<io.hammerhead.karooext.models.RideState> { st ->
+                        rideActive = st !is io.hammerhead.karooext.models.RideState.Idle
+                    }
+                }
+            }
+        }.onFailure { FileLog.event("keep-awake: connect FAILED — ${it.message}"); karooSystem = null }
+    }
+
+    private fun karooDisconnect() {
+        handler.removeCallbacks(keepAwakeTick)
+        // disconnect() unregisters every consumer with it; it also unbinds unconditionally, which throws
+        // if the bind never took — hence the guard.
+        karooSystem?.let { runCatching { it.disconnect() } }
+        karooSystem = null
+        rideActive = false
+    }
+
+    /** Called at master-on and whenever config changes, so the toggle takes effect without a restart.
+     *  Pokes once immediately: a START_STICKY restart can land well into an already-running countdown,
+     *  and waiting a full interval would then miss the deadline. */
+    private fun applyKeepAwake() {
+        handler.removeCallbacks(keepAwakeTick)
+        if (foreground && Config(this).keepAwake) {
+            karooConnect()
+            handler.postDelayed(keepAwakeTick, KEEP_AWAKE_RETRY_MS)
+        } else karooDisconnect()
+    }
+
+    /** The Karoo powers ITSELF off when idle: HxStateManagerService flips "can shutdown" the moment the
+     *  screen goes off, and with no ride recording it takes the device down — at any battery level. A
+     *  wakelock cannot veto that; nothing an app can do can. What we CAN do is say so, because otherwise
+     *  the log simply stops mid-line and a reader cannot tell a device shutdown from a crashed bridge. */
+    private val shutdownReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val battery = runCatching {
+                (getSystemService(BATTERY_SERVICE) as android.os.BatteryManager)
+                    .getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            }.getOrDefault(-1)
+            // Synchronous: the log executor will not get another slice.
+            FileLog.eventNow("=== device ${intent?.action?.substringAfterLast('.') ?: "SHUTDOWN"} " +
+                "— uptime ${android.os.SystemClock.elapsedRealtime() / 60_000}m, battery $battery%, " +
+                "master=${Config(this@BridgeService).masterEnabled}, wake=${wakeLock?.isHeld == true}")
+        }
+    }
+
     private val btStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, intent: Intent?) {
             if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
@@ -211,6 +315,13 @@ class BridgeService : Service() {
         // broadcast — guarded anyway, so adding a non-protected action here can't kill the service at birth.
         runCatching { registerReceiver(btStateReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)) }
             .onFailure { FileLog.event("bt state receiver not registered: ${it.message}") }
+        // ACTION_SHUTDOWN is not exempt from the implicit-broadcast ban, so it must be registered here
+        // rather than in the manifest — a manifest receiver would simply never fire.
+        runCatching {
+            registerReceiver(shutdownReceiver, IntentFilter(Intent.ACTION_SHUTDOWN).apply {
+                addAction(Intent.ACTION_REBOOT)
+            })
+        }.onFailure { FileLog.event("shutdown receiver not registered: ${it.message}") }
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -220,13 +331,13 @@ class BridgeService : Service() {
         when (intent?.action) {
             ACTION_MASTER_ON -> { if (goForeground()) maybeStartReceive() }
             ACTION_MASTER_OFF -> {
-                stopEmit(); stopReceive(); releaseWakeLock()
+                stopEmit(); stopReceive(); releaseWakeLock(); karooDisconnect()
                 Config(this).emitEnabled = false
                 foreground = false
                 ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf()
             }
             // master off: nothing to reconfigure, and don't leave an idle started service behind
-            ACTION_RECONFIGURE -> if (foreground) { FileLog.enabled = Config(this).loggingEnabled; applyConfigChange() }
+            ACTION_RECONFIGURE -> if (foreground) { FileLog.enabled = Config(this).loggingEnabled; applyConfigChange(); applyKeepAwake() }
                                  else if (!Config(this).masterEnabled) stopSelf()   // don't kill a service the master wants alive
             ACTION_EMIT_START -> { if (foreground) startEmit() }   // never emit from a non-foreground (master-off) service
             ACTION_EMIT_STOP -> { Config(this).emitEnabled = false; stopEmit() }
@@ -281,6 +392,7 @@ class BridgeService : Service() {
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf()
             return false
         }
+        applyKeepAwake()
         handler.removeCallbacks(snapshot); handler.post(snapshot)   // stops itself once foreground goes false
         return true
     }
@@ -664,13 +776,15 @@ class BridgeService : Service() {
 
     override fun onDestroy() {
         runCatching { unregisterReceiver(btStateReceiver) }
+        runCatching { unregisterReceiver(shutdownReceiver) }
+        karooDisconnect()
         stopEmit(); stopReceive(); releaseWakeLock()
         foreground = false   // ...or the snapshot keeps reposting itself and holds the Service alive
         handler.removeCallbacks(snapshot)
         super.onDestroy()
     }
     override fun onTimeout(startId: Int) {
-        stopEmit(); stopReceive(); releaseWakeLock()
+        stopEmit(); stopReceive(); releaseWakeLock(); karooDisconnect()
         foreground = false   // or a later EMIT_START would pass the foreground gate on a dying service
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf()
     }

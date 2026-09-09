@@ -42,6 +42,8 @@
     <string name="config_identity">Identidad anunciada</string>
     <string name="config_name_hint">Nombre con el que nos ven las apps. DÉJALO VACÍO para usar el nombre Bluetooth del propio dispositivo: es lo más simple y así no se cambia el nombre del aparato. Es cosmético en cualquier caso: no afecta a lo que la app puede hacer con el rodillo.</string>
     <string name="config_options">Opciones</string>
+    <string name="config_keep_awake">Evitar que el Karoo se apague (enciende la pantalla cada 5 min - gasta bateria; se apaga a los 10 min sin ride)</string>
+    <string name="config_keep_screen">Mantener encendida ESTA pantalla mientras esté abierta (el Karoo se apaga solo sin ride)</string>
     <string name="config_log">Guardar log (CSV)</string>
     <string name="config_sim">Modo simulación (sin bici)</string>
     <string name="config_ant_output">Salida ANT+ (potencia corregida a reloj/ciclocomputador)</string>

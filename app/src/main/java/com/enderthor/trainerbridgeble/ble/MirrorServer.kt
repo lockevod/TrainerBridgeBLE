@@ -292,7 +292,7 @@ class MirrorServer(
         // subscribers/clients too: clearServices() moves every ATT handle, so a peer that reconnected to a
         // remembered MAC would be tracked as subscribed to characteristic objects that no longer exist.
         // serviceRetries, or a rebuild starts with the budget the failed build already spent.
-        chars.clear(); pendingServices.clear(); subscribers.clear(); serviceRetries = 0
+        chars.clear(); pendingServices.clear(); subscribers.clear(); serviceRetries = 0; audienceWarned.clear()
         for (svc in profile.services) {
             if (GattUuids.isStackService(svc.uuid)) continue
             val service = BluetoothGattService(svc.uuid,
@@ -385,6 +385,7 @@ class MirrorServer(
         procedureDeadline = null
         ftmsControl.clear()
         terminalIndication = null
+        audienceWarned.clear()
         clients.clear(); subscribers.clear()
         // ...and never keep broadcasting under the trainer's name with no server behind it: an app that
         // connects during the rebuild window finds no services and caches a broken device for the session.
@@ -410,6 +411,7 @@ class MirrorServer(
         serviceAddWatchdog = null
         ftmsControl.clear()
         terminalIndication = null
+        audienceWarned.clear()
         procedureDeadline?.let { handler.removeCallbacks(it.second) }
         procedureDeadline = null
         stopAdvertising()
@@ -448,6 +450,23 @@ class MirrorServer(
 
     /** For the service's periodic snapshot: how many apps are attached, and how far the level we report has
      *  drifted from the machine's (shown/raw — they diverge by every servo step we absorbed, by design). */
+    /** UUIDs we have already reported as having no listener, so the notice is one line per dry spell and
+     *  not one per 4 Hz packet. Cleared as soon as somebody subscribes. */
+    private val audienceWarned = java.util.Collections.newSetFromMap(ConcurrentHashMap<UUID, Boolean>())
+
+    /** A value arrived from the trainer and there was nobody to hand it to. Silence here reads exactly like
+     *  "the trainer never sent it", which is the wrong conclusion to draw from a log. */
+    private fun noAudience(charUuid: UUID) {
+        // Only for characteristics that CAN have an audience. A read-only one (Feature, ranges, device
+        // info) is cached for a later read, not dropped — warning about it fires on every mirror start,
+        // when startEmit seeds the cache with every value we already read from the trainer.
+        val notifies = chars[charUuid]?.properties?.and(
+            BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) ?: 0
+        if (notifies == 0) return
+        if (FileLog.enabled && audienceWarned.add(charUuid))
+            FileLog.event("relay ${shortUuid(charUuid)} DROPPED — no app subscribed to it")
+    }
+
     val clientCount: Int get() = clients.size
     val levelDebug: String get() = "${shownZycleLevel ?: "-"}/${lastRawZycleLevel ?: "-"}"
 
@@ -579,9 +598,19 @@ class MirrorServer(
             else -> value
         }
         cache[charUuid] = out
+        // Machine Status is how FTMS ANNOUNCES a change the app did not command — the resistance knob was
+        // turned, the target moved. It fires only on a change, so log every one with its audience: "the
+        // trainer told us, and we had nobody to tell" is otherwise indistinguishable from "it never told us".
+        if (charUuid == GattUuids.MACHINE_STATUS && FileLog.enabled) {
+            val op = value.firstOrNull()?.toInt()?.and(0xFF)
+            val param = if (value.size > 1) FileLog.hex(value.copyOfRange(1, value.size)) else "-"
+            FileLog.event("machine status op=%s param=%s -> %d subscriber(s)"
+                .format(op?.let { "0x%02X".format(it) } ?: "-", param, subscribers[charUuid]?.size ?: 0))
+        }
         val ch = chars[charUuid] ?: return
-        val subs = subscribers[charUuid] ?: return
-        if (subs.isEmpty()) return
+        val subs = subscribers[charUuid] ?: return noAudience(charUuid)
+        if (subs.isEmpty()) return noAudience(charUuid)
+        audienceWarned.remove(charUuid)
         logRelay(charUuid, value, out, subs.size)
         handler.post {
             val srv = server ?: return@post
