@@ -204,6 +204,8 @@ class BridgeService : Service() {
     /** Recording (or paused) already prevents the idle shutdown, so poking then is pure cost — and it
      *  relights a display the rider deliberately let sleep. */
     @Volatile private var rideActive = false
+    /** Bounds the screen-on skip to one interval; see the branch that uses it. */
+    private var screenOnSkips = 0
 
     private val keepAwakeTick = object : Runnable {
         override fun run() {
@@ -220,8 +222,17 @@ class BridgeService : Service() {
                 // Nothing to disarm while the screen is already awake — the countdown only starts when it
                 // sleeps. Matters when "keep this screen on" is also enabled: without this the poke fired
                 // every interval doing nothing, and the log said it had done something.
-                screenOn() -> { FileLog.event("keep-awake: screen already on — nothing to disarm"); KEEP_AWAKE_MS }
-                else -> pokeScreen()
+                // NEVER twice running, though: isInteractive is a proxy, and AOSP counts a DREAMING state
+                // as interactive. If a firmware ever armed the countdown in a state that reads interactive,
+                // an unlimited skip would be the one error the 5-vs-10-minute margin cannot absorb — it
+                // would persist. A poke with the screen genuinely on is a no-op, so being wrong this way
+                // is free; being wrong the other way costs the device.
+                screenOn() && screenOnSkips == 0 -> {
+                    screenOnSkips++
+                    FileLog.event("keep-awake: screen already on — no countdown to disarm, poke not needed")
+                    KEEP_AWAKE_MS
+                }
+                else -> { screenOnSkips = 0; pokeScreen() }
             }
             handler.postDelayed(this, next)
         }
@@ -270,11 +281,13 @@ class BridgeService : Service() {
     }
 
     /** Called at master-on and whenever config changes, so the toggle takes effect without a restart.
-     *  Pokes once immediately: a START_STICKY restart can land well into an already-running countdown,
-     *  and waiting a full interval would then miss the deadline. */
+     *  Posts a tick in 20 s rather than waiting a full interval: a START_STICKY restart can land well into
+     *  an already-running countdown. (That tick may SKIP if the screen is on — which is sound, because a
+     *  countdown can only have been armed by the screen sleeping.) */
     private fun applyKeepAwake() {
         handler.removeCallbacks(keepAwakeTick)
         if (foreground && Config(this).keepAwake) {
+            screenOnSkips = 0
             karooConnect()
             handler.postDelayed(keepAwakeTick, KEEP_AWAKE_RETRY_MS)
         } else karooDisconnect()
