@@ -67,6 +67,26 @@ class Config(context: Context) {
         set(v) = p.edit().putString(KEY_ADVNAME, v).apply()
 
     /** Write the diagnostic CSV log. */
+    /** Poke the Karoo awake before its idle timer fires. `persist.hx.idle_shutdown_delay` is 600000 ms:
+     *  ten minutes after the screen sleeps with no ride recording, HxStateManagerService powers the whole
+     *  device off — at any battery level, and a running bridge does NOT count as activity. This dispatches
+     *  the SDK's TurnScreenOn every 5 minutes, which resets that.
+     *  COST, stated honestly: TurnScreenOn has no counterpart that turns it back off, so each poke costs
+     *  one full device screen timeout (~1 min on a stock Karoo), not "a brief flash" — roughly a 20%
+     *  screen duty cycle for as long as a trainer is linked. The screen is the biggest consumer on this
+     *  device. It stops on the same leash as the wakelock guard, so an abandoned session still sleeps. */
+    var keepAwake: Boolean
+        get() = p.getBoolean(KEY_KEEP_AWAKE, false)
+        set(v) = p.edit().putBoolean(KEY_KEEP_AWAKE, v).apply()
+
+    /** Hold the screen on while the bridge is active. The Karoo powers ITSELF off when idle: its
+     *  HxStateManagerService arms the shutdown the moment the screen sleeps, and with no ride recording
+     *  it takes the device down at any battery level. Recording a ride prevents it — this is for the
+     *  sessions where you don't. Costs real battery: the screen is the biggest consumer on the device. */
+    var keepScreenOn: Boolean
+        get() = p.getBoolean(KEY_KEEP_SCREEN, false)
+        set(v) = p.edit().putBoolean(KEY_KEEP_SCREEN, v).apply()
+
     var loggingEnabled: Boolean
         get() = p.getBoolean(KEY_LOG, false)
         set(v) = p.edit().putBoolean(KEY_LOG, v).apply()
@@ -111,6 +131,8 @@ class Config(context: Context) {
         const val KEY_NAME = "pairedName"
         const val KEY_ADVNAME = "advertisedName"
         const val KEY_LOG = "loggingEnabled"
+        const val KEY_KEEP_SCREEN = "keepScreenOn"
+        const val KEY_KEEP_AWAKE = "keepAwake"
         const val KEY_SIM = "simulate"
         const val KEY_ANT = "antOutput"
         const val KEY_ANT_ID = "antDeviceId"

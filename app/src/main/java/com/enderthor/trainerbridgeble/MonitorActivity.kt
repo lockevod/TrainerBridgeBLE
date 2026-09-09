@@ -133,7 +133,17 @@ class MonitorActivity : Activity() {
         render()
     }
 
+    /** Only while the master is ON: leaving the app open with the bridge idle should not pin the screen.
+     *  This is the whole mitigation — the Karoo's shutdown is armed by the screen going off, so a screen
+     *  that never sleeps never arms it. Nothing an app can do can veto the shutdown once it starts. */
+    private fun applyKeepScreenOn() {
+        val hold = config.keepScreenOn && config.masterEnabled
+        if (hold) window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
     private fun render() {
+        applyKeepScreenOn()
         val s = service
         val master = config.masterEnabled
         val emitting = s?.emitting == true
@@ -143,7 +153,7 @@ class MonitorActivity : Activity() {
         startBtn.isEnabled = canEmit; startBtn.alpha = if (canEmit) 1f else 0.4f
         // Fresh = a sample arrived within the last 3s. A brief (<3s) blip keeps showing the last value
         // (the mirror is re-emitting it too); a longer gap blanks the tiles to "—".
-        val fresh = s != null && s.lastSampleMs != 0L && System.currentTimeMillis() - s.lastSampleMs <= STALE_MS
+        val fresh = s != null && s.lastSampleMs != 0L && android.os.SystemClock.elapsedRealtime() - s.lastSampleMs <= STALE_MS
         // Banner shows the TRAINER (receive) link when master is on; "Off" when master is off.
         val (bText, bColor) = when {
             !master -> getString(R.string.monitor_off) to Palette.MUTED

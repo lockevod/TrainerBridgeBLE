@@ -72,6 +72,17 @@ trainer for power, speed and cadence — so recording the *corrected* power matt
 > Note: Karoo extensions auto-start, so the app is always loaded on the Karoo — the **App active** switch
 > is how you make sure it isn't consuming anything when you're not using it.
 
+### If the Karoo switches itself off mid-session
+
+The Karoo powers **itself** off about ten minutes after its screen goes to sleep when no ride is being
+recorded — whatever the battery level, and whatever any app is doing. It is the Karoo's own idle
+behaviour, not the bridge crashing: the bridge is simply switched off with the rest of the device.
+
+If you record the ride on the Karoo, this never happens. If you'd rather not record — you use the Karoo
+only as the bridge and something else does the recording — turn on **Keep the Karoo awake** in Config.
+It briefly wakes the screen every five minutes, which is enough to stop the countdown. That costs
+battery (the screen is the biggest consumer on the device), so it is off by default.
+
 ---
 
 ## Using it on a phone
@@ -122,7 +133,15 @@ Open **Configuración** from the Monitor:
   because Android has no per-advertisement name — and then anything else the device advertises carries that
   name too, until it is restored on stop.
 - **Options** — save diagnostic log (CSV), simulation mode (a fake trainer for testing with no hardware),
-  ANT+ output + its device id.
+  ANT+ output + its device id, and the two anti-shutdown switches below.
+- **Keep the Karoo awake** (off by default) — stops the Karoo powering itself off while the bridge is
+  running with no ride recorded; see *If the Karoo switches itself off mid-session* above. It wakes the
+  screen every five minutes, so it uses noticeably more battery. It stops on its own once there has been
+  no trainer for a while, so a session you walked away from still lets the device sleep, and it does
+  nothing while a ride is recording (the Karoo doesn't switch off then anyway).
+- **Keep THIS screen on** (off by default) — holds the screen awake **while the Monitor screen is open**,
+  which also prevents the shutdown. It stops applying the moment you switch to another screen or app,
+  which is why the switch above exists.
 
 ---
 
