@@ -144,14 +144,16 @@ class BridgeService : Service() {
             val target = ((lastResistance ?: 0) + delta).coerceIn(0, 200)   // 0..200 per the Zycle's 0x2AD6 range
             val bytes = encodeTargetResistance(target)
             val localMirror = mirror
-            if (localMirror != null && !localMirror.admitLocalControl(0x04)) {
+            val procedure = localMirror?.admitLocalControl(0x04, bytes)
+            if (localMirror != null && procedure == null) {
+                lastControl = getString(R.string.status_control_busy)
                 FileLog.event("UI button → resistance target=$target BLOCKED — FTMS control busy")
                 listener?.invoke()
                 return
             }
             val source = client
             if (source == null) {
-                localMirror?.localControlTransportFailed(0x04)
+                procedure?.let { localMirror.localControlTransportFailed(it) }
                 FileLog.event("UI button → resistance target=$target FAILED")
                 listener?.invoke()
             } else source.write(
@@ -159,15 +161,27 @@ class BridgeService : Service() {
                 bytes,
                 true,
             ) { success ->
-                if (!success) localMirror?.localControlTransportFailed(0x04)
+                // Arm/close the procedure HERE, on the write callback, not inside the UI post below:
+                // that post is a second main-loop hop, and an arm that lands after a newer procedure was
+                // admitted used to strip the newer one of its deadline.
+                if (success) procedure?.let { localMirror.localControlDispatched(it) }
+                else procedure?.let { localMirror.localControlTransportFailed(it) }
                 handler.post {
                     if (client !== source) return@post
                     if (success) {
-                        // This path bypasses the mirror, so retire ERG learning only after the trainer write.
-                        ErgBias.onControl(bytes, android.os.SystemClock.elapsedRealtime())
+                        // Transport only. With the mirror up the trainer's FTMS Response Code decides
+                        // acceptance, and onControlAccepted commits it — including telling ErgBias to
+                        // retire any armed ERG target. The response clock starts now, not at admission.
                         lastResistance = target
-                        lastControl = getString(R.string.control_resistance_target, target)
-                        FileLog.event("UI button → resistance target=$target")
+                        if (procedure == null) {
+                            // No mirror: nothing will ever correlate a response, so the write is all we
+                            // have. A trainer that rejects the procedure is indistinguishable from one
+                            // that accepts it on this path.
+                            ErgBias.onControl(bytes, android.os.SystemClock.elapsedRealtime())
+                            lastControl = getString(R.string.control_resistance_target, target)
+                        }
+                        FileLog.event("UI button → resistance target=$target sent" +
+                            if (procedure != null) " (awaiting trainer verdict #${procedure.id})" else "")
                     } else FileLog.event("UI button → resistance target=$target FAILED")
                     listener?.invoke()
                 }
@@ -262,6 +276,7 @@ class BridgeService : Service() {
         foreground = true
         if (!acquireWakeLock()) {
             foreground = false
+            status = getString(R.string.status_wakelock_failed); listener?.invoke()
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf()
             return false
         }
@@ -424,19 +439,25 @@ class BridgeService : Service() {
                     onComplete(false)
                     false
                 } else source.write(uuid, bytes, withResponse) { success ->
-                    var moved = false
-                    if (success) emitOwner.runIfCurrent(emitToken) {
-                        if (com.enderthor.trainerbridgeble.ble.GattUuids.carriesControl(uuid)) {
-                            // `bytes` is already inverse-corrected: exactly the raw watts the trainer is told
-                            // to hold, which is what measured power has to be compared against.
-                            ErgBias.onControl(bytes, android.os.SystemClock.elapsedRealtime())
-                            lastControl = describeControl(bytes)
-                            moved = true
-                        }
-                    }
+                    // An accepted ATT write is NOT an accepted procedure: the trainer can still answer
+                    // Control Not Permitted / Invalid Parameter. Committing here taught ERG bias from
+                    // targets the machine refused. onControlAccepted below is the real commit point.
                     onComplete(success)
-                    if (moved) listener?.invoke()
                 }
+            },
+            onControlAccepted = { bytes ->
+                // Delivered on the trainer's binder thread. The mutations must happen UNDER the monitor,
+                // not after a check-then-act: stopEmit() runs on main and a callback that merely passed
+                // the check could otherwise publish into an already torn-down session.
+                var moved = false
+                emitOwner.runIfCurrent(emitToken) {
+                    // `bytes` is already inverse-corrected: exactly the raw watts the trainer was told to
+                    // hold, which is what measured power has to be compared against.
+                    ErgBias.onControl(bytes, android.os.SystemClock.elapsedRealtime())
+                    lastControl = describeControl(bytes)
+                    moved = true
+                }
+                if (moved) listener?.invoke()
             },
             onTrainerRecycle = {
                 var current = false
@@ -682,7 +703,7 @@ class BridgeService : Service() {
             if (FileLog.enabled) FileLog.event(
                 "state master=${Config(this@BridgeService).masterEnabled} recv=$receiving emit=$emitting " +
                 "trainer=${if (zycleSynced) "synced" else if (zycleConnected) "connected" else "-"} " +
-                "adv=$bleAdvOk apps=${mirror?.clientCount ?: 0} " +
+                "adv=$bleAdvOk apps=${mirror?.clientCount ?: 0} wake=${wakeLock?.isHeld == true} " +
                 "powerFresh=$powerFresh raw=$lastRawW corr=$lastCorrectedW cad=$lastCadence res=$resistance " +
                 "erg=${ErgBias.commanded} bias=${ErgBias.watts}W " +
                 "level=${mirror?.levelDebug ?: "-"} ant=${if (antEnabled) antOk else null} stale=${staleCallbacks.get()}")

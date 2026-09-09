@@ -253,13 +253,23 @@ class ZycleClient(
     private fun scheduleWriteRetry(request: WriteReq) {
         handler.postDelayed({
             if (!stopped && writeSeq.get() == request.ticket.sequence && gattSessions.current === request.session) {
+                FileLog.event("Zycle write ${shortUuid(request.uuid)} #${request.ticket.sequence} RETRY")
                 enqueueWrite(request.copy(retriesLeft = request.retriesLeft - 1))
-            } else completeWrite(request, false)
+            } else {
+                // The ordering invariant lives or dies here: without this line a superseded retry is
+                // indistinguishable from a lost write in the log.
+                FileLog.event("Zycle write ${shortUuid(request.uuid)} #${request.ticket.sequence} " +
+                    "SUPERSEDED (now #${writeSeq.get()})")
+                completeWrite(request, false)
+            }
         }, CONTROL_RETRY_DELAY_MS)
     }
 
     private fun completeWrite(request: WriteReq, success: Boolean) {
         pendingWrites.remove(request.ticket)
+        if (GattUuids.carriesControl(request.uuid))
+            FileLog.event("Zycle write ${shortUuid(request.uuid)} #${request.ticket.sequence} " +
+                if (success) "COMPLETED" else "FAILED")
         runCatching { request.ticket.complete(success) }
             .onFailure { FileLog.event("Zycle write ${shortUuid(request.uuid)} completion callback FAILED") }
     }
@@ -511,10 +521,21 @@ class ZycleClient(
             gattSessions.runIfCurrent(g) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     val v = @Suppress("DEPRECATION") (ch.value?.copyOf() ?: ByteArray(0))
-                    FileLog.event("Zycle read ${shortUuid(ch.uuid)} = ${FileLog.hex(v)}")   // identity/feature/ranges values
-                    onValue(ch.uuid, v)
-                } else FileLog.event("Zycle read ${shortUuid(ch.uuid)} failed status=$status")
-                if (ch.uuid == FTMS_FEATURE) bootstrapReadiness?.featureRead = status == BluetoothGatt.GATT_SUCCESS
+                    // A GATT_SUCCESS read of a too-short value is not a Feature. Validate BEFORE
+                    // publishing: onValue() seeds lastValues and any already-connected mirror client,
+                    // which would then cache "no ERG, no automatic mode" for its whole connection.
+                    // 0x2ACC is two mandatory 32-bit fields: Fitness Machine Features AND Target Setting
+                    // Features. A 4-byte read has no Target Setting Features, so the client concludes
+                    // "no ERG, no automatic mode" — the exact failure this gate exists to prevent.
+                    val usable = ch.uuid != FTMS_FEATURE || v.size >= 8
+                    FileLog.event("Zycle read ${shortUuid(ch.uuid)} = ${FileLog.hex(v)}" +
+                        if (!usable) " — REJECTED, too short for FTMS Feature" else "")
+                    if (usable) onValue(ch.uuid, v)
+                    if (ch.uuid == FTMS_FEATURE) bootstrapReadiness?.featureRead = usable
+                } else {
+                    FileLog.event("Zycle read ${shortUuid(ch.uuid)} failed status=$status")
+                    if (ch.uuid == FTMS_FEATURE) bootstrapReadiness?.featureRead = false
+                }
                 lastMessageMs = android.os.SystemClock.elapsedRealtime()
                 opDone()
             }
@@ -577,7 +598,24 @@ class ZycleClient(
     )
 
     private fun enqueueSubscribe(g: BluetoothGatt, ch: BluetoothGattCharacteristic, retry: Boolean = true): Unit = enqueue {
-        g.setCharacteristicNotification(ch, true)
+        // The CCCD write tells the TRAINER to send; this tells ANDROID to deliver. If only the former
+        // succeeds we advertise as controllable and no Control Point response ever reaches us.
+        if (!g.setCharacteristicNotification(ch, true)) {
+            // Requeue once, like the writeDescriptor refusal below: a transient false during re-discovery
+            // would otherwise fail readiness permanently and drop us into a reconnect loop.
+            FileLog.event("Zycle subscribe ${shortUuid(ch.uuid)} — local registration REFUSED" +
+                if (retry) " — requeueing" else " — giving up")
+            if (retry) handler.postDelayed({
+                gattSessions.runIfCurrent(g) {
+                    enqueueSubscribe(g, ch, retry = false)
+                    opDone()
+                }
+            }, OP_REQUEUE_MS) else {
+                markBootstrapSubscription(ch.uuid, false)
+                opDone()
+            }
+            return@enqueue
+        }
         val d = ch.getDescriptor(cccd)
         if (d == null) {
             markBootstrapSubscription(ch.uuid, false)

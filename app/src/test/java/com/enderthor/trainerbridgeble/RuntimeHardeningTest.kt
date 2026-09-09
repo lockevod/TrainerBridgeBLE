@@ -6,6 +6,7 @@ import kotlin.concurrent.thread
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -29,144 +30,281 @@ import org.junit.Test
  *     ownership rejection is checked below; the call shape is not.
  */
 class RuntimeHardeningTest {
-    private val clientA = FtmsControlCoordinator.Client("A", 1L)
-    private val clientB = FtmsControlCoordinator.Client("B", 1L)
+    private fun admitted(c: FtmsControlCoordinator.Admission?) =
+        (c as FtmsControlCoordinator.Admission.Admitted).procedure
+
+    private fun rejected(result: Int, client: FtmsControlCoordinator.Client?) =
+        FtmsControlCoordinator.Admission.Rejected(result, client)
+
+    private val erg = byteArrayOf(0x05, 0xF0.toByte(), 0x00)     // Set Target Power 240 W
+    private val res = byteArrayOf(0x04, 0x24, 0x00)              // Set Target Resistance 36
 
     @Test fun localProcedureBlocksExternalAndDrainsWithoutClientNotification() {
         val coordinator = FtmsControlCoordinator()
+        val a = coordinator.connected("A")
 
-        assertTrue(coordinator.admitLocal(0x04))
-        assertEquals(
-            FtmsControlCoordinator.Admission.Rejected(FtmsControlCoordinator.OPERATION_FAILED),
-            coordinator.admit(clientA, 0x00),
-        )
+        assertNotNull(coordinator.admitLocal(0x04, res))
+        assertEquals(rejected(FtmsControlCoordinator.OPERATION_FAILED, a), coordinator.admit("A", 0x00, null))
         assertNull(coordinator.response(0x05, FtmsControlCoordinator.SUCCESS))
-        assertEquals(
-            FtmsControlCoordinator.Admission.Rejected(FtmsControlCoordinator.OPERATION_FAILED),
-            coordinator.admit(clientA, 0x00),
-        )
-        assertNull(coordinator.response(0x04, FtmsControlCoordinator.SUCCESS))
-        assertEquals(
-            FtmsControlCoordinator.Admission.Admitted(FtmsControlCoordinator.Procedure(clientA, 0x00)),
-            coordinator.admit(clientA, 0x00),
-        )
+        assertEquals(rejected(FtmsControlCoordinator.OPERATION_FAILED, a), coordinator.admit("A", 0x00, null))
+        assertNull(coordinator.response(0x04, FtmsControlCoordinator.SUCCESS)?.client)
+        assertNotNull(admitted(coordinator.admit("A", 0x00, null)))
         coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
-        assertFalse(coordinator.admitLocal(0x04))
+        assertNull(coordinator.admitLocal(0x04, res))
+    }
+
+    /** The C1 fix, and the bug the first attempt at it introduced: a LOCAL procedure has no client, so a
+     *  `Client?` return could not distinguish "timed out" from "not the pending one". Skipping recovery on
+     *  that null left the session quarantined with nothing able to lift it for the rest of the ride. */
+    @Test fun aTimedOutLocalProcedureStillReportsItsTerminationSoRecoveryRuns() {
+        val coordinator = FtmsControlCoordinator()
+        val local = coordinator.admitLocal(0x04, res)!!
+        assertNull(local.client)
+
+        val terminated = coordinator.timedOut(local)
+        assertNotNull(terminated)                       // matched, even with no client to notify
+        assertNull(terminated!!.client)
+        assertEquals(local, terminated.procedure)
+    }
+
+    @Test fun anUnansweredProcedureIsReleasedByItsDeadlineAndQuarantinesTheLink() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.connected("A")
+        coordinator.admit("A", 0x00, null)
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)          // A owns control
+        val stuck = admitted(coordinator.admit("A", 0x04, res))             // trainer never answers
+
+        assertEquals(FtmsControlCoordinator.OPERATION_FAILED,
+            (coordinator.admit("A", 0x04, res) as FtmsControlCoordinator.Admission.Rejected).result)
+        assertEquals("A", coordinator.timedOut(stuck)?.client?.address)
+        // quarantined until the trainer link is recycled — not silently reopened
+        assertEquals(FtmsControlCoordinator.OPERATION_FAILED,
+            (coordinator.admit("A", 0x04, res) as FtmsControlCoordinator.Admission.Rejected).result)
+        coordinator.trainerReady()
+        assertNotNull(admitted(coordinator.admit("A", 0x04, res)))
+    }
+
+    @Test fun anExpiredDeadlineCannotTerminateTheProcedureThatReplacedIt() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.connected("A")
+        coordinator.admit("A", 0x00, null)
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
+        val first = admitted(coordinator.admit("A", 0x04, res))
+        coordinator.response(0x04, FtmsControlCoordinator.SUCCESS)
+        val second = admitted(coordinator.admit("A", 0x04, res))
+
+        assertNull(coordinator.timedOut(first))         // stale: must not quarantine or cancel
+        assertNull(coordinator.transportFailed(first))  // ...and must not disarm the newer deadline
+        assertEquals("A", coordinator.transportFailed(second)?.client?.address)
+    }
+
+    /** The payload must ride WITH the procedure. As a side slot, one procedure's response committed
+     *  another's target — teaching ERG bias a number the machine was never holding. */
+    @Test fun aResponseCommitsTheBytesOfTheProcedureItTerminated() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.connected("A")
+        coordinator.admit("A", 0x00, null)
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
+
+        val ergProcedure = admitted(coordinator.admit("A", 0x05, erg))
+        assertArrayEquals(erg, coordinator.transportFailed(ergProcedure)?.bytes)   // failed: bytes came back
+        // ...and the slot is empty afterwards, so a later local success cannot commit them
+        val local = coordinator.admitLocal(0x04, res)
+        assertNull(local)                                        // A still owns control
+        coordinator.trainerDropped()
+        val afterDrop = coordinator.admitLocal(0x04, res)!!
+        assertArrayEquals(res, coordinator.response(0x04, FtmsControlCoordinator.SUCCESS)?.bytes)
+        assertEquals(0x04, afterDrop.opcode)
+    }
+
+    /** The local button carries 0x04, which is ErgBias's signal to retire an armed ERG target. Routing it
+     *  through the mirror without a payload silently stopped that signal from ever arriving. */
+    @Test fun aLocalProcedureCarriesItsOwnBytesToTheCommitPoint() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.admitLocal(0x04, res)
+        val terminated = coordinator.response(0x04, FtmsControlCoordinator.SUCCESS)
+        assertNotNull(terminated)
+        assertArrayEquals(res, terminated!!.bytes)
+        assertNull(terminated.client)
+    }
+
+    /** The C2 fix. The identity lookup and the admission are one step, so a disconnect cannot land between
+     *  them and let a client that is already gone be promoted to owner — locking out its own reconnect. */
+    @Test fun admissionAfterDisconnectIsRefusedRatherThanPromotingAGhost() {
+        val coordinator = FtmsControlCoordinator()
+        val first = coordinator.connected("A")
+        coordinator.disconnected("A")
+
+        assertNull(coordinator.admit("A", 0x00, null))     // fail closed: no live identity for that address
+        val second = coordinator.connected("A")
+        assertTrue(first != second)                        // reconnect gets its own generation
+        assertEquals(second, admitted(coordinator.admit("A", 0x00, null)).client)
+        assertEquals(second, coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)?.client)
     }
 
     @Test fun disconnectReportsWhenPendingProcedureWasLost() {
         val coordinator = FtmsControlCoordinator()
-        coordinator.admit(clientA, 0x00)
+        coordinator.connected("A")
+        val b = coordinator.connected("B")
+        val lost = admitted(coordinator.admit("A", 0x00, null))
 
-        assertFalse(coordinator.disconnect(clientB))
-        assertTrue(coordinator.disconnect(clientA))
-        assertEquals(
-            FtmsControlCoordinator.Admission.Rejected(FtmsControlCoordinator.OPERATION_FAILED),
-            coordinator.admit(clientB, 0x00),
-        )
-        coordinator.trainerDropped()
-        assertEquals(
-            FtmsControlCoordinator.Admission.Rejected(FtmsControlCoordinator.OPERATION_FAILED),
-            coordinator.admit(clientB, 0x00),
-        )
+        assertEquals(lost, coordinator.disconnected("A")?.procedure)
+        assertEquals(rejected(FtmsControlCoordinator.OPERATION_FAILED, b), coordinator.admit("B", 0x00, null))
         coordinator.trainerReady()
-        assertEquals(
-            FtmsControlCoordinator.Admission.Admitted(FtmsControlCoordinator.Procedure(clientB, 0x00)),
-            coordinator.admit(clientB, 0x00),
-        )
+        assertNotNull(admitted(coordinator.admit("B", 0x00, null)))
     }
 
-    @Test fun reconnectWithSameAddressHasDifferentClientIdentity() {
-        assertFalse(
-            FtmsControlCoordinator.Client("A", 1L) == FtmsControlCoordinator.Client("A", 2L),
-        )
+    @Test fun disconnectWithoutAPendingProcedureRemovesTheIdentityAndReportsNoLoss() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.connected("A")
+        assertNull(coordinator.disconnected("A"))
+        assertNull(coordinator.identity("A"))              // the key really is gone, not merely unreported
+        assertNull(coordinator.disconnected("A"))          // idempotent: no second recycle
     }
 
     @Test fun firstSuccessfulRequestControlOwnsFtms() {
         val coordinator = FtmsControlCoordinator()
-
-        assertEquals(
-            FtmsControlCoordinator.Admission.Admitted(FtmsControlCoordinator.Procedure(clientA, 0x00)),
-            coordinator.admit(clientA, 0x00),
-        )
-        assertEquals(clientA, coordinator.response(0x00, FtmsControlCoordinator.SUCCESS))
-        assertEquals(
-            FtmsControlCoordinator.Admission.Admitted(FtmsControlCoordinator.Procedure(clientA, 0x05)),
-            coordinator.admit(clientA, 0x05),
-        )
+        val a = coordinator.connected("A")
+        assertEquals(a, admitted(coordinator.admit("A", 0x00, null)).client)
+        assertEquals(a, coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)?.client)
+        assertNotNull(admitted(coordinator.admit("A", 0x05, erg)))
     }
 
     @Test fun secondClientCannotControlOrStealOwnership() {
         val coordinator = FtmsControlCoordinator()
-        coordinator.admit(clientA, 0x00)
+        coordinator.connected("A"); val b = coordinator.connected("B")
+        coordinator.admit("A", 0x00, null)
         coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
 
-        assertEquals(
-            FtmsControlCoordinator.Admission.Rejected(FtmsControlCoordinator.CONTROL_NOT_PERMITTED),
-            coordinator.admit(clientB, 0x05),
-        )
-        assertEquals(
-            FtmsControlCoordinator.Admission.Rejected(FtmsControlCoordinator.CONTROL_NOT_PERMITTED),
-            coordinator.admit(clientB, 0x00),
-        )
+        assertEquals(rejected(FtmsControlCoordinator.CONTROL_NOT_PERMITTED, b), coordinator.admit("B", 0x05, erg))
+        assertEquals(rejected(FtmsControlCoordinator.CONTROL_NOT_PERMITTED, b), coordinator.admit("B", 0x00, null))
+    }
+
+    /** A terminal indication that never reached its origin leaves that controller waiting forever;
+     *  dropping the claim is what lets anyone else — including its own reconnect — arbitrate again. */
+    @Test fun releasingAnUndeliverableOwnerReopensArbitration() {
+        val coordinator = FtmsControlCoordinator()
+        val a = coordinator.connected("A")
+        val b = coordinator.connected("B")
+        coordinator.admit("A", 0x00, null)
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
+
+        assertEquals(rejected(FtmsControlCoordinator.CONTROL_NOT_PERMITTED, b), coordinator.admit("B", 0x00, null))
+        assertTrue(coordinator.releaseOwner(a))
+        assertFalse(coordinator.releaseOwner(a))     // only the current owner, only once
+        assertNotNull(admitted(coordinator.admit("B", 0x00, null)))
     }
 
     @Test fun onlyOneProcedureCanBePending() {
         val coordinator = FtmsControlCoordinator()
-
-        coordinator.admit(clientA, 0x00)
-        assertEquals(
-            FtmsControlCoordinator.Admission.Rejected(FtmsControlCoordinator.OPERATION_FAILED),
-            coordinator.admit(clientA, 0x00),
-        )
-        assertNull(coordinator.transportFailed(clientB, 0x00))
-        assertEquals(clientA, coordinator.transportFailed(clientA, 0x00))
-        assertEquals(
-            FtmsControlCoordinator.Admission.Admitted(FtmsControlCoordinator.Procedure(clientA, 0x00)),
-            coordinator.admit(clientA, 0x00),
-        )
+        val a = coordinator.connected("A")
+        val first = admitted(coordinator.admit("A", 0x00, null))
+        assertEquals(rejected(FtmsControlCoordinator.OPERATION_FAILED, a), coordinator.admit("A", 0x00, null))
+        coordinator.transportFailed(first)
+        assertNotNull(admitted(coordinator.admit("A", 0x00, null)))
     }
 
     @Test fun responseRoutesOnlyToMatchingOrigin() {
         val coordinator = FtmsControlCoordinator()
-        coordinator.admit(clientA, 0x00)
-
+        val a = coordinator.connected("A")
+        coordinator.admit("A", 0x00, null)
         assertNull(coordinator.response(0x05, FtmsControlCoordinator.SUCCESS))
-        assertEquals(clientA, coordinator.response(0x00, FtmsControlCoordinator.SUCCESS))
-        assertEquals(
-            FtmsControlCoordinator.Admission.Admitted(FtmsControlCoordinator.Procedure(clientA, 0x05)),
-            coordinator.admit(clientA, 0x05),
-        )
+        assertEquals(a, coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)?.client)
+        assertNotNull(admitted(coordinator.admit("A", 0x05, erg)))
     }
 
     @Test fun failedRequestControlDoesNotAcquireOwnership() {
         val coordinator = FtmsControlCoordinator()
-        coordinator.admit(clientA, 0x00)
-
-        assertEquals(clientA, coordinator.response(0x00, FtmsControlCoordinator.OPERATION_FAILED))
-        assertEquals(
-            FtmsControlCoordinator.Admission.Admitted(FtmsControlCoordinator.Procedure(clientB, 0x00)),
-            coordinator.admit(clientB, 0x00),
-        )
+        coordinator.connected("A"); val b = coordinator.connected("B")
+        coordinator.admit("A", 0x00, null)
+        assertEquals("A", coordinator.response(0x00, FtmsControlCoordinator.OPERATION_FAILED)?.client?.address)
+        assertEquals(b, admitted(coordinator.admit("B", 0x00, null)).client)
     }
 
     @Test fun ownerDisconnectAndTrainerDropClearOwnership() {
         val coordinator = FtmsControlCoordinator()
-        coordinator.admit(clientA, 0x00)
+        coordinator.connected("A")
+        coordinator.admit("A", 0x00, null)
         coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
 
-        coordinator.admit(clientA, 0x05)
-        coordinator.disconnect(clientA)
+        coordinator.admit("A", 0x05, erg)
+        coordinator.disconnected("A")
         coordinator.trainerDropped()
         coordinator.trainerReady()
-        coordinator.admit(clientB, 0x00)
+        val b = coordinator.connected("B")
+        coordinator.admit("B", 0x00, null)
         coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
-        coordinator.admit(clientB, 0x05)
-        assertEquals(clientB, coordinator.trainerDropped())
-        assertEquals(
-            FtmsControlCoordinator.Admission.Admitted(FtmsControlCoordinator.Procedure(clientA, 0x00)),
-            coordinator.admit(clientA, 0x00),
-        )
+        coordinator.admit("B", 0x05, erg)
+        assertEquals(b, coordinator.trainerDropped())
+        coordinator.connected("A")
+        assertNotNull(admitted(coordinator.admit("A", 0x00, null)))
+    }
+
+    /** A local GATT server rebuild closes the server, and Android raises no disconnect callbacks for the
+     *  connections it kills. Keeping ownership across that stranded ERG on a dead generation. */
+    @Test fun teardownDropsOwnershipAndEveryConnectionIdentity() {
+        val coordinator = FtmsControlCoordinator()
+        val a = coordinator.connected("A")
+        coordinator.admit("A", 0x00, null)
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
+
+        coordinator.clear()
+        assertNull(coordinator.identity("A"))
+        assertNull(coordinator.admit("A", 0x00, null))     // the old handle is gone, not merely stale
+        val reconnected = coordinator.connected("A")
+        assertTrue(a != reconnected)
+        assertEquals(reconnected, admitted(coordinator.admit("A", 0x00, null)).client)
+        assertEquals(reconnected, coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)?.client)
+    }
+
+    /** The guard that stops a late arm from stripping a healthy procedure of its only deadline. The local
+     *  button path crosses two main-loop hops, so its arm routinely lands after a newer procedure's. */
+    @Test fun onlyTheLiveProcedureIsStillPending() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.connected("A")
+        val local = coordinator.admitLocal(0x04, res)!!
+        assertTrue(coordinator.isPending(local))
+
+        coordinator.response(0x04, FtmsControlCoordinator.SUCCESS)
+        assertFalse(coordinator.isPending(local))          // ended: a stale arm must bail here
+
+        val next = admitted(coordinator.admit("A", 0x00, null))
+        assertTrue(coordinator.isPending(next))
+        assertFalse(coordinator.isPending(local))          // ...and must not adopt the newer one either
+    }
+
+    /** A rejection issued while the client did NOT own control must carry no authority to release
+     *  ownership that same client legitimately acquires afterwards. */
+    @Test fun ownershipAuthorityIsScopedToTheClientThatActuallyOwns() {
+        val coordinator = FtmsControlCoordinator()
+        val a = coordinator.connected("A")
+        val b = coordinator.connected("B")
+        coordinator.admit("A", 0x00, null)
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
+
+        assertTrue(coordinator.owns(a))
+        assertFalse(coordinator.owns(b))                   // B's rejection may not release anything
+        coordinator.disconnected("A")
+        coordinator.admit("B", 0x00, null)
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
+        assertTrue(coordinator.owns(b))                    // B now owns it for real
+        assertFalse(coordinator.owns(a))
+    }
+
+    /** The single highest-value line in the coordinator: an app that disconnects must not keep ERG
+     *  hostage. Nothing else covers it — trainerDropped() masks it in the broader ownership test. */
+    @Test fun aDepartedOwnerDoesNotKeepControlHostage() {
+        val coordinator = FtmsControlCoordinator()
+        val a = coordinator.connected("A")
+        val b = coordinator.connected("B")
+        coordinator.admit("A", 0x00, null)
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
+        assertTrue(coordinator.owns(a))
+
+        assertNull(coordinator.disconnected("A"))          // nothing was pending, so no recycle
+        assertFalse(coordinator.owns(a))                   // ...but ownership is gone with the connection
+        assertEquals(b, admitted(coordinator.admit("B", 0x00, null)).client)
+        assertEquals(b, coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)?.client)
     }
 
     @Test fun trainerWriteCompletesExactlyOnce() {
@@ -180,6 +318,11 @@ class RuntimeHardeningTest {
     @Test fun targetResistanceUsesSigned16LittleEndian() {
         assertArrayEquals(byteArrayOf(0x04, 0x24, 0x00), encodeTargetResistance(36))
         assertArrayEquals(byteArrayOf(0x04, 0x10, 0x00), encodeTargetResistance(16))
+        // the high byte and the sign: 36/16 alone pass for byteArrayOf(0x04, v.toByte(), 0)
+        assertArrayEquals(byteArrayOf(0x04, 0x2C, 0x01), encodeTargetResistance(300))
+        assertArrayEquals(byteArrayOf(0x04, 0xFF.toByte(), 0xFF.toByte()), encodeTargetResistance(-1))
+        assertArrayEquals(byteArrayOf(0x04, 0x00, 0x80.toByte()), encodeTargetResistance(Int.MIN_VALUE))
+        assertArrayEquals(byteArrayOf(0x04, 0xFF.toByte(), 0x7F), encodeTargetResistance(Int.MAX_VALUE))
     }
 
     // ── connect-attempt ownership (ZycleClient.connect / stop) ────────────────────────────────────

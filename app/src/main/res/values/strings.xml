@@ -56,6 +56,8 @@
     <string name="status_searching_trainer">searching trainer…</string>
     <string name="status_starting">starting…</string>
     <string name="status_app_connected">app connected (%d)</string>
+    <string name="status_control_busy">an app is controlling the trainer</string>
+    <string name="status_wakelock_failed">could not keep the CPU awake</string>
     <string name="status_app_disconnected">app disconnected (%d)</string>
     <string name="status_advertising">advertising %s</string>
     <string name="status_advertise_failed">advertise failed (%d)</string>

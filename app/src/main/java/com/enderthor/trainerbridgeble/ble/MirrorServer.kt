@@ -46,6 +46,9 @@ class MirrorServer(
     private val correction: () -> PowerCorrection,
     private val toZycle: (charUuid: UUID, bytes: ByteArray, withResponse: Boolean, onComplete: (Boolean) -> Unit) -> Boolean,
     private val onTrainerRecycle: () -> Unit = {},
+    /** The trainer ACCEPTED a control procedure (FTMS Response Code = SUCCESS) with these exact bytes.
+     *  ERG bias learning and the UI must hang off this, not off the ATT write callback. */
+    private val onControlAccepted: (ByteArray) -> Unit = {},
     private val onStatus: (String) -> Unit = {},
     /** Health report to the UI: true once we're actually advertising; false if the server/advertising fails. */
     private val onAdvState: (Boolean) -> Unit = {},
@@ -64,13 +67,23 @@ class MirrorServer(
     private val cache = ConcurrentHashMap<UUID, ByteArray>()                            // last value (power corrected)
     private val subscribers = ConcurrentHashMap<UUID, MutableSet<String>>()             // char uuid → subscribed client addrs
     private val clients = ConcurrentHashMap<String, BluetoothDevice>()                  // connected centrals
-    private val clientKeys = ConcurrentHashMap<String, FtmsControlCoordinator.Client>()
-    private val clientGeneration = java.util.concurrent.atomic.AtomicLong()
     private val ftmsControl = FtmsControlCoordinator()
+    /** Deadline for the admitted FTMS procedure. Without it one unanswered Control Point response wedges
+     *  the gate and every later request — Request Control included — is refused for the rest of the ride. */
+    /** The live procedure and its timer, kept together so a cancellation can prove it owns the deadline.
+     *  Mostly main-looper, but rebuildServer() reaches it from a binder thread, hence @Volatile. */
+    @Volatile private var procedureDeadline: Pair<FtmsControlCoordinator.Procedure, Runnable>? = null
+    /** The client whose TERMINAL Control Point result is currently in flight, so a later failure report
+     *  from onNotificationSent can be attributed. Measurement notifications never set this. */
+    @Volatile private var terminalIndication: FtmsControlCoordinator.Client? = null
     // touched from the GATT server binder thread, the client's binder thread and main — a plain ArrayDeque
     // can throw mid-poll when stop() clears it, and an exception on a binder callback kills the process
     private val pendingServices = java.util.concurrent.ConcurrentLinkedDeque<BluetoothGattService>()
 
+    // Armed only AFTER the trainer write completes, so it measures the machine and not our own op queue.
+    // FTMS conformance ties the collector's wait to the ATT transaction timeout (~30 s); anything shorter
+    // recycles the trainer link on a healthy-but-slow machine, which costs the rider far more than waiting.
+    private val PROCEDURE_TIMEOUT_MS = 30_000L
     private val ADV_RESTART_MS = 250L
     private val ADV_RETRY_MS = 1000L
     private val ADV_RETRY_MAX_MS = 30_000L   // backoff ceiling; there is no attempt cap (see scheduleAdvRetry)
@@ -328,15 +341,21 @@ class MirrorServer(
     @Synchronized private fun addNextService() {
         if (serviceAddOwner.current != null) return
         val svc = pendingServices.peek() ?: return
-        if (runCatching { server?.addService(svc) }.getOrNull() == true) {
-            serviceAddOwner.replace(svc)
-            val watchdog = Runnable {
-                if (serviceAddOwner.clearIfCurrent(svc) { serviceAddWatchdog = null })
-                    rebuildServer("addService callback timeout for ${shortUuid(svc.uuid)}")
-            }
-            serviceAddWatchdog = watchdog
-            handler.postDelayed(watchdog, SERVICE_ADD_TIMEOUT_MS)
-        } else {
+        // Claim ownership BEFORE the binder call: onServiceAdded can arrive on a binder thread before a
+        // post-call assignment lands, and a callback that finds no owner is discarded as stale — costing an
+        // 8 s watchdog and a whole server rebuild for an add that actually succeeded.
+        val watchdog = Runnable {
+            if (serviceAddOwner.clearIfCurrent(svc) { serviceAddWatchdog = null })
+                rebuildServer("addService callback timeout for ${shortUuid(svc.uuid)}")
+        }
+        serviceAddWatchdog = watchdog
+        handler.postDelayed(watchdog, SERVICE_ADD_TIMEOUT_MS)
+        serviceAddOwner.replace(svc)
+        val accepted = runCatching { server?.addService(svc) }.getOrNull() == true
+        // Retract the claim only if the callback has not already consumed it (it may have completed the
+        // add while the binder call was still returning).
+        if (!accepted && serviceAddOwner.clearIfCurrent(svc) { serviceAddWatchdog = null }) {
+            handler.removeCallbacks(watchdog)
             if (serviceRetries++ >= SERVICE_MAX_RETRIES) {
                 rebuildServer("addService refused for ${shortUuid(svc.uuid)}")
                 return
@@ -359,6 +378,17 @@ class MirrorServer(
         handler.removeCallbacks(serviceRetryRunnable)
         pendingServices.clear()
         chars.clear()
+        // Closing the server invalidates every ATT handle and delivers NO disconnect callbacks, so any
+        // controller identity kept here would strand FTMS ownership on a generation that can never return:
+        // the app reconnects, gets a new generation, and is refused CONTROL_NOT_PERMITTED for the ride.
+        procedureDeadline?.let { handler.removeCallbacks(it.second) }
+        procedureDeadline = null
+        ftmsControl.clear()
+        terminalIndication = null
+        clients.clear(); subscribers.clear()
+        // ...and never keep broadcasting under the trainer's name with no server behind it: an app that
+        // connects during the rebuild window finds no services and caches a broken device for the session.
+        stopAdvertising()
         val failedServer = synchronized(serverLock) {
             server.also {
                 server = null
@@ -379,13 +409,16 @@ class MirrorServer(
         serviceAddWatchdog?.let { handler.removeCallbacks(it) }
         serviceAddWatchdog = null
         ftmsControl.clear()
+        terminalIndication = null
+        procedureDeadline?.let { handler.removeCallbacks(it.second) }
+        procedureDeadline = null
         stopAdvertising()
         handler.removeCallbacksAndMessages(null)   // pending adv starts / service retries must not outlive us
         runCatching { server?.close() }
         server = null
         restoreName()
         built.set(false); advBlueprint = null
-        chars.clear(); cache.clear(); subscribers.clear(); clients.clear(); clientKeys.clear(); pendingServices.clear()
+        chars.clear(); cache.clear(); subscribers.clear(); clients.clear(); pendingServices.clear()
         shownZycleLevel = null; lastRawZycleLevel = null; lastControlWriteMs = 0L; servoStepOwed = false; reanchorLevel = false
     }
 
@@ -418,9 +451,76 @@ class MirrorServer(
     val clientCount: Int get() = clients.size
     val levelDebug: String get() = "${shownZycleLevel ?: "-"}/${lastRawZycleLevel ?: "-"}"
 
-    fun admitLocalControl(opcode: Int): Boolean = ftmsControl.admitLocal(opcode)
-    fun localControlTransportFailed(opcode: Int) { ftmsControl.transportFailed(null, opcode) }
-    fun releaseFtmsQuarantine() { ftmsControl.trainerReady() }
+    /** Non-null once admitted: hand the same token back so a late failure cannot kill a newer procedure.
+     *  The bytes travel WITH the procedure — a side slot let one procedure's response commit another's
+     *  target, and left the local button with no payload at all. */
+    internal fun admitLocalControl(opcode: Int, bytes: ByteArray): FtmsControlCoordinator.Procedure? =
+        ftmsControl.admitLocal(opcode, bytes)?.also {
+            FileLog.event("ftms ADMITTED local op=0x%02X #%d".format(opcode, it.id))
+        }
+    internal fun localControlTransportFailed(procedure: FtmsControlCoordinator.Procedure) {
+        // Only the procedure that was actually still pending may cancel its deadline: a stale failure
+        // arriving after a newer procedure was admitted must not disarm the newer one's timer.
+        if (ftmsControl.transportFailed(procedure) != null) cancelProcedureDeadline(procedure)
+    }
+    /** The trainer took the write. Only now does the response clock start — arming at admission also
+     *  measured our own serialised op queue, so a slow predecessor could expire a healthy procedure. */
+    internal fun localControlDispatched(procedure: FtmsControlCoordinator.Procedure) =
+        armProcedureDeadline(procedure)
+
+    fun releaseFtmsQuarantine() {
+        ftmsControl.trainerReady()
+        FileLog.event("ftms quarantine released")
+    }
+
+    private fun armProcedureDeadline(procedure: FtmsControlCoordinator.Procedure) {
+        handler.post {
+            // An arm can reach main AFTER its own procedure ended and a newer one was armed — the local
+            // button path crosses two main-loop hops, so it loses that race routinely. Replacing the live
+            // deadline here would strip a healthy procedure of its only timer and leave it unbounded.
+            if (!ftmsControl.isPending(procedure)) return@post
+            procedureDeadline?.let { handler.removeCallbacks(it.second) }
+            val deadline = Runnable {
+                procedureDeadline = null
+                // A null return means "not the pending procedure" — the ONLY case that may skip recovery.
+                // A matched LOCAL procedure legitimately has no client, and skipping recovery for it left
+                // the session quarantined with nothing able to lift it for the rest of the ride.
+                val terminated = ftmsControl.timedOut(procedure) ?: return@Runnable
+                FileLog.event("ftms TIMEOUT op=0x%02X #%d — no trainer response in ${PROCEDURE_TIMEOUT_MS}ms"
+                    .format(procedure.opcode, procedure.id))
+                terminated.client?.let {
+                    notifyControlResult(it, byteArrayOf(
+                        0x80.toByte(), procedure.opcode.toByte(),
+                        FtmsControlCoordinator.OPERATION_FAILED.toByte()))
+                }
+                // a late opcode-only response can no longer be matched to a request: recycle the link
+                handler.post(onTrainerRecycle)
+            }
+            procedureDeadline = procedure to deadline
+            handler.postDelayed(deadline, PROCEDURE_TIMEOUT_MS)
+        }
+    }
+
+    /** Cancels ONLY this procedure's deadline. Arming and cancelling are both posted from binder threads,
+     *  so "cancel whatever is current" could disarm the timer of a procedure admitted in between. */
+    private fun cancelProcedureDeadline(procedure: FtmsControlCoordinator.Procedure) {
+        handler.post {
+            val live = procedureDeadline ?: return@post
+            if (live.first.id != procedure.id) return@post
+            handler.removeCallbacks(live.second)
+            procedureDeadline = null
+        }
+    }
+
+    /** The trainer's verdict. Only SUCCESS commits UI/servo/ERG state, and it commits the bytes THAT
+     *  procedure carried — including the local button's, which must reach ErgBias so an armed ERG target
+     *  is retired when the rider takes manual control. */
+    private fun onControlOutcome(terminated: FtmsControlCoordinator.Terminated, accepted: Boolean) {
+        if (!accepted) return
+        lastControlWriteMs = SystemClock.elapsedRealtime()
+        servoStepOwed = true
+        terminated.bytes?.let(onControlAccepted)
+    }
 
     /** A value arrived from the trainer: correct power, cache, and notify every subscribed client. */
     fun onZycleValue(charUuid: UUID, value: ByteArray) {
@@ -428,7 +528,14 @@ class MirrorServer(
             value[0].toInt() and 0xFF == 0x80) {
             val opcode = value[1].toInt() and 0xFF
             val result = value[2].toInt() and 0xFF
-            ftmsControl.response(opcode, result)?.let { notifyControlResult(it, value) }
+            ftmsControl.response(opcode, result)?.let { terminated ->
+                cancelProcedureDeadline(terminated.procedure)
+                FileLog.event("ftms RESPONSE op=0x%02X result=0x%02X #%d -> %s".format(opcode, result,
+                    terminated.procedure.id,
+                    terminated.client?.let { "${it.address}#${it.generation}" } ?: "local"))
+                terminated.client?.let { notifyControlResult(it, value) }
+                onControlOutcome(terminated, result == FtmsControlCoordinator.SUCCESS)
+            }
             return
         }
         val out = when {
@@ -488,8 +595,8 @@ class MirrorServer(
     }
 
     @Suppress("DEPRECATION")
-    private fun notify(srv: BluetoothGattServer, dev: BluetoothDevice, ch: BluetoothGattCharacteristic, value: ByteArray, indicate: Boolean) {
-        runCatching {
+    private fun notify(srv: BluetoothGattServer, dev: BluetoothDevice, ch: BluetoothGattCharacteristic, value: ByteArray, indicate: Boolean): Boolean {
+        return runCatching {
             val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
                 srv.notifyCharacteristicChanged(dev, ch, indicate, value) == android.bluetooth.BluetoothStatusCodes.SUCCESS
             else {
@@ -499,31 +606,55 @@ class MirrorServer(
             }
             // a refused notification is a silently dropped sample — "power froze in the app"
             if (!ok) FileLog.event("notify ${shortUuid(ch.uuid)} REFUSED (buffer full?) -> ${dev.address}")
-        }
+            ok
+        }.getOrDefault(false)
     }
 
-    private fun notifyControlResult(client: FtmsControlCoordinator.Client, value: ByteArray) {
+    /** EVERY path that fails to hand a TERMINAL result to its origin must release that origin's claim:
+     *  a controller waiting for a response it will never see would otherwise keep ERG locked for everyone.
+     *  A rejection is not terminal for an admitted procedure and carries no such authority — a stale one
+     *  could otherwise revoke ownership the same client legitimately acquired in the meantime. */
+    private fun undeliverable(client: FtmsControlCoordinator.Client, why: String, terminal: Boolean) {
+        if (!terminal || !ftmsControl.owns(client)) return
+        if (ftmsControl.releaseOwner(client))
+            FileLog.event("ftms terminal result undeliverable ($why) -> ${client.address}#${client.generation} — owner released")
+    }
+
+    private fun notifyControlResult(
+        client: FtmsControlCoordinator.Client,
+        value: ByteArray,
+        terminal: Boolean = true,
+    ) {
         val uuid = GattUuids.FTMS_CONTROL_POINT
-        val ch = chars[uuid] ?: return
-        val subs = subscribers[uuid] ?: return
-        if (clientKeys[client.address] != client || !synchronized(subs) { subs.contains(client.address) }) return
+        val ch = chars[uuid] ?: return undeliverable(client, "no local characteristic", terminal)
+        val subs = subscribers[uuid] ?: return undeliverable(client, "no subscriber set", terminal)
+        if (ftmsControl.identity(client.address) != client) return undeliverable(client, "stale generation", terminal)
+        if (!synchronized(subs) { subs.contains(client.address) }) return undeliverable(client, "not subscribed", terminal)
         handler.post {
-            val srv = server ?: return@post
-            if (clientKeys[client.address] != client) return@post
-            val dev = clients[client.address] ?: return@post
-            val currentSubs = subscribers[uuid] ?: return@post
-            if (!synchronized(currentSubs) { currentSubs.contains(client.address) }) return@post
-            notify(srv, dev, ch, value, ch.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)
+            val srv = server ?: return@post undeliverable(client, "server closed", terminal)
+            if (ftmsControl.identity(client.address) != client) return@post undeliverable(client, "stale generation", terminal)
+            val dev = clients[client.address] ?: return@post undeliverable(client, "device gone", terminal)
+            val currentSubs = subscribers[uuid] ?: return@post undeliverable(client, "no subscriber set", terminal)
+            if (!synchronized(currentSubs) { currentSubs.contains(client.address) })
+                return@post undeliverable(client, "unsubscribed before send", terminal)
+            if (terminal) terminalIndication = client
+            if (!notify(srv, dev, ch, value, ch.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)) {
+                terminalIndication = null
+                // The controller would wait forever for a response it will never get. Drop its claim and cut
+                // the link so it reconnects and re-arbitrates instead of sitting there believing it owns ERG.
+                undeliverable(client, "indication refused", terminal)
+                cancelClient(client)
+            }
         }
     }
 
     private fun cancelClient(client: FtmsControlCoordinator.Client) {
-        if (clientKeys[client.address] != client) return
+        if (ftmsControl.identity(client.address) != client) return
         clients[client.address]?.let { server?.cancelConnection(it) }
     }
 
     private val serverCallback = object : BluetoothGattServerCallback() {
-        override fun onServiceAdded(status: Int, service: BluetoothGattService?) {
+        @Synchronized override fun onServiceAdded(status: Int, service: BluetoothGattService?) {
             val added = service ?: return
             if (!serviceAddOwner.clearIfCurrent(added) {
                     serviceAddWatchdog?.let { handler.removeCallbacks(it) }
@@ -557,7 +688,7 @@ class MirrorServer(
                 return
             }
             if (newState == android.bluetooth.BluetoothProfile.STATE_CONNECTED) {
-                clientKeys[device.address] = FtmsControlCoordinator.Client(device.address, clientGeneration.incrementAndGet())
+                ftmsControl.connected(device.address)
                 clients[device.address] = device
                 onStatus(context.getString(R.string.status_app_connected, clients.size))
                 FileLog.event("app connected ${device.address} status=$status (${clients.size} total)")
@@ -565,7 +696,9 @@ class MirrorServer(
                 // central (e.g. the Garmin) can still discover us.
                 handler.post { restartAdvertising() }
             } else {
-                val lostPending = clientKeys.remove(device.address)?.let { ftmsControl.disconnect(it) } == true
+                val lostPending = ftmsControl.disconnected(device.address)?.also {
+                    cancelProcedureDeadline(it.procedure)
+                } != null
                 clients.remove(device.address); subscribers.values.forEach { it.remove(device.address) }
                 onStatus(context.getString(R.string.status_app_disconnected, clients.size))
                 FileLog.event("app disconnected ${device.address} status=$status (${clients.size} left)")
@@ -625,22 +758,47 @@ class MirrorServer(
                 // matters if some app starts using long writes — the log line above says when it happens.
                 if (!preparedWrite && uuid == GattUuids.FTMS_CONTROL_POINT && device != null && value.isNotEmpty()) {
                     val opcode = value[0].toInt() and 0xFF
-                    val client = clientKeys[device.address]
-                    when (val admission = client?.let { ftmsControl.admit(it, opcode) }) {
-                        null -> Unit
-                        is FtmsControlCoordinator.Admission.Rejected ->
-                            notifyControlResult(client, byteArrayOf(0x80.toByte(), opcode.toByte(), admission.result.toByte()))
+                    when (val admission = ftmsControl.admit(device.address, opcode, out)) {
+                        // No live identity: fail CLOSED. Minting one here from `clients` — which is cleared
+                        // a few instructions after the coordinator on disconnect and on rebuild — would let
+                        // a departing app be resurrected and promoted to owner, which is the exact hole the
+                        // by-address admission was written to close.
+                        null -> FileLog.event("ftms REJECTED op=0x%02X — no live connection <- %s"
+                            .format(opcode, device.address))
+                        is FtmsControlCoordinator.Admission.Rejected -> {
+                            FileLog.event("ftms REJECTED op=0x%02X result=0x%02X <- %s"
+                                .format(opcode, admission.result, device.address))
+                            admission.client?.let {
+                                notifyControlResult(it,
+                                    byteArrayOf(0x80.toByte(), opcode.toByte(), admission.result.toByte()),
+                                    terminal = false)
+                            }
+                        }
                         is FtmsControlCoordinator.Admission.Admitted -> {
                             val procedure = admission.procedure
+                            FileLog.event("ftms ADMITTED op=0x%02X #%d <- %s#%d"
+                                .format(opcode, procedure.id, device.address, procedure.client?.generation ?: 0L))
                             relayed = toZycle(uuid, out, withResponse) { success ->
-                                if (success) {
-                                    lastControlWriteMs = SystemClock.elapsedRealtime()
-                                    servoStepOwed = true
-                                } else ftmsControl.transportFailed(procedure.client, procedure.opcode)?.let {
-                                    notifyControlResult(it, byteArrayOf(
+                                // Transport success is NOT command success: FTMS puts acceptance in the
+                                // Response Code, so nothing commits until onZycleValue sees it. The response
+                                // clock starts HERE, once the machine actually has the write.
+                                if (success) armProcedureDeadline(procedure)
+                                else ftmsControl.transportFailed(procedure)?.let {
+                                    cancelProcedureDeadline(procedure)
+                                    it.client?.let { c ->
+                                        notifyControlResult(c, byteArrayOf(
+                                            0x80.toByte(), procedure.opcode.toByte(),
+                                            FtmsControlCoordinator.OPERATION_FAILED.toByte(),
+                                        ))
+                                    }
+                                }
+                            }
+                            if (!relayed) ftmsControl.transportFailed(procedure)?.let {
+                                cancelProcedureDeadline(procedure)
+                                it.client?.let { c ->
+                                    notifyControlResult(c, byteArrayOf(
                                         0x80.toByte(), procedure.opcode.toByte(),
-                                        FtmsControlCoordinator.OPERATION_FAILED.toByte(),
-                                    ))
+                                        FtmsControlCoordinator.OPERATION_FAILED.toByte()))
                                 }
                             }
                         }
@@ -682,7 +840,18 @@ class MirrorServer(
 
         /** Notification flow control: a failure here means our notifications stopped reaching the app. */
         override fun onNotificationSent(device: BluetoothDevice?, status: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) FileLog.event("notify FAILED status=$status -> ${device?.address}")
+            if (status == BluetoothGatt.GATT_SUCCESS) return
+            FileLog.event("notify FAILED status=$status -> ${device?.address}")
+            // notifyCharacteristicChanged() returning success only means the send was accepted for
+            // dispatch; THIS is where Android reports whether it actually landed. If the send in flight
+            // was a terminal Control Point result, its origin will wait forever for an answer it will
+            // never see, while every other app is refused because it still holds control.
+            val addr = device?.address ?: return
+            val pendingTerminal = terminalIndication ?: return
+            if (pendingTerminal.address != addr) return
+            terminalIndication = null
+            undeliverable(pendingTerminal, "onNotificationSent status=$status", terminal = true)
+            cancelClient(pendingTerminal)
         }
 
         override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) {
