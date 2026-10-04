@@ -39,6 +39,8 @@ class RuntimeHardeningTest {
     private val erg = byteArrayOf(0x05, 0xF0.toByte(), 0x00)     // Set Target Power 240 W
     private val res = byteArrayOf(0x04, 0x24, 0x00)              // Set Target Resistance 36
 
+    /** The rider's own button is a DIFFERENT controller, so it still blocks an app — only the owner's
+     *  pipeline against itself is exempt. */
     @Test fun localProcedureBlocksExternalAndDrainsWithoutClientNotification() {
         val coordinator = FtmsControlCoordinator()
         val a = coordinator.connected("A")
@@ -49,8 +51,7 @@ class RuntimeHardeningTest {
         assertEquals(rejected(FtmsControlCoordinator.OPERATION_FAILED, a), coordinator.admit("A", 0x00, null))
         assertNull(coordinator.response(0x04, FtmsControlCoordinator.SUCCESS)?.client)
         assertNotNull(admitted(coordinator.admit("A", 0x00, null)))
-        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
-        assertNull(coordinator.admitLocal(0x04, res))
+        assertNull(coordinator.admitLocal(0x04, res))   // ...and now the app owns it, so the button yields
     }
 
     /** The C1 fix, and the bug the first attempt at it introduced: a LOCAL procedure has no client, so a
@@ -74,8 +75,6 @@ class RuntimeHardeningTest {
         coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)          // A owns control
         val stuck = admitted(coordinator.admit("A", 0x04, res))             // trainer never answers
 
-        assertEquals(FtmsControlCoordinator.OPERATION_FAILED,
-            (coordinator.admit("A", 0x04, res) as FtmsControlCoordinator.Admission.Rejected).result)
         assertEquals("A", coordinator.timedOut(stuck)?.client?.address)
         // quarantined until the trainer link is recycled — not silently reopened
         assertEquals(FtmsControlCoordinator.OPERATION_FAILED,
@@ -195,13 +194,150 @@ class RuntimeHardeningTest {
         assertNotNull(admitted(coordinator.admit("B", 0x00, null)))
     }
 
-    @Test fun onlyOneProcedureCanBePending() {
+    /** The regression this fixes: Bestcycling writes Set Target Power in bursts as tight as 62 ms and never
+     *  subscribes to the response, so it cannot know a procedure is outstanding. Refusing those writes
+     *  discarded them silently — on the real ride it asked for 78 W, was refused, and the rider pedalled on
+     *  against the last accepted target of 0 W. They are HELD now, latest-wins, and sent in turn. */
+    @Test fun theOwnersExtraCommandsAreHeldNotRefused() {
         val coordinator = FtmsControlCoordinator()
-        val a = coordinator.connected("A")
-        val first = admitted(coordinator.admit("A", 0x00, null))
-        assertEquals(rejected(FtmsControlCoordinator.OPERATION_FAILED, a), coordinator.admit("A", 0x00, null))
-        coordinator.transportFailed(first)
-        assertNotNull(admitted(coordinator.admit("A", 0x00, null)))
+        coordinator.connected("A")
+        val request = admitted(coordinator.admit("A", 0x00, null))
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)   // A owns control
+        val inFlight = admitted(coordinator.admit("A", 0x05, erg))
+        assertTrue(request.id != inFlight.id)
+
+        val newer = byteArrayOf(0x05, 0x50, 0x00)
+        assertEquals(FtmsControlCoordinator.Admission.Held, coordinator.admit("A", 0x05, erg))
+        assertEquals(FtmsControlCoordinator.Admission.Held, coordinator.admit("A", 0x05, newer))
+
+        // Latest wins WITHIN the opcode: only the newest target survives the wait, which is what an ERG
+        // target deserves. Promotion is one transition — take-then-admit let an older one overtake a newer.
+        coordinator.response(0x05, FtmsControlCoordinator.SUCCESS)   // the in-flight one ends
+        val (promoted, admission) = coordinator.promoteHeld()!!
+        assertArrayEquals(newer, promoted.bytes)
+        assertNotNull(admitted(admission))
+        assertNull(coordinator.promoteHeld())        // ...and nothing is left behind
+    }
+
+    /** Latest-wins is only safe WITHIN an opcode. A Start/Resume is not replaceable by a later target —
+     *  and the real app interleaves them, Request Control followed 90 ms later by Start/Resume. Losing one
+     *  leaves the machine in a state ERG never recovers from. */
+    @Test fun aHeldStateCommandIsNotEatenByALaterTarget() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.connected("A")
+        coordinator.admit("A", 0x00, null)
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
+        coordinator.admit("A", 0x05, erg)                             // in flight
+
+        coordinator.admit("A", 0x07, byteArrayOf(0x07))               // Start/Resume, held
+        coordinator.admit("A", 0x05, erg)                             // a target, held separately
+        coordinator.admit("A", 0x05, byteArrayOf(0x05, 0x60, 0x00))   // ...superseding only the target
+
+        coordinator.response(0x05, FtmsControlCoordinator.SUCCESS)
+        val first = coordinator.promoteHeld()!!.first
+        assertEquals(0x07, first.opcode)                              // drained in the order sent
+        coordinator.response(0x07, FtmsControlCoordinator.SUCCESS)
+        val second = coordinator.promoteHeld()!!.first
+        assertEquals(0x05, second.opcode)
+        assertArrayEquals(byteArrayOf(0x05, 0x60, 0x00), second.bytes)
+        assertNull(coordinator.promoteHeld())
+    }
+
+    /** Everything still queued when the session goes down must be answerable, not evaporate. */
+    @Test fun drainHeldReturnsEverythingStillWaiting() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.connected("A")
+        coordinator.admit("A", 0x00, null)
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
+        coordinator.admit("A", 0x05, erg)
+        coordinator.admit("A", 0x07, byteArrayOf(0x07))
+        coordinator.admit("A", 0x05, erg)
+
+        assertEquals(setOf(0x07, 0x05), coordinator.drainHeld().map { it.opcode }.toSet())
+        assertNull(coordinator.promoteHeld())
+    }
+
+    /** A client that leaves takes its queued commands with it — and its claim, which is the leak the
+     *  claimant/owner split exists to prevent. */
+    @Test fun disconnectClearsTheClaimAndAnythingHeld() {
+        val coordinator = FtmsControlCoordinator()
+        val a = coordinator.connected("A"); val b = coordinator.connected("B")
+        coordinator.admit("A", 0x00, null)          // claimant, never confirmed
+        coordinator.admit("A", 0x05, erg)           // held behind it
+
+        // Disconnecting mid-procedure quarantines the link on purpose (a late opcode-only response could
+        // not be attributed), so B waits for the recycle — but the CLAIM and the queue are gone at once.
+        coordinator.disconnected("A")
+        assertFalse(coordinator.owns(a))
+        assertNull(coordinator.promoteHeld())
+        coordinator.trainerReady()
+        assertNotNull(admitted(coordinator.admit("B", 0x00, null)))   // B is no longer locked out
+    }
+
+    /** One procedure in flight is what keeps an opcode-only response attributable — the property the ERG
+     *  bias learner depends on, since a refused target it learned from is persisted across rides. */
+    @Test fun onlyOneProcedureIsEverInFlight() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.connected("A")
+        coordinator.admit("A", 0x00, null)
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
+
+        val inFlight = admitted(coordinator.admit("A", 0x05, erg))
+        coordinator.admit("A", 0x05, erg)                       // held, not a second procedure
+        assertTrue(coordinator.isPending(inFlight))
+        assertArrayEquals(erg, coordinator.response(0x05, FtmsControlCoordinator.SUCCESS)?.bytes)
+    }
+
+    /** ...but a SECOND controller is still refused, which is what the gate is actually for. */
+    @Test fun aSecondControllerIsStillRefusedWhileTheOwnerPipelines() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.connected("A"); val b = coordinator.connected("B")
+        coordinator.admit("A", 0x00, null)
+        coordinator.admit("A", 0x05, erg)
+
+        assertEquals(rejected(FtmsControlCoordinator.CONTROL_NOT_PERMITTED, b), coordinator.admit("B", 0x05, erg))
+        assertEquals(rejected(FtmsControlCoordinator.CONTROL_NOT_PERMITTED, b), coordinator.admit("B", 0x00, null))
+    }
+
+    /** A claimant is served but not trusted: it may burst immediately (it cannot wait for a response it
+     *  never subscribed to), yet it does not OWN anything until the trainer says so. Without the split, a
+     *  client the trainer refused would hold control — and lock out the rider's buttons — all session. */
+    @Test fun aClaimantIsServedButOnlyTheTrainerGrantsOwnership() {
+        val coordinator = FtmsControlCoordinator()
+        val a = coordinator.connected("A"); val b = coordinator.connected("B")
+        coordinator.admit("A", 0x00, null)
+        assertFalse(coordinator.owns(a))                      // asked, not granted
+        assertEquals(rejected(FtmsControlCoordinator.CONTROL_NOT_PERMITTED, b),
+            coordinator.admit("B", 0x00, null))               // ...but B still cannot barge in
+
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
+        assertTrue(coordinator.owns(a))
+    }
+
+    @Test fun aRefusedRequestControlRevokesTheClaim() {
+        val coordinator = FtmsControlCoordinator()
+        val a = coordinator.connected("A"); val b = coordinator.connected("B")
+        coordinator.admit("A", 0x00, null)
+        coordinator.response(0x00, FtmsControlCoordinator.OPERATION_FAILED)
+
+        assertFalse(coordinator.owns(a))
+        assertEquals(b, admitted(coordinator.admit("B", 0x00, null)).client)
+    }
+
+    /** The other two revocation paths, which the previous attempt at this left unreachable. */
+    @Test fun aClaimThatNeverReachedTheTrainerIsRevoked() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.connected("A"); val b = coordinator.connected("B")
+        val request = admitted(coordinator.admit("A", 0x00, null))
+        coordinator.transportFailed(request)                  // the write never went out
+        assertNotNull(admitted(coordinator.admit("B", 0x00, null)))
+
+        val coordinator2 = FtmsControlCoordinator()
+        coordinator2.connected("A"); coordinator2.connected("B")
+        val request2 = admitted(coordinator2.admit("A", 0x00, null))
+        coordinator2.timedOut(request2)                       // ...or went out and was never answered
+        coordinator2.trainerReady()
+        assertNotNull(admitted(coordinator2.admit("B", 0x00, null)))
     }
 
     @Test fun responseRoutesOnlyToMatchingOrigin() {

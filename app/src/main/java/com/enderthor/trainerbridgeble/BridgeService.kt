@@ -19,6 +19,7 @@ import com.enderthor.trainerbridgeble.ant.AntFecTx
 import com.enderthor.trainerbridgeble.ant.PowerSample
 import com.enderthor.trainerbridgeble.ble.AdvBlueprint
 import com.enderthor.trainerbridgeble.ble.GattProfile
+import com.enderthor.trainerbridgeble.ble.GattUuids
 import com.enderthor.trainerbridgeble.ble.MirrorServer
 import com.enderthor.trainerbridgeble.ble.SimSource
 import com.enderthor.trainerbridgeble.ble.TrainerSource
@@ -620,7 +621,9 @@ class BridgeService : Service() {
         // the machine has no capabilities (no ERG, no automatic mode) for the whole session.
         if (lastValues.isNotEmpty()) {
             FileLog.event("mirror seeded with ${lastValues.size} cached values")
-            lastValues.forEach { (u, v) -> m.onZycleValue(u, v) }
+            // ...except the bike's button: a cached press is history, and replayed now it would claim a fresh
+            // servo step to the level it once named.
+            lastValues.forEach { (u, v) -> if (u != GattUuids.ZYCLE_BUTTON) m.onZycleValue(u, v) }
         }
         lastAdvBlueprint?.let { m.setAdvBlueprint(it) }
         if (config.antOutputEnabled) startAntTx(config)

@@ -11,8 +11,8 @@ android {
         applicationId = "com.enderthor.trainerbridgeble"
         minSdk = 26
         targetSdk = 34
-        versionCode = 202609011
-        versionName = "0.9.3"
+        versionCode = 202609071
+        versionName = "0.9.4"
     }
 
     buildTypes {

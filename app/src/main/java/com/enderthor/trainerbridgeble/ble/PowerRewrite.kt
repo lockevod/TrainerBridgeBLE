@@ -58,7 +58,7 @@ object PowerRewrite {
      * — and it is the one field an app must not see follow the trainer: Bestcycling re-derives its ERG
      * target from it and rewrites the target ~60 ms after every change (118 of 125 level steps in a 60 min
      * ride did exactly that), including the changes the trainer's own servo makes settling on a target WE
-     * commanded. [showLevel] is the level the mirror decided to report — see [levelToShow].
+     * commanded. [showLevel] is the level the mirror decided to report — see [LevelAttribution].
      *
      * Note the FTMS frame (0x2AD2) carries the machine's resistance level too, and that copy is relayed
      * untouched — it is a different scale (identical to this byte in only 37-74% of samples, mean +4 to +8)
@@ -70,41 +70,79 @@ object PowerRewrite {
         val raw = le16signed(value, ZYCLE_POWER_OFFSET)
         return value.copyOf().also {
             putLe16(it, ZYCLE_POWER_OFFSET, c.correct(raw))
-            if (showLevel != null) it[ZYCLE_LEVEL_OFFSET] = showLevel.toByte()
+            // The byte is what it is — one octet. The running total behind it may sit outside that
+            // range after a run of absorbed steps; clamping HERE defers the rider's press to the frame
+            // that brings the total back in range, instead of erasing it.
+            if (showLevel != null) it[ZYCLE_LEVEL_OFFSET] = showLevel.coerceIn(0, 255).toByte()
         }
     }
 
-    /** The level to report, and whether the servo step we owed is still outstanding. */
-    data class ShownLevel(val level: Int, val servoStepOwed: Boolean)
-
     /**
-     * The level to report, given the one we reported last ([shown]), the trainer's previous level
-     * ([lastRaw]) and its current one ([raw]).
+     * Who moved the trainer's level: the RIDER pressing the bike's own +/- buttons (a real intensity change —
+     * the app nudges its target for each step) or the SERVO settling on a target the app commanded (must stay
+     * invisible, or the app reads it as presses and rewrites its target and its %).
      *
-     * The trainer moves its level for two reasons and the app must only see one: the RIDER pressing the
-     * bike's own +/- buttons (a real intensity change — the app nudges its target a couple of watts per
-     * step, which is what the rider asked for), and the SERVO settling on a target the app itself just
-     * commanded (which must stay invisible, or the app rewrites the target it just sent and the two feed
-     * each other — measured over a 60 min ride, that wander was 94 steps up against 25 down, net +27 W,
-     * i.e. the app's intensity drifting on its own, not a one-way runaway).
+     * The bike says which: every press sends a button notification ([zycleButtonLevel]) carrying the level
+     * it set, and the servo never does. 4-oct ride: 176 single steps came with one, ~10-100 ms from the level
+     * frame and in either order; none of the 821 levels the servo moved did. Nor is the servo one step per
+     * write, which the budget this replaced assumed: re-sending the SAME target re-derives the level from
+     * scratch (33 -> 24 after the rider's nine presses), and an interval change jumps it 40+ — all of which
+     * leaked to the app as presses -, dragging its target and % down and the reported level below 0, where
+     * the clamped byte hid every later press.
      *
-     * The discriminator is a budget, not a stopwatch: a control-point write buys the servo EXACTLY ONE level
-     * step ([servoStepOwed]), because that is what it takes — over that ride 111 of 169 target writes were
-     * followed by one step, 57 by none and 1 by two. Everything else is the rider. A plain time window was
-     * tried first and is much worse: replayed against the same two rides it suppresses the same servo steps
-     * (12 vs 13 leaked) but passes only 4 of the rider's 30 button presses instead of 15, because the app's
-     * own reply to press #1 re-opens the window over presses #2-#10 (they come a median 300 ms apart).
+     * One notification is ONE press, whatever the step it lands next to: a press and a servo jump can share
+     * a telemetry frame (7 -> 25 with the button naming 25, 15 ms after a target write), and crediting the
+     * whole step handed the app 17 phantom presses. Any remainder stays claimable by a second notification.
      *
-     * Deltas, not the value: with the servo's steps absorbed the reported level drifts away from the
-     * machine's, which is safe only because the app reads it relatively — verified over the same ride, where
-     * raw level 9 produced app targets of 68, 76 and 81 W and level 26 produced 170, 165 and 160.
+     * Synchronized: live notifications arrive on the GATT binder thread, the mirror's start-up seed on main.
+     *
+     * ponytail: a press whose notification never comes (~6% of them, 4-oct) is absorbed as servo. The
+     * notification's counter would recover most; add that if lost presses are felt.
      */
-    fun levelToShow(shown: Int?, lastRaw: Int?, raw: Int, servoStepOwed: Boolean): ShownLevel = when {
-        shown == null || lastRaw == null -> ShownLevel(raw, servoStepOwed)  // first frame: adopt what it says
-        raw == lastRaw -> ShownLevel(shown, servoStepOwed)                  // no step, nothing to attribute
-        servoStepOwed -> ShownLevel(shown, false)                           // the step we owed; spend it
-        else -> ShownLevel((shown + (raw - lastRaw)).coerceIn(0, 255), false)   // the rider's — pass it on
+    class LevelAttribution(private val windowMs: Long = 500) {
+        var shown: Int? = null; private set          // what the app sees
+        var lastRaw: Int? = null; private set        // what the trainer last reported
+        private var unclaimed = 0; private var unclaimedAt = 0L   // the last step, until a press claims it
+        private var pressLevel = -1; private var pressAt = 0L     // a press that beat its level frame here
+
+        /** A telemetry frame: RIDER/SERVO for a step (SERVO may still be claimed by [onButton]), null if none. */
+        @Synchronized fun onLevel(raw: Int, nowMs: Long): String? {
+            val last = lastRaw
+            lastRaw = raw
+            // Anchored mid-range, not at the idle 0 the ride starts from: the app reads the level relatively,
+            // and from 0 the rider's first presses - could not show at all.
+            val s = shown ?: return null.also { shown = maxOf(raw, ANCHOR_LEVEL) }
+            if (last == null || raw == last) return null
+            if (pressLevel == raw && nowMs - pressAt < windowMs) {
+                val step = Integer.signum(raw - last)
+                shown = s + step; pressLevel = -1
+                unclaimed = raw - last - step; unclaimedAt = nowMs
+                return "RIDER"
+            }
+            unclaimed = raw - last; unclaimedAt = nowMs
+            return "SERVO"
+        }
+
+        /** A button notification for [level]. @return true if it claimed one level of the step just absorbed. */
+        @Synchronized fun onButton(level: Int, nowMs: Long): Boolean {
+            val s = shown
+            if (s != null && unclaimed != 0 && level == lastRaw && nowMs - unclaimedAt < windowMs) {
+                val step = Integer.signum(unclaimed)
+                shown = s + step; unclaimed -= step
+                return true
+            }
+            pressLevel = level; pressAt = nowMs
+            return false
+        }
+
+        /** The trainer link dropped: whatever it moved through meanwhile is nobody's press. */
+        @Synchronized fun rebase(raw: Int) { lastRaw = raw; unclaimed = 0; pressLevel = -1 }
     }
+
+    /** Page 0x31 of the Zycle's button characteristic: uint16 LE at 6..7 is 20 x level + 0..16 (371 of 371
+     *  frames), so it names the level the press set. Page 0x30 does not track the level and is ignored. */
+    fun zycleButtonLevel(value: ByteArray): Int? =
+        if (value.size != 8 || (value[0].toInt() and 0xFF) != 0x31) null else le16(value, 6) / 20
 
     /** The level this frame reports, or null if the frame is too short to hold one. Zero is a real level
      *  (the machine reports it while idle) and must be tracked like any other, or the step back out of it
@@ -115,6 +153,8 @@ object PowerRewrite {
     private const val ZYCLE_TELEMETRY_LEN = 20
     private const val ZYCLE_POWER_OFFSET = 9
     private const val ZYCLE_LEVEL_OFFSET = 12
+    // Inside the 0-90 the machine itself has sent Bestcycling, with room for 60 net presses - and ~195 +.
+    private const val ANCHOR_LEVEL = 60
 
     /** FTMS Control Point Set Target Power (0x05, uint16 W LE) → inverse-correct the watts. Other ops pass. */
     fun inverseTargetPower(write: ByteArray, c: PowerCorrection): ByteArray {

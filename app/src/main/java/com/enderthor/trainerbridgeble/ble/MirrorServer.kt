@@ -102,9 +102,6 @@ class MirrorServer(
      *  stack answers a start — there is none — just the rate at which we keep asking. */
     private val ADV_SWEEP_MS = 1000L
     private val ADV_SWEEP_MAX_MS = 30000L
-    /** How long after a control write the trainer's level is still settling on it. Observed on the 28-jul
-     *  ride: every servo-driven level step landed 0.19-2.6 s after the write that caused it. */
-    private val LEVEL_SETTLE_MS = 3000L
     @Volatile private var serviceRetries = 0
     private val serviceRetryRunnable = Runnable { if (server != null) addNextService() }
     private val serviceAddOwner = IdentityOwner<BluetoothGattService>()
@@ -140,13 +137,9 @@ class MirrorServer(
             return
         }
         trainerLinked = linked
-        // Losing the trainer invalidates the level anchor (see [reanchorLevel]) AND any servo step we were
-        // still owed: the write that bought it may never have reached the trainer, and if it did, the step it
-        // caused is on the far side of the outage where the re-anchor absorbs it anyway. Leaving it armed
-        // means the rider's first press after a fast reconnect is eaten instead — and this codebase's settled
-        // bias is that eating a real press is the worse failure (pinning the byte killed the buttons).
-        // Getting the link back also deserves a fresh advertise backoff.
-        if (!linked) { reanchorLevel = true; servoStepOwed = false; lastControlWriteMs = 0L }
+        // Losing the trainer invalidates the level anchor (see [reanchorLevel]). Getting the link back also
+        // deserves a fresh advertise backoff.
+        if (!linked) reanchorLevel = true
         else { advRetries = 0; advRetryMs = ADV_RETRY_MS }
         FileLog.event("mirror trainer link=$linked -> ${if (linked) "advertise" else "stop advertising"}")
         handler.post {
@@ -421,27 +414,18 @@ class MirrorServer(
         restoreName()
         built.set(false); advBlueprint = null
         chars.clear(); cache.clear(); subscribers.clear(); clients.clear(); pendingServices.clear()
-        shownZycleLevel = null; lastRawZycleLevel = null; lastControlWriteMs = 0L; servoStepOwed = false; reanchorLevel = false
+        zycleLevel = PowerRewrite.LevelAttribution(); lastZycleTelemetry = null; reanchorLevel = false
     }
 
     /**
      * The Zycle level byte we report. It is NOT the trainer's: it starts there and then moves only by the
-     * steps the RIDER makes on the bike's own +/- buttons. Measured over a 38 min ride, 118 of the 126 level
-     * changes we relayed verbatim were followed within 45-100 ms by a target write the app never meant to
-     * make — the servo settling on our own command, read by the app as the rider changing intensity. Pinning
-     * the byte outright stopped that, and also stopped the rider's real button presses from ever reaching
-     * the app (28-jul ride: the level walked 7→16 and 10→90 under the rider's thumb while the app sat at 6).
-     * So: each control write we relay buys the servo one level step, and every other step is the rider's.
-     * The rule itself, and why it is a budget rather than a time window, is in [PowerRewrite.levelToShow].
-     *
-     * ponytail: a budget of one, not a model of the servo. Replayed against both rides it still leaks 13 of
-     * 125 servo steps to the app and still eats about half the rider's presses in a fast burst; only the
-     * machine's real level↔watts curve would separate them exactly.
+     * steps the RIDER makes on the bike's own +/- buttons. Relayed verbatim, the servo's own steps reached the
+     * app as presses and it rewrote its target after each (118 of 126 changes, 38 min ride); pinned, the
+     * rider's real presses never reached it (28-jul). The rule is in [PowerRewrite.LevelAttribution].
      */
-    @Volatile private var shownZycleLevel: Int? = null    // what the app sees
-    @Volatile private var lastRawZycleLevel: Int? = null  // what the trainer last reported, to difference against
-    @Volatile private var lastControlWriteMs = 0L         // elapsedRealtime of the last control write we relayed
-    @Volatile private var servoStepOwed = false           // that write has a level step coming; it is not the rider's
+    @Volatile private var zycleLevel = PowerRewrite.LevelAttribution()
+    /** The trainer's last telemetry frame, as received: re-sent when a press is claimed after it went out. */
+    @Volatile private var lastZycleTelemetry: ByteArray? = null
     /** The trainer link dropped, so the next level we see must be RE-ANCHORED rather than differenced.
      *  A drop does not stop the mirror (the GATT and the connected apps are deliberately kept), so without
      *  this the pair above straddles the outage and the first frame back is differenced against a level from
@@ -468,7 +452,7 @@ class MirrorServer(
     }
 
     val clientCount: Int get() = clients.size
-    val levelDebug: String get() = "${shownZycleLevel ?: "-"}/${lastRawZycleLevel ?: "-"}"
+    val levelDebug: String get() = zycleLevel.let { "${it.shown ?: "-"}/${it.lastRaw ?: "-"}" }
 
     /** Non-null once admitted: hand the same token back so a late failure cannot kill a newer procedure.
      *  The bytes travel WITH the procedure — a side slot let one procedure's response commit another's
@@ -512,6 +496,7 @@ class MirrorServer(
                         0x80.toByte(), procedure.opcode.toByte(),
                         FtmsControlCoordinator.OPERATION_FAILED.toByte()))
                 }
+                failHeld("procedure timed out, link being recycled")
                 // a late opcode-only response can no longer be matched to a request: recycle the link
                 handler.post(onTrainerRecycle)
             }
@@ -534,11 +519,81 @@ class MirrorServer(
     /** The trainer's verdict. Only SUCCESS commits UI/servo/ERG state, and it commits the bytes THAT
      *  procedure carried — including the local button's, which must reach ErgBias so an armed ERG target
      *  is retired when the rider takes manual control. */
+    /** The trainer's verdict. Only SUCCESS commits the commanded target — and it can, because exactly one
+     *  procedure is ever in flight, so this response belongs to exactly this request. That attribution is
+     *  what keeps a refused target out of the ERG bias learner, whose result is persisted and would
+     *  otherwise skew every later ride. */
     private fun onControlOutcome(terminated: FtmsControlCoordinator.Terminated, accepted: Boolean) {
-        if (!accepted) return
-        lastControlWriteMs = SystemClock.elapsedRealtime()
-        servoStepOwed = true
-        terminated.bytes?.let(onControlAccepted)
+        if (accepted) terminated.bytes?.let(onControlAccepted)
+        dispatchHeld()
+    }
+
+    /** Send the command the owner posted while another was in flight. Latest-wins: whatever is here is the
+     *  newest it asked for, so nothing useful was lost by making it wait. */
+    private fun dispatchHeld() {
+        // Taken and admitted in ONE coordinator transition: doing it in two let a newer command slip in
+        // between, after which the older was pushed back and eventually sent AFTER it — the resistance
+        // rolling backwards.
+        val (next, admission) = ftmsControl.promoteHeld() ?: return
+        when (admission) {
+            is FtmsControlCoordinator.Admission.Admitted -> {
+                FileLog.event("ftms DISPATCHED held op=0x%02X #%d <- %s"
+                    .format(next.opcode, admission.procedure.id, next.client.address))
+                relayAdmitted(admission.procedure, next.bytes, true)
+            }
+            // Genuinely dropped. The client was told its ATT write landed, so it is owed a terminal
+            // result — a conforming controller would otherwise wait for an indication that never comes.
+            is FtmsControlCoordinator.Admission.Rejected -> {
+                FileLog.event("ftms held op=0x%02X DROPPED result=0x%02X <- %s"
+                    .format(next.opcode, admission.result, next.client.address))
+                notifyControlResult(next.client, byteArrayOf(
+                    0x80.toByte(), next.opcode.toByte(), admission.result.toByte()), terminal = false)
+            }
+            // Re-held behind something admitted in the meantime; that one's termination will drain it.
+            FtmsControlCoordinator.Admission.Held ->
+                FileLog.event("ftms held op=0x%02X still waiting".format(next.opcode))
+        }
+    }
+
+    /** The session is going down: answer everything still queued rather than letting it evaporate. */
+    private fun failHeld(why: String) {
+        val stranded = ftmsControl.drainHeld()
+        if (stranded.isEmpty()) return
+        FileLog.event("ftms ${stranded.size} held command(s) dropped — $why")
+        stranded.forEach {
+            notifyControlResult(it.client, byteArrayOf(
+                0x80.toByte(), it.opcode.toByte(),
+                FtmsControlCoordinator.OPERATION_FAILED.toByte()), terminal = false)
+        }
+    }
+
+    /** The one relay path for an admitted control procedure. Arms the servo budget on ATT WRITE COMPLETION:
+     *  the trainer answers a Control Point write within a few ms of receiving it (measured on the real
+     *  Zycle: completion to response is -5..+4 ms, median -2), so completion is the moment the motor can
+     *  start — while the 116-1799 ms seen from enqueue is our OWN serialised op queue, not trainer latency.
+     *  @return false if the write could not be dispatched at all. */
+    private fun relayAdmitted(
+        procedure: FtmsControlCoordinator.Procedure,
+        out: ByteArray,
+        withResponse: Boolean,
+    ): Boolean {
+        val relayed = toZycle(GattUuids.FTMS_CONTROL_POINT, out, withResponse) { success ->
+            if (success) armProcedureDeadline(procedure) else failProcedure(procedure)
+        }
+        if (!relayed) failProcedure(procedure)
+        return relayed
+    }
+
+    private fun failProcedure(procedure: FtmsControlCoordinator.Procedure) {
+        ftmsControl.transportFailed(procedure)?.let {
+            cancelProcedureDeadline(procedure)
+            it.client?.let { c ->
+                notifyControlResult(c, byteArrayOf(
+                    0x80.toByte(), procedure.opcode.toByte(),
+                    FtmsControlCoordinator.OPERATION_FAILED.toByte()))
+            }
+            dispatchHeld()
+        }
     }
 
     /** A value arrived from the trainer: correct power, cache, and notify every subscribed client. */
@@ -566,34 +621,36 @@ class MirrorServer(
             // Zycle's own telemetry carries the same watts as 0x2AD2 and Bestcycling subscribes to both:
             // one bridge must never hand one app two different numbers for the same instant.
             charUuid == GattUuids.ZYCLE_TELEMETRY -> {
+                val l = zycleLevel
+                lastZycleTelemetry = value
                 PowerRewrite.zycleLevel(value)?.let { raw ->
                     // First frame after a dropout: re-anchor onto whatever the trainer says now, so the gap it
-                    // moved through while we were blind is NOT differenced into the app's view. Deliberately
-                    // NOT by nulling shownZycleLevel — levelToShow's first-frame rule adopts the raw level,
-                    // which is the same jump by another route. A genuine press made during the outage is lost;
-                    // we could not have seen it.
-                    // ponytail: the flag has no expiry, so a press landing between the link coming back and
-                    // the first telemetry frame is absorbed into the anchor too. That window is one frame
-                    // (~250 ms at 4 Hz); bounding it with a timer would cost state and re-open the far worse
-                    // jump this exists to stop. Revisit only if a trainer is seen going quiet after reconnect.
+                    // moved through while we were blind is NOT differenced into the app's view. A genuine press
+                    // made during the outage is lost; we could not have seen it.
                     val reanchored = reanchorLevel
-                    if (reanchorLevel) { lastRawZycleLevel = raw; reanchorLevel = false }
-                    val prevRaw = lastRawZycleLevel; val prevShown = shownZycleLevel
-                    // The budget expires: 57 of 169 writes moved no level at all, and an armed one left
-                    // lying around would eat the rider's next press minutes later.
-                    val owed = servoStepOwed && SystemClock.elapsedRealtime() - lastControlWriteMs < LEVEL_SETTLE_MS
-                    val next = PowerRewrite.levelToShow(shownZycleLevel, lastRawZycleLevel, raw, owed)
-                    shownZycleLevel = next.level; servoStepOwed = next.servoStepOwed; lastRawZycleLevel = raw
-                    // THE line that makes the servo-vs-rider rule auditable. Every claim in this file's
-                    // comments ("118 of 125", "111 of 169 writes → 1 step") came from reconstructing this by
-                    // hand out of hex dumps; logged directly, a ride answers it by counting lines. Only when
-                    // the level actually moved or we re-anchored — a few hundred lines a ride, not 4 Hz.
-                    if (FileLog.enabled && (reanchored || raw != prevRaw))
-                        FileLog.event("level raw=$prevRaw->$raw shown=$prevShown->${next.level} " +
-                            (if (reanchored) "REANCHOR" else if (owed) "SERVO(spent)" else "RIDER") +
-                            " owedAfter=${next.servoStepOwed}")
+                    if (reanchorLevel) { l.rebase(raw); reanchorLevel = false }
+                    val prevRaw = l.lastRaw; val prevShown = l.shown
+                    val who = l.onLevel(raw, SystemClock.elapsedRealtime())
+                    // THE line that makes the servo-vs-rider rule auditable from a ride log.
+                    if (FileLog.enabled && (reanchored || who != null))
+                        FileLog.event("level raw=$prevRaw->$raw shown=$prevShown->${l.shown} " +
+                            (if (reanchored) "REANCHOR" else who))
                 }
-                PowerRewrite.correctZycleTelemetry(value, correction(), shownZycleLevel)
+                PowerRewrite.correctZycleTelemetry(value, correction(), l.shown)
+            }
+            // The bike's button: the one witness that a level step was the rider's (see LevelAttribution).
+            charUuid == GattUuids.ZYCLE_BUTTON -> {
+                PowerRewrite.zycleButtonLevel(value)?.let { lvl ->
+                    val l = zycleLevel
+                    val before = l.shown
+                    if (l.onButton(lvl, SystemClock.elapsedRealtime())) {
+                        if (FileLog.enabled) FileLog.event("level shown=$before->${l.shown} RIDER (button)")
+                        // The frame that carried this step already went out with the old level, and the
+                        // next one is up to ~2 s away when nothing moves: re-send it now with the press in.
+                        lastZycleTelemetry?.let { onZycleValue(GattUuids.ZYCLE_TELEMETRY, it) }
+                    }
+                }
+                value
             }
             else -> value
         }
@@ -815,37 +872,19 @@ class MirrorServer(
                             val procedure = admission.procedure
                             FileLog.event("ftms ADMITTED op=0x%02X #%d <- %s#%d"
                                 .format(opcode, procedure.id, device.address, procedure.client?.generation ?: 0L))
-                            relayed = toZycle(uuid, out, withResponse) { success ->
-                                // Transport success is NOT command success: FTMS puts acceptance in the
-                                // Response Code, so nothing commits until onZycleValue sees it. The response
-                                // clock starts HERE, once the machine actually has the write.
-                                if (success) armProcedureDeadline(procedure)
-                                else ftmsControl.transportFailed(procedure)?.let {
-                                    cancelProcedureDeadline(procedure)
-                                    it.client?.let { c ->
-                                        notifyControlResult(c, byteArrayOf(
-                                            0x80.toByte(), procedure.opcode.toByte(),
-                                            FtmsControlCoordinator.OPERATION_FAILED.toByte(),
-                                        ))
-                                    }
-                                }
-                            }
-                            if (!relayed) ftmsControl.transportFailed(procedure)?.let {
-                                cancelProcedureDeadline(procedure)
-                                it.client?.let { c ->
-                                    notifyControlResult(c, byteArrayOf(
-                                        0x80.toByte(), procedure.opcode.toByte(),
-                                        FtmsControlCoordinator.OPERATION_FAILED.toByte()))
-                                }
-                            }
+                            relayed = relayAdmitted(procedure, out, withResponse)
+                        }
+                        // Accepted, waiting its turn behind the procedure in flight. `relayed` stays true:
+                        // the app is told its write landed, because it did — nothing is discarded, and a
+                        // newer command will simply replace this one. Refusing here is what silently threw
+                        // away Bestcycling's targets and left the rider pedalling against a stale one.
+                        FtmsControlCoordinator.Admission.Held -> {
+                            FileLog.event("ftms HELD op=0x%02X <- %s — one procedure already in flight"
+                                .format(opcode, device.address))
+                            relayed = true
                         }
                     }
-                } else relayed = toZycle(uuid, out, withResponse) { success ->
-                    if (success && GattUuids.carriesControl(uuid)) {
-                        lastControlWriteMs = SystemClock.elapsedRealtime()
-                        servoStepOwed = true
-                    }
-                }
+                } else relayed = toZycle(uuid, out, withResponse) { }
                 if (!relayed) FileLog.event("app write $tag NOT RELAYED — answering failure")
             } else FileLog.event("app write $tag = <no value / unknown char>")
             // ATT response = "received", always. FTMS puts the OUTCOME in the control point indication.
