@@ -66,7 +66,6 @@ class Config(context: Context) {
         get() = p.getString(KEY_ADVNAME, "") ?: ""   // blank = advertise under the device's own name
         set(v) = p.edit().putString(KEY_ADVNAME, v).apply()
 
-    /** Write the diagnostic CSV log. */
     /** Poke the Karoo awake before its idle timer fires. `persist.hx.idle_shutdown_delay` is 600000 ms:
      *  ten minutes after the screen sleeps with no ride recording, HxStateManagerService powers the whole
      *  device off — at any battery level, and a running bridge does NOT count as activity. This dispatches
@@ -87,6 +86,7 @@ class Config(context: Context) {
         get() = p.getBoolean(KEY_KEEP_SCREEN, false)
         set(v) = p.edit().putBoolean(KEY_KEEP_SCREEN, v).apply()
 
+    /** Write the diagnostic CSV log. */
     var loggingEnabled: Boolean
         get() = p.getBoolean(KEY_LOG, false)
         set(v) = p.edit().putBoolean(KEY_LOG, v).apply()
