@@ -27,6 +27,8 @@ class ConfigActivity : Activity() {
     private lateinit var scanBtn: TextView
     private lateinit var foundList: LinearLayout
     private lateinit var inUseBox: LinearLayout
+    private lateinit var keepAwakeCheck: android.widget.CheckBox
+    private lateinit var keepScreenCheck: android.widget.CheckBox
     private lateinit var logCheck: android.widget.CheckBox
     private lateinit var simCheck: android.widget.CheckBox
     private lateinit var antCheck: android.widget.CheckBox
@@ -85,6 +87,8 @@ class ConfigActivity : Activity() {
 
         // Toggles
         val opt = card(getString(R.string.config_options))
+        keepAwakeCheck = check(getString(R.string.config_keep_awake), config.keepAwake); opt.addView(keepAwakeCheck)
+        keepScreenCheck = check(getString(R.string.config_keep_screen), config.keepScreenOn); opt.addView(keepScreenCheck)
         logCheck = check(getString(R.string.config_log), config.loggingEnabled); opt.addView(logCheck)
         simCheck = check(getString(R.string.config_sim), config.simulate); opt.addView(simCheck)
         antCheck = check(getString(R.string.config_ant_output), config.antOutputEnabled); opt.addView(antCheck)
@@ -116,6 +120,8 @@ class ConfigActivity : Activity() {
         intField(offsetField, getString(R.string.config_offset_label), { true }) { config.offsetW = it }
         intField(floorField, getString(R.string.config_floor_label), { it >= 0 }) { config.invertFloorW = it }
         config.advertisedName = nameField.text.toString().trim()   // blank = keep the device's own name
+        config.keepAwake = keepAwakeCheck.isChecked
+        config.keepScreenOn = keepScreenCheck.isChecked
         config.loggingEnabled = logCheck.isChecked
         config.simulate = simCheck.isChecked
         config.antOutputEnabled = antCheck.isChecked

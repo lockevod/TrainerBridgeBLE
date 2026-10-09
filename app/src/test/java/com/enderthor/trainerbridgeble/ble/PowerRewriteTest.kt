@@ -87,43 +87,136 @@ class PowerRewriteTest {
         assertEquals(null, PowerRewrite.zycleLevel(bytes(0x18, 0x00)))
     }
 
-    /** The whole rule, with the numbers off the 28-jul ride: adopt the first level, let our own command
-     *  have ONE step, and pass every other step on as the rider's. */
-    @Test fun levelToShow_spendsOneStepOnTheServoAndPassesTheRiderOn() {
-        // first frame of the mirror: whatever the trainer says
-        assertEquals(6, PowerRewrite.levelToShow(null, null, 6, servoStepOwed = false).level)
-        // we relayed an ERG target, so the servo is owed one step: 6 -> 32 is it, and the app sees nothing
-        val servo = PowerRewrite.levelToShow(6, 6, 32, servoStepOwed = true)
-        assertEquals(6, servo.level)
-        assertEquals(false, servo.servoStepOwed)      // spent — the next step is the rider's
-        // rider presses + twice, machine 32 -> 34: the app's level steps by the same 2
-        assertEquals(7, PowerRewrite.levelToShow(6, 32, 33, servoStepOwed = false).level)
-        assertEquals(8, PowerRewrite.levelToShow(7, 33, 34, servoStepOwed = false).level)
-        // and down again, symmetrically
-        assertEquals(7, PowerRewrite.levelToShow(8, 34, 33, servoStepOwed = false).level)
+    /** The bike's own button notification (f03ee002, page 0x31): 20 x the level the press set, plus 0-16. */
+    private fun press(level: Int, extra: Int = 4) = (20 * level + extra).let {
+        bytes(0x31, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, it and 0xFF, it shr 8)
     }
 
-    /** 57 of 169 target writes moved no level at all: a frame that reports the same level must not spend
-     *  the budget, or the servo's real step lands after it and reaches the app. */
-    @Test fun levelToShow_anUnchangedLevelSpendsNothing() {
-        val idle = PowerRewrite.levelToShow(6, 6, 6, servoStepOwed = true)
-        assertEquals(6, idle.level)
-        assertEquals(true, idle.servoStepOwed)
+    @Test fun zycleButtonLevel_readsTheLevelThePressSet() {
+        assertEquals(24, PowerRewrite.zycleButtonLevel(bytes(0x31, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xE4, 0x01)))
+        assertEquals(51, PowerRewrite.zycleButtonLevel(press(51, 16)))
+        // page 0x30 is not a press and its counter does not track the level
+        assertEquals(null, PowerRewrite.zycleButtonLevel(bytes(0x30, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00)))
+        assertEquals(null, PowerRewrite.zycleButtonLevel(bytes(0x31, 0xFF)))
     }
 
-    /** The budget is one, not a window: the rider's presses land a median 300 ms apart, so everything after
-     *  the servo's one step must get through even while the app is still replying. */
-    @Test fun levelToShow_onlyTheFirstStepAfterAWriteIsOurs() {
-        val first = PowerRewrite.levelToShow(20, 20, 21, servoStepOwed = true)
-        assertEquals(20, first.level)
-        val second = PowerRewrite.levelToShow(first.level, 21, 22, first.servoStepOwed)
-        assertEquals(21, second.level)                // the rider's, passed on immediately
+    /** 4-oct ride, 504-541 s: the app commands 173 W, the servo jumps 15 -> 23; the rider presses + nine times
+     *  (23 -> 33, each with its button notification ~10 ms behind the level frame); the app re-sends 173 W
+     *  and the servo drops 33 -> 24. The app must see the nine presses and NEITHER jump — the drop is what it
+     *  read as the rider pressing - nine times, cutting its target and its %. */
+    @Test fun levelAttribution_passesPressesAndAbsorbsTheServoWhateverItsSize() {
+        val l = PowerRewrite.LevelAttribution()
+        var t = 0L
+        l.onLevel(15, t)
+        assertEquals(40, l.shown)                          // anchored off the floor, so presses - are visible too
+        assertEquals("SERVO", l.onLevel(23, t + 400))      // no press behind it
+        assertEquals(40, l.shown)
+        t = 10_000
+        for (lvl in 24..33) {
+            assertEquals("SERVO", l.onLevel(lvl, t))        // provisional until the button speaks
+            assertEquals(true, l.onButton(PowerRewrite.zycleButtonLevel(press(lvl))!!, t + 10))
+            t += 700
+        }
+        assertEquals(50, l.shown)                          // all ten presses through, none eaten
+        assertEquals("SERVO", l.onLevel(24, t + 15_000))
+        assertEquals(50, l.shown)                          // the -9 never reaches the app
+        assertEquals(false, l.onButton(33, t + 15_010))    // a stale level is not a claim on the drop
+        assertEquals(50, l.shown)
     }
 
-    /** A byte is a byte: the reported level must stay in 0..255 however far the deltas push it. */
-    @Test fun levelToShow_staysInsideAByte() {
-        assertEquals(0, PowerRewrite.levelToShow(2, 40, 10, servoStepOwed = false).level)       // would go negative
-        assertEquals(255, PowerRewrite.levelToShow(250, 10, 40, servoStepOwed = false).level)   // would overflow
+    /** The two notifications are on different characteristics; now and then the button one arrives first. */
+    @Test fun levelAttribution_aPressMayArriveBeforeItsLevelFrame() {
+        val l = PowerRewrite.LevelAttribution()
+        l.onLevel(30, 0)
+        assertEquals(false, l.onButton(29, 100))
+        assertEquals("RIDER", l.onLevel(29, 150))
+        assertEquals(39, l.shown)
+    }
+
+    /** A press is only evidence for a level change close to it: one seen later cannot claim an old jump. */
+    @Test fun levelAttribution_aPressOutsideTheWindowClaimsNothing() {
+        val l = PowerRewrite.LevelAttribution()
+        l.onLevel(30, 0)
+        l.onLevel(31, 1000)
+        assertEquals(false, l.onButton(31, 2000))
+        assertEquals(40, l.shown)
+        l.onLevel(30, 5000)
+        assertEquals("SERVO", l.onLevel(31, 5100))          // and that stale press does not claim a later step to 31
+        assertEquals(40, l.shown)
+    }
+
+    /** csv.1, 1785081034847: a target write, the servo jumps 7 -> 25, and 15 ms later the bike's button names 25.
+     *  One notification is one press: the other 17 levels are the servo's and must not reach the app. */
+    @Test fun levelAttribution_aPressNeverClaimsMoreThanOneStep() {
+        val l = PowerRewrite.LevelAttribution()
+        l.onLevel(7, 0)
+        l.onLevel(25, 1000)
+        assertEquals(true, l.onButton(25, 1015))
+        assertEquals(41, l.shown)
+        // ...and the same when the button beats the frame
+        assertEquals(false, l.onButton(10, 2000))
+        assertEquals("RIDER", l.onLevel(10, 2010))
+        assertEquals(40, l.shown)
+    }
+
+    /** Two presses inside one telemetry frame: each notification claims its own step, and only its own. */
+    @Test fun levelAttribution_twoPressesInOneFrameNeedTwoNotifications() {
+        val l = PowerRewrite.LevelAttribution()
+        l.onLevel(30, 0)
+        l.onLevel(32, 1000)
+        assertEquals(true, l.onButton(31, 1010))
+        assertEquals(true, l.onButton(32, 1020))
+        assertEquals(42, l.shown)
+        assertEquals(false, l.onButton(31, 1030))           // nothing left to claim
+        assertEquals(42, l.shown)
+    }
+
+    /** A real burst names each level it sets (31, then 32), and both may arrive on either side of the one
+     *  frame that carries them. Keeping a single early press, or matching only the frame's level, lost one. */
+    @Test fun levelAttribution_aBurstOfPressesIsCreditedInEitherOrder() {
+        val early = PowerRewrite.LevelAttribution()
+        early.onLevel(30, 0)
+        assertEquals(false, early.onButton(31, 100))
+        assertEquals(false, early.onButton(32, 200))
+        assertEquals("RIDER", early.onLevel(32, 250))
+        assertEquals(42, early.shown)
+
+        val late = PowerRewrite.LevelAttribution()
+        late.onLevel(30, 0)
+        assertEquals("SERVO", late.onLevel(32, 100))
+        assertEquals(true, late.onButton(31, 110))
+        assertEquals(true, late.onButton(32, 120))
+        assertEquals(42, late.shown)
+    }
+
+    /** The level the app sees saturates at the byte's bounds: past 0, the first press back up shows at once. */
+    @Test fun levelAttribution_reversesImmediatelyAfterSaturating() {
+        val l = PowerRewrite.LevelAttribution()
+        l.onLevel(0, 0)                                      // shown anchored at 40
+        var raw = 0; var t = 1000L
+        repeat(70) {                                         // 70 presses -, servo restoring headroom between
+            l.onLevel(20, t); raw = 19
+            l.onLevel(raw, t + 300); l.onButton(raw, t + 310)
+            t += 1000
+        }
+        assertEquals(0, l.shown)
+        l.onLevel(20, t); assertEquals(true, l.onButton(20, t + 10))
+        assertEquals(1, l.shown)
+    }
+
+    /** A high first level is adopted as is: the anchor only lifts a low one off the floor. */
+    @Test fun levelAttribution_keepsAHighFirstLevel() {
+        val l = PowerRewrite.LevelAttribution()
+        l.onLevel(75, 0)
+        assertEquals(75, l.shown)
+        assertEquals(null, l.onLevel(75, 100))              // nothing moved, nothing to attribute
+    }
+
+    /** ...and the byte on the wire is what stays inside a byte. */
+    @Test fun theWireByteIsClampedNotTheRunningTotal() {
+        val c = PowerCorrection(1.0, 0.0)
+        assertEquals(0, PowerRewrite.correctZycleTelemetry(realZycleFrame(), c, -28)[12].toInt() and 0xFF)
+        assertEquals(255, PowerRewrite.correctZycleTelemetry(realZycleFrame(), c, 280)[12].toInt() and 0xFF)
     }
 
     @Test fun zycleTelemetry_passesAnUnexpectedLayoutThrough() {

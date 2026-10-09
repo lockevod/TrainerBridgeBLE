@@ -84,7 +84,8 @@ class RawAntLink(
      *  bidirectional slave to send acknowledged control data from its own thread; tolerates null. */
     val currentChannel: AntChannel? get() = channel
 
-    /** Wall-clock of the last message from the current channel; 0 when none since (re)open. Drives the
+    /** elapsedRealtime (NOT wall-clock — a clock re-sync must not move a timeout) of the last message from
+     *  the current channel; 0 when none since (re)open. Drives the
      *  heartbeat watchdog: a SLAVE that acquires a master then goes silent while still "tracking" emits
      *  neither RX_SEARCH_TIMEOUT nor onChannelDeath, so nothing else would recover it. Masters get a TX
      *  event every period, so their heartbeat never expires. */
@@ -130,9 +131,9 @@ class RawAntLink(
                 delay(HEARTBEAT_CHECK_MS)
                 val last = lastMessageMs
                 if (!stopped && channel != null && !opening.get() && last != 0L &&
-                    System.currentTimeMillis() - last > HEARTBEAT_TIMEOUT_MS
+                    android.os.SystemClock.elapsedRealtime() - last > HEARTBEAT_TIMEOUT_MS
                 ) {
-                    Log.i(tag, "silent ${System.currentTimeMillis() - last}ms — recycling")
+                    Log.i(tag, "silent ${android.os.SystemClock.elapsedRealtime() - last}ms — recycling")
                     lastMessageMs = 0L
                     val dead = channel; channel = null; releaseChannel(dead)
                     scheduleReopen("heartbeat")
@@ -161,7 +162,7 @@ class RawAntLink(
                 ch.setChannelEventHandler(object : IAntChannelEventHandler {
                     override fun onReceiveMessage(type: MessageFromAntType?, msg: AntMessageParcel?) {
                         if (msg == null || type == null || ch !== channel) return
-                        lastMessageMs = System.currentTimeMillis()
+                        lastMessageMs = android.os.SystemClock.elapsedRealtime()
                         // The slave's search window expiring closes the channel as a CHANNEL_EVENT
                         // (never onChannelDeath). Consume it here and reopen, else the channel is dead
                         // for the rest of the session. Any other CHANNEL_EVENT (e.g. master TX) and all

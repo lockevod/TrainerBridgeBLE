@@ -42,6 +42,8 @@
     <string name="config_identity">Advertised identity</string>
     <string name="config_name_hint">Name the apps see us as. LEAVE IT EMPTY to use this device\'s own Bluetooth name: simplest, and your device name is never changed. Cosmetic either way — it does not affect what an app can do with the trainer.</string>
     <string name="config_options">Options</string>
+    <string name="config_keep_awake">Keep the Karoo awake (wakes the screen every 5 min - uses battery; it powers off 10 min after the screen sleeps with no ride)</string>
+    <string name="config_keep_screen">Keep THIS screen on while it is open (the Karoo powers off by itself with no ride)</string>
     <string name="config_log">Save log (CSV)</string>
     <string name="config_sim">Simulation mode (no bike)</string>
     <string name="config_ant_output">ANT+ output (corrected power to watch/bike computer)</string>
@@ -56,6 +58,8 @@
     <string name="status_searching_trainer">searching trainer…</string>
     <string name="status_starting">starting…</string>
     <string name="status_app_connected">app connected (%d)</string>
+    <string name="status_control_busy">an app is controlling the trainer</string>
+    <string name="status_wakelock_failed">could not keep the CPU awake</string>
     <string name="status_app_disconnected">app disconnected (%d)</string>
     <string name="status_advertising">advertising %s</string>
     <string name="status_advertise_failed">advertise failed (%d)</string>

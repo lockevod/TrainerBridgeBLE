@@ -13,6 +13,10 @@ object FileLog {
     @Volatile var enabled = false
     @Volatile private var file: File? = null
     private val io = Executors.newSingleThreadExecutor()
+    /** Every mutation of the file goes through this: the executor's append+rotate and the synchronous
+     *  shutdown line write the same path, and a rotation racing that line would lose the one record that
+     *  tells a device shutdown apart from a crashed bridge. */
+    private val fileLock = Any()
 
     fun init(context: Context) {
         if (file != null) return
@@ -24,7 +28,7 @@ object FileLog {
         val f = file ?: return
         val ts = System.currentTimeMillis()   // when it HAPPENED — the IO queue can lag under load
         io.execute {
-            runCatching {
+            runCatching { synchronized(fileLock) {
                 // Nothing is throttled (a dropped line is the one you needed), so cap the file instead.
                 // Rotate rather than truncate: truncating at the cap leaves you holding a log that starts
                 // seconds ago, which is worthless for a ride that just ended. O(1) — a rename, no read.
@@ -36,11 +40,22 @@ object FileLog {
                     if (rotated) f.writeText("# $ts log rotated at ${MAX_BYTES / 1024 / 1024} MB (previous: ${f.name}.1)\n")
                 }
                 f.appendText("# $ts $msg\n")
-            }
+            } }
         }
     }
 
-    private const val MAX_BYTES = 16L * 1024 * 1024   // two files kept, so 32 MB total
+    /** Synchronous append, for the one case where the queue will never drain: the device is powering
+     *  off and we have seconds. Blocks the caller — never use it on a BLE callback or the hot path. */
+    fun eventNow(msg: String) {
+        if (!enabled) return
+        val f = file ?: return
+        runCatching { synchronized(fileLock) { f.appendText("# ${System.currentTimeMillis()} $msg\n") } }
+    }
+
+    // Every notification is logged unthrottled (~2 KB/s), so 16 MB filled in ~2 h and rotation threw away
+    // the START of the ride — which is exactly where the connect / sync / first-advertise sequence lives,
+    // the part you turned logging on to see. 48 MB holds a ~6 h ride in one file, 12 h across the two.
+    private const val MAX_BYTES = 48L * 1024 * 1024   // two files kept, so 96 MB worst case
 
     fun clear() { file?.let { f -> io.execute { runCatching { f.writeText("") } } } }
 

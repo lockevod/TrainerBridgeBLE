@@ -44,6 +44,8 @@ object GattUuids {
      *  instant, ~8% + offset apart, from the same bridge. Whatever an app does with power, it must read the
      *  same value whichever channel it listens on. */
     val ZYCLE_TELEMETRY: UUID = UUID.fromString("beefe004-4910-473c-be46-960948c2f59c")
+    /** Zycle's button characteristic: notifies when the rider presses the bike's +/- — never for the servo. */
+    val ZYCLE_BUTTON: UUID = UUID.fromString("f03ee002-4910-473c-be46-960948c2f59c")
 
     /** Scan filters for the given 16-bit service UUIDs (ORed) — the controller drops everything else
      *  before it reaches the callback, so HR straps, phones and headphones never show up.
