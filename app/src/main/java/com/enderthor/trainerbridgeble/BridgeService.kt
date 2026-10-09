@@ -622,8 +622,10 @@ class BridgeService : Service() {
         if (lastValues.isNotEmpty()) {
             FileLog.event("mirror seeded with ${lastValues.size} cached values")
             // ...except the bike's button: a cached press is history, and replayed now it would claim a fresh
-            // servo step to the level it once named.
-            lastValues.forEach { (u, v) -> if (u != GattUuids.ZYCLE_BUTTON) m.onZycleValue(u, v) }
+            // servo step to the level it once named. It is still cached, so an app reading it gets a value.
+            lastValues.forEach { (u, v) ->
+                if (u == GattUuids.ZYCLE_BUTTON) m.seedCacheOnly(u, v) else m.onZycleValue(u, v)
+            }
         }
         lastAdvBlueprint?.let { m.setAdvBlueprint(it) }
         if (config.antOutputEnabled) startAntTx(config)

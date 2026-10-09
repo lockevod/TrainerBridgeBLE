@@ -70,9 +70,7 @@ object PowerRewrite {
         val raw = le16signed(value, ZYCLE_POWER_OFFSET)
         return value.copyOf().also {
             putLe16(it, ZYCLE_POWER_OFFSET, c.correct(raw))
-            // The byte is what it is — one octet. The running total behind it may sit outside that
-            // range after a run of absorbed steps; clamping HERE defers the rider's press to the frame
-            // that brings the total back in range, instead of erasing it.
+            // One octet. [LevelAttribution] already saturates inside it; this guards any other caller.
             if (showLevel != null) it[ZYCLE_LEVEL_OFFSET] = showLevel.coerceIn(0, 255).toByte()
         }
     }
@@ -98,45 +96,62 @@ object PowerRewrite {
      *
      * ponytail: a press whose notification never comes (~6% of them, 4-oct) is absorbed as servo. The
      * notification's counter would recover most; add that if lost presses are felt.
+     * One notification per press is measured, not assumed: the 4-oct ride has 177 page-0x31 frames, no two
+     * consecutive ones naming the same level, and bursts down to 13 ms apart — hence several early presses.
      */
     class LevelAttribution(private val windowMs: Long = 500) {
         var shown: Int? = null; private set          // what the app sees
         var lastRaw: Int? = null; private set        // what the trainer last reported
-        private var unclaimed = 0; private var unclaimedAt = 0L   // the last step, until a press claims it
-        private var pressLevel = -1; private var pressAt = 0L     // a press that beat its level frame here
+        private var unclaimed = 0; private var unclaimedAt = 0L   // the last step, until presses claim it
+        private var stepFrom = 0                                  // ...and where it started
+        // Presses that beat their level frame. Several, not one: two quick presses can both land before
+        // the frame that carries them (31 then 32, then 30 -> 32), and keeping only the newest lost one.
+        private val early = ArrayList<Pair<Int, Long>>()
 
         /** A telemetry frame: RIDER/SERVO for a step (SERVO may still be claimed by [onButton]), null if none. */
         @Synchronized fun onLevel(raw: Int, nowMs: Long): String? {
             val last = lastRaw
             lastRaw = raw
-            // Anchored mid-range, not at the idle 0 the ride starts from: the app reads the level relatively,
+            // Anchored off the floor, not at the idle 0 the ride starts from: the app reads the level relatively,
             // and from 0 the rider's first presses - could not show at all.
             val s = shown ?: return null.also { shown = maxOf(raw, ANCHOR_LEVEL) }
             if (last == null || raw == last) return null
-            if (pressLevel == raw && nowMs - pressAt < windowMs) {
-                val step = Integer.signum(raw - last)
-                shown = s + step; pressLevel = -1
-                unclaimed = raw - last - step; unclaimedAt = nowMs
-                return "RIDER"
-            }
-            unclaimed = raw - last; unclaimedAt = nowMs
-            return "SERVO"
+            val step = Integer.signum(raw - last)
+            early.removeAll { nowMs - it.second >= windowMs }
+            var credited = 0
+            val it = early.iterator()
+            while (it.hasNext() && credited < Math.abs(raw - last))
+                if (within(it.next().first, last, raw)) { it.remove(); credited++ }
+            shown = clampLevel(s + step * credited)
+            unclaimed = raw - last - step * credited; unclaimedAt = nowMs; stepFrom = last
+            return if (credited > 0) "RIDER" else "SERVO"
         }
 
-        /** A button notification for [level]. @return true if it claimed one level of the step just absorbed. */
+        /** A button notification for [level]. @return true if it claimed one level of the step just absorbed.
+         *  Any level the step passed through counts: a burst names 31 and 32 for one 30 -> 32 frame. */
         @Synchronized fun onButton(level: Int, nowMs: Long): Boolean {
-            val s = shown
-            if (s != null && unclaimed != 0 && level == lastRaw && nowMs - unclaimedAt < windowMs) {
+            val s = shown; val raw = lastRaw
+            if (s != null && raw != null && unclaimed != 0 && nowMs - unclaimedAt < windowMs &&
+                within(level, stepFrom, raw)) {
                 val step = Integer.signum(unclaimed)
-                shown = s + step; unclaimed -= step
+                shown = clampLevel(s + step); unclaimed -= step
                 return true
             }
-            pressLevel = level; pressAt = nowMs
+            early.add(level to nowMs)
+            if (early.size > MAX_EARLY_PRESSES) early.removeAt(0)
             return false
         }
 
         /** The trainer link dropped: whatever it moved through meanwhile is nobody's press. */
-        @Synchronized fun rebase(raw: Int) { lastRaw = raw; unclaimed = 0; pressLevel = -1 }
+        @Synchronized fun rebase(raw: Int) { lastRaw = raw; unclaimed = 0; early.clear() }
+
+        /** The levels a step from [from] to [to] moved INTO: (from, to] going up, [to, from) going down. */
+        private fun within(level: Int, from: Int, to: Int) =
+            if (to > from) level in (from + 1)..to else level in to until from
+
+        /** Saturate at what one byte can carry. Past it a press changed nothing the app could see, and kept
+         *  in the total it left a dead zone: 10 presses beyond 0 meant the next 10 presses + showed nothing. */
+        private fun clampLevel(level: Int) = level.coerceIn(0, 255)
     }
 
     /** Page 0x31 of the Zycle's button characteristic: uint16 LE at 6..7 is 20 x level + 0..16 (371 of 371
@@ -153,8 +168,13 @@ object PowerRewrite {
     private const val ZYCLE_TELEMETRY_LEN = 20
     private const val ZYCLE_POWER_OFFSET = 9
     private const val ZYCLE_LEVEL_OFFSET = 12
-    // Inside the 0-90 the machine itself has sent Bestcycling, with room for 60 net presses - and ~195 +.
-    private const val ANCHOR_LEVEL = 60
+    // Room for 40 net presses - and 215 +. Lopsided on purpose: the servo keeps pulling the level down and
+    // the rider presses it back up, so presses are overwhelmingly + (4-oct, 84 min: 154 + to 21 -, net +168
+    // and never once below the start). Bestcycling takes this byte past 90 — it commanded 162 itself (30-jul).
+    // ponytail: a ride past ~100 min of that pace reaches 255 and its further + presses stop showing; re-anchor
+    // on each app (re)connect if rides get that long.
+    private const val ANCHOR_LEVEL = 40
+    private const val MAX_EARLY_PRESSES = 8   // a burst is a handful; the window expires the rest anyway
 
     /** FTMS Control Point Set Target Power (0x05, uint16 W LE) → inverse-correct the watts. Other ops pass. */
     fun inverseTargetPower(write: ByteArray, c: PowerCorrection): ByteArray {

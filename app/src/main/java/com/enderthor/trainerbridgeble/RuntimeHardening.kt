@@ -119,7 +119,7 @@ internal class FtmsControlCoordinator {
         return admitLocked(client, opcode, bytes)
     }
 
-    private fun admitLocked(client: Client, opcode: Int, bytes: ByteArray?): Admission? {
+    private fun admitLocked(client: Client, opcode: Int, bytes: ByteArray?, fromQueue: Boolean = false): Admission? {
         if (invalidSession) return Admission.Rejected(OPERATION_FAILED, client)
         val holder = controller
         if (opcode == REQUEST_CONTROL) {
@@ -127,11 +127,20 @@ internal class FtmsControlCoordinator {
         } else if (holder != client) return Admission.Rejected(CONTROL_NOT_PERMITTED, client)
 
         val inFlight = pending
-        if (inFlight != null) {
+        // A fresh write must not overtake the queue: response() and the drain after it are two steps, and a
+        // target landing between them ran first and was then rolled back by the older one still held.
+        if (inFlight != null || (!fromQueue && held.isNotEmpty())) {
             // The rider's own button is a DIFFERENT controller; an app does not queue behind it.
-            if (inFlight.client == null) return Admission.Rejected(OPERATION_FAILED, client)
+            if (inFlight != null && inFlight.client == null) return Admission.Rejected(OPERATION_FAILED, client)
             // The owner's own newer command of the SAME opcode supersedes the held one and waits its turn.
             if (bytes == null) return Admission.Rejected(OPERATION_FAILED, client)
+            // Two would-be controllers racing for an open slot: the first one queued keeps it. Replacing it
+            // would leave the first never answered.
+            if (held[opcode]?.client.let { it != null && it != client })
+                return Admission.Rejected(CONTROL_NOT_PERMITTED, client)
+            // Re-inserted at the END: a replaced key keeps its old slot in a LinkedHashMap, so Start, Stop,
+            // Start drained as Start, Stop and left the trainer stopped while the app thought it was running.
+            held.remove(opcode)
             held[opcode] = Held(client, opcode, bytes)
             return Admission.Held
         }
@@ -155,7 +164,7 @@ internal class FtmsControlCoordinator {
         if (pending != null) return null
         val key = held.keys.firstOrNull() ?: return null
         val next = held.remove(key) ?: return null
-        return next to (admitLocked(next.client, next.opcode, next.bytes)
+        return next to (admitLocked(next.client, next.opcode, next.bytes, fromQueue = true)
             ?: Admission.Rejected(OPERATION_FAILED, next.client))
     }
 

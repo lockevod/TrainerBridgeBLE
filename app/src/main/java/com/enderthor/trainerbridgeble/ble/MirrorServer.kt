@@ -464,7 +464,9 @@ class MirrorServer(
     internal fun localControlTransportFailed(procedure: FtmsControlCoordinator.Procedure) {
         // Only the procedure that was actually still pending may cancel its deadline: a stale failure
         // arriving after a newer procedure was admitted must not disarm the newer one's timer.
-        if (ftmsControl.transportFailed(procedure) != null) cancelProcedureDeadline(procedure)
+        if (ftmsControl.transportFailed(procedure) == null) return
+        cancelProcedureDeadline(procedure)
+        dispatchHeld()   // every termination drains: a revoked claimant's queue can sit behind a local one
     }
     /** The trainer took the write. Only now does the response clock start — arming at admission also
      *  measured our own serialised op queue, so a slow predecessor could expire a healthy procedure. */
@@ -534,24 +536,31 @@ class MirrorServer(
         // Taken and admitted in ONE coordinator transition: doing it in two let a newer command slip in
         // between, after which the older was pushed back and eventually sent AFTER it — the resistance
         // rolling backwards.
-        val (next, admission) = ftmsControl.promoteHeld() ?: return
-        when (admission) {
-            is FtmsControlCoordinator.Admission.Admitted -> {
-                FileLog.event("ftms DISPATCHED held op=0x%02X #%d <- %s"
-                    .format(next.opcode, admission.procedure.id, next.client.address))
-                relayAdmitted(admission.procedure, next.bytes, true)
+        // A rejection admits nothing, so nothing would drain the rest: keep going until one is sent or the
+        // queue is empty — a refused Request Control otherwise stranded every command held behind it.
+        while (true) {
+            val (next, admission) = ftmsControl.promoteHeld() ?: return
+            when (admission) {
+                is FtmsControlCoordinator.Admission.Admitted -> {
+                    FileLog.event("ftms DISPATCHED held op=0x%02X #%d <- %s"
+                        .format(next.opcode, admission.procedure.id, next.client.address))
+                    relayAdmitted(admission.procedure, next.bytes, true)
+                    return
+                }
+                // Genuinely dropped. The client was told its ATT write landed, so it is owed a terminal
+                // result — a conforming controller would otherwise wait for an indication that never comes.
+                is FtmsControlCoordinator.Admission.Rejected -> {
+                    FileLog.event("ftms held op=0x%02X DROPPED result=0x%02X <- %s"
+                        .format(next.opcode, admission.result, next.client.address))
+                    notifyControlResult(next.client, byteArrayOf(
+                        0x80.toByte(), next.opcode.toByte(), admission.result.toByte()), terminal = false)
+                }
+                // Re-held behind something admitted in the meantime; that one's termination will drain it.
+                FtmsControlCoordinator.Admission.Held -> {
+                    FileLog.event("ftms held op=0x%02X still waiting".format(next.opcode))
+                    return
+                }
             }
-            // Genuinely dropped. The client was told its ATT write landed, so it is owed a terminal
-            // result — a conforming controller would otherwise wait for an indication that never comes.
-            is FtmsControlCoordinator.Admission.Rejected -> {
-                FileLog.event("ftms held op=0x%02X DROPPED result=0x%02X <- %s"
-                    .format(next.opcode, admission.result, next.client.address))
-                notifyControlResult(next.client, byteArrayOf(
-                    0x80.toByte(), next.opcode.toByte(), admission.result.toByte()), terminal = false)
-            }
-            // Re-held behind something admitted in the meantime; that one's termination will drain it.
-            FtmsControlCoordinator.Admission.Held ->
-                FileLog.event("ftms held op=0x%02X still waiting".format(next.opcode))
         }
     }
 
@@ -595,6 +604,9 @@ class MirrorServer(
             dispatchHeld()
         }
     }
+
+    /** Fill the read cache WITHOUT processing the value — for one that must not act when replayed. */
+    fun seedCacheOnly(charUuid: UUID, value: ByteArray) { cache[charUuid] = value }
 
     /** A value arrived from the trainer: correct power, cache, and notify every subscribed client. */
     fun onZycleValue(charUuid: UUID, value: ByteArray) {
@@ -879,7 +891,7 @@ class MirrorServer(
                         // newer command will simply replace this one. Refusing here is what silently threw
                         // away Bestcycling's targets and left the rider pedalling against a stale one.
                         FtmsControlCoordinator.Admission.Held -> {
-                            FileLog.event("ftms HELD op=0x%02X <- %s — one procedure already in flight"
+                            FileLog.event("ftms HELD op=0x%02X <- %s — behind the procedure in flight or the queue"
                                 .format(opcode, device.address))
                             relayed = true
                         }

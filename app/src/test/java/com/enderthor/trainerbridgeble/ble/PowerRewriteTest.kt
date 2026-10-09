@@ -108,20 +108,20 @@ class PowerRewriteTest {
         val l = PowerRewrite.LevelAttribution()
         var t = 0L
         l.onLevel(15, t)
-        assertEquals(60, l.shown)                          // anchored mid-range, so presses - are visible too
+        assertEquals(40, l.shown)                          // anchored off the floor, so presses - are visible too
         assertEquals("SERVO", l.onLevel(23, t + 400))      // no press behind it
-        assertEquals(60, l.shown)
+        assertEquals(40, l.shown)
         t = 10_000
         for (lvl in 24..33) {
             assertEquals("SERVO", l.onLevel(lvl, t))        // provisional until the button speaks
             assertEquals(true, l.onButton(PowerRewrite.zycleButtonLevel(press(lvl))!!, t + 10))
             t += 700
         }
-        assertEquals(70, l.shown)                          // all ten presses through, none eaten
+        assertEquals(50, l.shown)                          // all ten presses through, none eaten
         assertEquals("SERVO", l.onLevel(24, t + 15_000))
-        assertEquals(70, l.shown)                          // the -9 never reaches the app
+        assertEquals(50, l.shown)                          // the -9 never reaches the app
         assertEquals(false, l.onButton(33, t + 15_010))    // a stale level is not a claim on the drop
-        assertEquals(70, l.shown)
+        assertEquals(50, l.shown)
     }
 
     /** The two notifications are on different characteristics; now and then the button one arrives first. */
@@ -130,7 +130,7 @@ class PowerRewriteTest {
         l.onLevel(30, 0)
         assertEquals(false, l.onButton(29, 100))
         assertEquals("RIDER", l.onLevel(29, 150))
-        assertEquals(59, l.shown)
+        assertEquals(39, l.shown)
     }
 
     /** A press is only evidence for a level change close to it: one seen later cannot claim an old jump. */
@@ -139,10 +139,10 @@ class PowerRewriteTest {
         l.onLevel(30, 0)
         l.onLevel(31, 1000)
         assertEquals(false, l.onButton(31, 2000))
-        assertEquals(60, l.shown)
+        assertEquals(40, l.shown)
         l.onLevel(30, 5000)
         assertEquals("SERVO", l.onLevel(31, 5100))          // and that stale press does not claim a later step to 31
-        assertEquals(60, l.shown)
+        assertEquals(40, l.shown)
     }
 
     /** csv.1, 1785081034847: a target write, the servo jumps 7 -> 25, and 15 ms later the bike's button names 25.
@@ -152,23 +152,56 @@ class PowerRewriteTest {
         l.onLevel(7, 0)
         l.onLevel(25, 1000)
         assertEquals(true, l.onButton(25, 1015))
-        assertEquals(61, l.shown)
+        assertEquals(41, l.shown)
         // ...and the same when the button beats the frame
         assertEquals(false, l.onButton(10, 2000))
         assertEquals("RIDER", l.onLevel(10, 2010))
-        assertEquals(60, l.shown)
+        assertEquals(40, l.shown)
     }
 
-    /** Two presses inside one telemetry frame: each notification claims its own step. */
+    /** Two presses inside one telemetry frame: each notification claims its own step, and only its own. */
     @Test fun levelAttribution_twoPressesInOneFrameNeedTwoNotifications() {
         val l = PowerRewrite.LevelAttribution()
         l.onLevel(30, 0)
         l.onLevel(32, 1000)
-        assertEquals(true, l.onButton(32, 1010))
+        assertEquals(true, l.onButton(31, 1010))
         assertEquals(true, l.onButton(32, 1020))
-        assertEquals(62, l.shown)
-        assertEquals(false, l.onButton(32, 1030))           // nothing left to claim
-        assertEquals(62, l.shown)
+        assertEquals(42, l.shown)
+        assertEquals(false, l.onButton(31, 1030))           // nothing left to claim
+        assertEquals(42, l.shown)
+    }
+
+    /** A real burst names each level it sets (31, then 32), and both may arrive on either side of the one
+     *  frame that carries them. Keeping a single early press, or matching only the frame's level, lost one. */
+    @Test fun levelAttribution_aBurstOfPressesIsCreditedInEitherOrder() {
+        val early = PowerRewrite.LevelAttribution()
+        early.onLevel(30, 0)
+        assertEquals(false, early.onButton(31, 100))
+        assertEquals(false, early.onButton(32, 200))
+        assertEquals("RIDER", early.onLevel(32, 250))
+        assertEquals(42, early.shown)
+
+        val late = PowerRewrite.LevelAttribution()
+        late.onLevel(30, 0)
+        assertEquals("SERVO", late.onLevel(32, 100))
+        assertEquals(true, late.onButton(31, 110))
+        assertEquals(true, late.onButton(32, 120))
+        assertEquals(42, late.shown)
+    }
+
+    /** The level the app sees saturates at the byte's bounds: past 0, the first press back up shows at once. */
+    @Test fun levelAttribution_reversesImmediatelyAfterSaturating() {
+        val l = PowerRewrite.LevelAttribution()
+        l.onLevel(0, 0)                                      // shown anchored at 40
+        var raw = 0; var t = 1000L
+        repeat(70) {                                         // 70 presses -, servo restoring headroom between
+            l.onLevel(20, t); raw = 19
+            l.onLevel(raw, t + 300); l.onButton(raw, t + 310)
+            t += 1000
+        }
+        assertEquals(0, l.shown)
+        l.onLevel(20, t); assertEquals(true, l.onButton(20, t + 10))
+        assertEquals(1, l.shown)
     }
 
     /** A high first level is adopted as is: the anchor only lifts a low one off the floor. */

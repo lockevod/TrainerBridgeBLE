@@ -243,6 +243,58 @@ class RuntimeHardeningTest {
         assertNull(coordinator.promoteHeld())
     }
 
+    /** response() and the drain that follows it are two steps. A target landing between them must not
+     *  run first and then be rolled back by the older one still held. */
+    @Test fun aWriteBetweenResponseAndDrainDoesNotOvertakeTheQueue() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.connected("A")
+        coordinator.admit("A", 0x00, null)
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
+        coordinator.admit("A", 0x05, erg)                               // A, in flight
+        coordinator.admit("A", 0x05, byteArrayOf(0x05, 0x50, 0x00))     // B, held
+
+        coordinator.response(0x05, FtmsControlCoordinator.SUCCESS)      // A ends; drain not run yet
+        val newest = byteArrayOf(0x05, 0x60, 0x00)
+        assertEquals(FtmsControlCoordinator.Admission.Held, coordinator.admit("A", 0x05, newest))   // C
+
+        val (promoted, admission) = coordinator.promoteHeld()!!
+        assertArrayEquals(newest, promoted.bytes)                       // C superseded B; B is never sent
+        assertNotNull(admitted(admission))
+        assertNull(coordinator.promoteHeld())
+    }
+
+    /** A refused Request Control revokes the claim; everything held behind it must come out as rejections
+     *  one after another, not leave the rest stranded with nothing left to drain it. */
+    @Test fun aRefusedClaimRejectsEveryCommandHeldBehindIt() {
+        val coordinator = FtmsControlCoordinator()
+        val a = coordinator.connected("A")
+        coordinator.admit("A", 0x00, null)
+        coordinator.admit("A", 0x07, byteArrayOf(0x07))
+        coordinator.admit("A", 0x05, erg)
+        coordinator.response(0x00, FtmsControlCoordinator.OPERATION_FAILED)
+
+        assertEquals(rejected(FtmsControlCoordinator.CONTROL_NOT_PERMITTED, a), coordinator.promoteHeld()!!.second)
+        assertEquals(rejected(FtmsControlCoordinator.CONTROL_NOT_PERMITTED, a), coordinator.promoteHeld()!!.second)
+        assertNull(coordinator.promoteHeld())
+    }
+
+    /** A replaced command moves to the back: Start, Stop, Start must end running, not stopped. */
+    @Test fun aReplacedHeldCommandDrainsInTheOrderLastSent() {
+        val coordinator = FtmsControlCoordinator()
+        coordinator.connected("A")
+        coordinator.admit("A", 0x00, null)
+        coordinator.response(0x00, FtmsControlCoordinator.SUCCESS)
+        coordinator.admit("A", 0x05, erg)                               // in flight
+        coordinator.admit("A", 0x07, byteArrayOf(0x07))                 // Start
+        coordinator.admit("A", 0x08, byteArrayOf(0x08, 0x01))           // Stop
+        coordinator.admit("A", 0x07, byteArrayOf(0x07))                 // Start again
+
+        coordinator.response(0x05, FtmsControlCoordinator.SUCCESS)
+        assertEquals(0x08, coordinator.promoteHeld()!!.first.opcode)
+        coordinator.response(0x08, FtmsControlCoordinator.SUCCESS)
+        assertEquals(0x07, coordinator.promoteHeld()!!.first.opcode)
+    }
+
     /** Everything still queued when the session goes down must be answerable, not evaporate. */
     @Test fun drainHeldReturnsEverythingStillWaiting() {
         val coordinator = FtmsControlCoordinator()
