@@ -46,6 +46,9 @@ object GattUuids {
     val ZYCLE_TELEMETRY: UUID = UUID.fromString("beefe004-4910-473c-be46-960948c2f59c")
     /** Zycle's button characteristic: notifies when the rider presses the bike's +/- — never for the servo. */
     val ZYCLE_BUTTON: UUID = UUID.fromString("f03ee002-4910-473c-be46-960948c2f59c")
+    /** Another Zycle notification whose first two bytes are the same instantaneous watts as 0x2AD2 (byte-
+     *  identical across the 4-oct ride). Relayed raw it was the one channel still handing an app uncorrected power. */
+    val ZYCLE_POWER_STATUS: UUID = UUID.fromString("f03ee006-4910-473c-be46-960948c2f59c")
 
     /** Scan filters for the given 16-bit service UUIDs (ORed) — the controller drops everything else
      *  before it reaches the callback, so HR straps, phones and headphones never show up.

@@ -176,7 +176,12 @@ class ConfigActivity : Activity() {
         val settings = android.bluetooth.le.ScanSettings.Builder()
             .setScanMode(android.bluetooth.le.ScanSettings.SCAN_MODE_LOW_LATENCY).build()
         val filters = if (filtered) com.enderthor.trainerbridgeble.ble.GattUuids.scanFilters(0x1826, 0x1818) else null
+        // Android's 5-starts-per-30s limit is per APP: the bridge's reconnect scans must see these starts too.
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (com.enderthor.trainerbridgeble.ScanStartBudget.shared.delayMs(now) > 0)
+            FileLog.event("config scan start may be dropped: 5 starts in the last 30 s")
         return runCatching { scanner.startScan(filters, settings, scanCallback) }.isSuccess
+            .also { if (it) com.enderthor.trainerbridgeble.ScanStartBudget.shared.record(now) }
     }
 
     private fun stopScan() {

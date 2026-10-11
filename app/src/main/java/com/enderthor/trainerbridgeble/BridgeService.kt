@@ -285,8 +285,10 @@ class BridgeService : Service() {
      *  Posts a tick in 20 s rather than waiting a full interval: a START_STICKY restart can land well into
      *  an already-running countdown. (That tick may SKIP if the screen is on — which is sound, because a
      *  countdown can only have been armed by the screen sleeping.) */
+    private var keepAwakeApplied: Boolean? = null
     private fun applyKeepAwake() {
         handler.removeCallbacks(keepAwakeTick)
+        keepAwakeApplied = Config(this).keepAwake
         if (foreground && Config(this).keepAwake) {
             screenOnSkips = 0
             karooConnect()
@@ -351,7 +353,13 @@ class BridgeService : Service() {
                 ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf()
             }
             // master off: nothing to reconfigure, and don't leave an idle started service behind
-            ACTION_RECONFIGURE -> if (foreground) { FileLog.enabled = Config(this).loggingEnabled; applyConfigChange(); applyKeepAwake() }
+            ACTION_RECONFIGURE -> if (foreground) {
+                FileLog.enabled = Config(this).loggingEnabled; applyConfigChange()
+                // Only when the toggle itself changed. The config screen saves on EVERY onStop — screen-off
+                // included — and re-applying reposted the poke at 20 s: screen off -> poke -> screen on ->
+                // off -> poke, every ~80 s for as long as the screen was left open (4-oct, 30+ min).
+                if (Config(this).keepAwake != keepAwakeApplied) applyKeepAwake()
+            }
                                  else if (!Config(this).masterEnabled) stopSelf()   // don't kill a service the master wants alive
             ACTION_EMIT_START -> { if (foreground) startEmit() }   // never emit from a non-foreground (master-off) service
             ACTION_EMIT_STOP -> { Config(this).emitEnabled = false; stopEmit() }

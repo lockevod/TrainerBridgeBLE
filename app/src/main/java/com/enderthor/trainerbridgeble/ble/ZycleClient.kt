@@ -19,6 +19,7 @@ import com.enderthor.trainerbridgeble.FileLog
 import com.enderthor.trainerbridgeble.FtmsBootstrapReadiness
 import com.enderthor.trainerbridgeble.GattSessionCoordinator
 import com.enderthor.trainerbridgeble.IdentityOwner
+import com.enderthor.trainerbridgeble.ScanStartBudget
 import com.enderthor.trainerbridgeble.TrainerWriteTicket
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -83,7 +84,12 @@ class ZycleClient(
     // a healthy link or delay it past a real one, by the size of the correction.
     @Volatile private var lastMessageMs = 0L   // last notification, for the silent-link watchdog
     private val reconnectPending = AtomicBoolean(false)
-    @Volatile private var retryMs = SCAN_RETRY_MS   // scan backoff, reset on a good connection
+    @Volatile private var retryMs = SCAN_RETRY_MS   // scan backoff, reset once a connection SYNCS
+    // Backoff for the connect -> fail -> rescan loop. It used to rescan every 2 s for ever: 9-sep, a weak link
+    // (rssi -91) failed status=62 six times in 23 s and discovery then stopped for the rest of the session.
+    @Volatile private var reconnectDelayMs = RECONNECT_DELAY_MS
+    private val scanBudget = ScanStartBudget.shared
+    @Volatile private var opStartedMs = 0L
     // Have we ever had this trainer on the line in THIS session? Splits the two scans that look alike:
     // a cold search (trainer not powered on — may run for hours) from a mid-ride reacquisition.
     @Volatile private var everConnected = false
@@ -101,6 +107,9 @@ class ZycleClient(
         gattSessions.runIfCurrent(g) {
             if (bootstrapReadiness?.ready != true) return@runIfCurrent
             if (!syncOwed.compareAndSet(true, false)) return@runIfCurrent
+            // Only a link that got all the way to synced proves the trainer is reachable: a connect that dies
+            // in bootstrap must keep backing off, or a weak link loops connect/fail at full speed.
+            retryMs = SCAN_RETRY_MS; reconnectDelayMs = RECONNECT_DELAY_MS
             handler.post { if (!stopped) gattSessions.runIfCurrent(g) { onSynced() } }
         }
     }
@@ -123,6 +132,7 @@ class ZycleClient(
 
     override fun start() {
         stopped = false
+        reconnectDelayMs = RECONNECT_DELAY_MS
         reconnectPending.set(false); retryMs = SCAN_RETRY_MS   // stop() may have eaten the runnable that clears these
         startScan()
         handler.removeCallbacks(heartbeat)   // never stack a second heartbeat
@@ -165,8 +175,12 @@ class ZycleClient(
     /** Idempotent re-scan scheduler — a self-induced teardown and the disconnect callback can both ask. */
     private fun scheduleReconnect() {
         if (stopped) return
-        if (reconnectPending.compareAndSet(false, true))
-            handler.postDelayed({ reconnectPending.set(false); startScan() }, RECONNECT_DELAY_MS)
+        if (reconnectPending.compareAndSet(false, true)) {
+            val wait = reconnectDelayMs
+            reconnectDelayMs = (wait * 2).coerceAtMost(RECONNECT_MAX_MS)
+            if (wait > RECONNECT_DELAY_MS) FileLog.event("Zycle reconnect backoff ${wait}ms")
+            handler.postDelayed({ reconnectPending.set(false); startScan() }, wait)
+        }
     }
 
     /** A timed-out Android GATT operation has no cancellation API. The only safe queue reset is therefore
@@ -323,6 +337,14 @@ class ZycleClient(
         if (gatt != null || connecting.get()) return   // already linked/linking — a stray retry must not scan
         // Bluetooth off (or the stack restarting) → no scanner at all. There is no adapter-state receiver,
         // so without a retry here the client would stay dead for the rest of the session.
+        // Android allows an app 5 scan starts per 30 s. On API 32 the 6th is dropped SILENTLY — no
+        // onScanFailed — while we already believed we were scanning, and nothing ever retried (9-sep, 21:10).
+        val now = android.os.SystemClock.elapsedRealtime()
+        val wait = scanBudget.delayMs(now)
+        if (wait > 0) {
+            FileLog.event("Zycle scan deferred ${wait}ms — Android's 5-starts-per-30s limit would drop it silently")
+            handler.removeCallbacks(rescan); handler.postDelayed(rescan, wait); return
+        }
         val scanner = adapter?.bluetoothLeScanner ?: run {
             FileLog.event("Zycle scan: no LE scanner (Bluetooth off?) — retry in ${retryMs}ms"); retryScanLater(); return
         }
@@ -351,13 +373,14 @@ class ZycleClient(
         if (started.isFailure) {
             FileLog.event("Zycle scan start threw: ${started.exceptionOrNull()}"); retryScanLater(); return
         }
+        scanBudget.record(now)
         scanning = true   // NOT the place to reset the backoff: a scan that starts can still fail async
     }
 
     private val rescan: Runnable = Runnable { startScan() }
 
-    /** Backoff, so a connect/fail flap can't drive us into Android's 5-scans-per-30s throttle — which
-     *  answers with onScanFailed(6) and used to latch the client dead. */
+    /** Backoff after a scan that failed to start or failed async. The 5-per-30s limit itself is enforced up
+     *  front by [scanBudget]: on API 32 it does NOT answer with onScanFailed. */
     private fun retryScanLater(): Unit {
         if (stopped) return
         handler.removeCallbacks(rescan)
@@ -424,7 +447,6 @@ class ZycleClient(
                 if (!gattSessions.runIfCurrent(g) {
                     FileLog.event("Zycle connected status=$status")
                     connecting.set(false)
-                    retryMs = SCAN_RETRY_MS   // a good connection resets the backoff
                     everConnected = true      // ...and promotes every later scan to the reacquisition duty cycle
                     lastMessageMs = android.os.SystemClock.elapsedRealtime()   // start the silent-link window at connect
                     syncOwed.set(true); burstEnqueued = false; bootstrapReadiness = null
@@ -488,11 +510,20 @@ class ZycleClient(
                         if ((ch.uuid == GattUuids.INDOOR_BIKE_DATA || ch.uuid == GattUuids.CYCLING_POWER_MEASUREMENT) &&
                             ch.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0)
                             enqueueSubscribe(g, ch)
+                    // THEN WHAT READINESS NEEDS: FTMS Feature and the Control Point subscription. Behind ~20
+                    // optional reads they came last, and on a weak link (1-3 s a read, 9-sep) the session died
+                    // before ever being usable; up front, the sync fallback can put the mirror up without them.
+                    val required = svcs.flatMap { it.characteristics }.filter {
+                        it.uuid == FTMS_FEATURE && it.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0 ||
+                        it.uuid == GattUuids.FTMS_CONTROL_POINT &&
+                            it.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
+                    }
+                    for (ch in required) if (ch.uuid == FTMS_FEATURE) enqueueRead(g, ch) else enqueueSubscribe(g, ch)
                     // READS NEXT: apps read FTMS Feature immediately and cache an empty answer for the session.
                     for (svc in svcs) for (ch in svc.characteristics)
-                        if (ch.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) enqueueRead(g, ch)
+                        if (ch !in required && ch.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) enqueueRead(g, ch)
                     for (svc in svcs) for (ch in svc.characteristics)
-                        if (ch.uuid != GattUuids.INDOOR_BIKE_DATA &&
+                        if (ch !in required && ch.uuid != GattUuids.INDOOR_BIKE_DATA &&
                             ch.uuid != GattUuids.CYCLING_POWER_MEASUREMENT &&
                             ch.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0)
                             enqueueSubscribe(g, ch)
@@ -708,11 +739,17 @@ class ZycleClient(
                 )
             }
             opWatchdog = w
+            opStartedMs = android.os.SystemClock.elapsedRealtime()
             handler.postDelayed(w, OP_TIMEOUT_MS)
             runCatching { op() }.onFailure { opDone() }
         }
     }
-    private fun opDone() { opWatchdog?.let { handler.removeCallbacks(it) }; opToken.incrementAndGet(); opBusy.set(false); pump() }
+    private fun opDone() {
+        // A slow op is the early warning for the watchdog below — and the only record of link quality.
+        val took = android.os.SystemClock.elapsedRealtime() - opStartedMs
+        if (opStartedMs != 0L && took >= SLOW_OP_MS) FileLog.event("Zycle slow GATT op ${took}ms")
+        opStartedMs = 0L
+        opWatchdog?.let { handler.removeCallbacks(it) }; opToken.incrementAndGet(); opBusy.set(false); pump() }
 
     private companion object {
         const val RECONNECT_DELAY_MS = 2000L
@@ -724,7 +761,11 @@ class ZycleClient(
         const val HEARTBEAT_TIMEOUT_MS = 15000L   // silent this long while "connected" → recycle the link (~15s, ANT-learned)
         const val CONTROL_WRITE_RETRIES = 2       // resend a control write that NAKs (status 133) up to twice
         const val CONTROL_RETRY_DELAY_MS = 250L
-        const val OP_TIMEOUT_MS = 4000L           // unstick the GATT queue if a callback is ever lost (flaky link)
+        // Unstick the GATT queue if a callback is ever lost. NOT 4 s: reads took up to 3.3 s at rssi -91 (9-sep)
+        // and 4 s retired a healthy-but-slow link mid-bootstrap. Android's own ATT timeout is 30 s.
+        const val OP_TIMEOUT_MS = 10000L
+        const val SLOW_OP_MS = 1500L
+        const val RECONNECT_MAX_MS = 30000L
         const val SYNC_FALLBACK_MS = 6000L        // only shorten a slow queue after required bootstrap is ready
         val FTMS_FEATURE: UUID = GattUuids.uuid16(0x2ACC)
     }

@@ -731,4 +731,15 @@ class RuntimeHardeningTest {
         assertEquals(8, persistence.onPower(rawWatts = 158, nowMs = 60_010L))
         assertEquals(4, learnerCalls)
     }
+
+    /** 9-sep 21:10: scan starts at 13.8, 20.2, 23.3, 25.8 and 32.7 s, then a sixth at 37.0 — which Android 12
+     *  dropped without a word. The budget must hold the sixth until the first leaves the 30 s window. */
+    @Test fun scanBudgetHoldsTheSixthStartInsideThirtySeconds() {
+        val b = ScanStartBudget()
+        for (t in listOf(13_800L, 20_200L, 23_300L, 25_800L, 32_700L)) {
+            assertEquals(0L, b.delayMs(t)); b.record(t)
+        }
+        assertEquals(13_800L + 31_000L - 37_000L, b.delayMs(37_000L))
+        assertEquals(0L, b.delayMs(44_800L))
+    }
 }

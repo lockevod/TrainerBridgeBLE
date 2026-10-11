@@ -3,6 +3,7 @@ package com.enderthor.trainerbridgeble.ble
 import com.enderthor.trainerbridgeble.correction.PowerCorrection
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PowerRewriteTest {
@@ -81,6 +82,13 @@ class PowerRewriteTest {
 
     /** Every frame carries a level, zero included — the machine reports 0 while idle and the step out of it
      *  must be differenced like any other, or leaving idle reaches the app as a jump nobody made. */
+    /** 4-oct: f03ee006 `1F00CD0944` next to a 0x2AD2 whose power is 0x001F — same watts, so same correction. */
+    @Test fun zyclePowerStatus_correctsPowerAndNothingElse() {
+        val out = PowerRewrite.correctZyclePowerStatus(bytes(0x1F, 0x00, 0xCD, 0x09, 0x44), c)
+        assertEquals(c.correct(31), (out[0].toInt() and 0xFF) or ((out[1].toInt() and 0xFF) shl 8))
+        assertArrayEquals(bytes(0xCD, 0x09, 0x44), out.copyOfRange(2, 5))
+    }
+
     @Test fun zycleLevel_readsTheByteIncludingZero() {
         assertEquals(0, PowerRewrite.zycleLevel(realZycleFrame().also { it[12] = 0 }))
         assertEquals(0x11, PowerRewrite.zycleLevel(realZycleFrame()))
@@ -164,8 +172,8 @@ class PowerRewriteTest {
         val l = PowerRewrite.LevelAttribution()
         l.onLevel(30, 0)
         l.onLevel(32, 1000)
-        assertEquals(true, l.onButton(31, 1010))
-        assertEquals(true, l.onButton(32, 1020))
+        assertEquals(false, l.onButton(31, 1010))          // 31 is also where a - from 32 lands: held back...
+        assertEquals(true, l.onButton(32, 1020))           // ...until a press past it proves the step ran through it
         assertEquals(42, l.shown)
         assertEquals(false, l.onButton(31, 1030))           // nothing left to claim
         assertEquals(42, l.shown)
@@ -184,9 +192,128 @@ class PowerRewriteTest {
         val late = PowerRewrite.LevelAttribution()
         late.onLevel(30, 0)
         assertEquals("SERVO", late.onLevel(32, 100))
-        assertEquals(true, late.onButton(31, 110))
+        assertEquals(false, late.onButton(31, 110))
         assertEquals(true, late.onButton(32, 120))
         assertEquals(42, late.shown)
+    }
+
+    /** The servo jumps 20 -> 30 and the rider presses - at once, the button (29) beating its frame. 29 lies
+     *  inside the servo's jump, so claiming it there sent a + to the app for a press -. */
+    @Test fun levelAttribution_aPressInsideAServoJumpKeepsItsOwnDirection() {
+        val down = PowerRewrite.LevelAttribution()
+        down.onLevel(20, 0)                                 // shown 40
+        assertEquals("SERVO", down.onLevel(30, 100))
+        assertEquals(false, down.onButton(29, 150))
+        assertEquals(40, down.shown)                        // not credited as + meanwhile
+        assertEquals("RIDER", down.onLevel(29, 200))
+        assertEquals(39, down.shown)
+
+        val up = PowerRewrite.LevelAttribution()
+        up.onLevel(30, 0)
+        assertEquals("SERVO", up.onLevel(20, 100))
+        assertEquals(false, up.onButton(21, 150))
+        assertEquals("RIDER", up.onLevel(21, 200))
+        assertEquals(41, up.shown)
+    }
+
+    /** Codex, 11-oct: two quick presses - inside a servo jump. The second must not claim the jump as a +. */
+    @Test fun levelAttribution_aReverseBurstInsideAServoJumpStaysReverse() {
+        val l = PowerRewrite.LevelAttribution()
+        l.onLevel(20, 0)
+        l.onLevel(30, 100)
+        assertEquals(false, l.onButton(29, 150))
+        assertEquals(false, l.onButton(28, 160))
+        assertEquals(40, l.shown)
+        assertEquals("RIDER", l.onLevel(28, 200))
+        assertEquals(38, l.shown)
+    }
+
+    /** Codex, 11-oct: the frame back over a held press can be ~2 s away when nothing else moves. */
+    @Test fun levelAttribution_aSlowReverseFrameStillResolvesTheHeldPress() {
+        val l = PowerRewrite.LevelAttribution()
+        l.onLevel(20, 0)
+        l.onLevel(30, 100)
+        l.onButton(29, 150)
+        assertEquals("RIDER", l.onLevel(29, 2_100))
+        assertEquals(39, l.shown)
+    }
+
+    /** A held press that nothing resolves is dropped, not guessed: wrong, a guess costs two steps. */
+    @Test fun levelAttribution_anUnresolvedHeldPressIsDropped() {
+        val lines = ArrayList<String>()
+        val quiet = PowerRewrite.LevelAttribution(log = { lines += it })
+        quiet.onLevel(30, 0)
+        quiet.onLevel(32, 100)
+        assertEquals(false, quiet.onButton(31, 110))
+        assertEquals(null, quiet.onLevel(32, 2_000))
+        assertEquals(null, quiet.onLevel(32, 3_000))
+        assertEquals(40, quiet.shown)
+        assertTrue(lines.any { it.startsWith("level btn=31 EXPIRED (direction unknown, dropped)") })
+
+        val moved = PowerRewrite.LevelAttribution()
+        moved.onLevel(30, 0)
+        moved.onLevel(32, 100)
+        moved.onButton(31, 110)
+        assertEquals("SERVO", moved.onLevel(35, 300))        // a servo step on decides nothing
+        assertEquals(40, moved.shown)
+
+        // a held press and then a separate press back, frame after both: one frame, one step, one credit
+        val late = PowerRewrite.LevelAttribution()
+        late.onLevel(20, 0)
+        late.onLevel(30, 100)
+        late.onButton(29, 150)
+        late.onButton(29, 1_640)
+        assertEquals("RIDER", late.onLevel(29, 1_650))
+        assertEquals(39, late.shown)
+    }
+
+    /** 11-oct fuzz: a servo pull-back that merely CROSSES a held press is not that press. Crediting it there
+     *  turned a + into a -; it is dropped instead. */
+    @Test fun levelAttribution_aServoPullBackDoesNotResolveAHeldPress() {
+        val l = PowerRewrite.LevelAttribution()
+        l.onLevel(20, 0)
+        l.onLevel(30, 100)
+        l.onButton(29, 120)
+        l.onLevel(30, 2_000)
+        assertEquals("SERVO", l.onLevel(24, 2_300))
+        assertEquals(40, l.shown)
+    }
+
+    /** 11-oct fuzz, seed 50160: two presses - in one frame, the first one held. Both count. */
+    @Test fun levelAttribution_aHeldPressSharingItsFrameWithAnotherStillCounts() {
+        val l = PowerRewrite.LevelAttribution()
+        l.onLevel(26, 0)
+        l.onLevel(35, 800)
+        assertEquals(false, l.onButton(34, 845))
+        assertEquals("RIDER", l.onLevel(33, 948))
+        assertEquals(true, l.onButton(33, 960))
+        assertEquals(38, l.shown)
+    }
+
+    /** Seed 7127: three presses - in one frame, the first held, the other two early. All three count. */
+    @Test fun levelAttribution_aHeldPressInAThreePressFrameStillCounts() {
+        val l = PowerRewrite.LevelAttribution()
+        l.onLevel(28, 0)
+        l.onLevel(38, 100)                                   // shown 40
+        l.onButton(37, 150)                                  // held
+        l.onButton(36, 700); l.onButton(35, 720)             // early: the step window is over
+        assertEquals("RIDER", l.onLevel(35, 750))
+        assertEquals(37, l.shown)
+    }
+
+    /** Every decision about a press leaves one log line, so a lost or reversed press is provable afterwards. */
+    @Test fun levelAttribution_logsEveryPressDecision() {
+        val lines = ArrayList<String>()
+        val l = PowerRewrite.LevelAttribution(log = { lines += it })
+        l.onLevel(30, 0)
+        l.onLevel(32, 100)
+        l.onButton(31, 110); l.onButton(32, 120)
+        l.onButton(50, 2000); l.onLevel(32, 3000)
+        assertTrue(lines.any { it.startsWith("level ANCHOR raw=30 shown=40") })
+        assertTrue(lines.any { it.startsWith("level btn=31 HELD") })
+        assertTrue(lines.any { it.startsWith("level btn=32 CLAIMED step=30->32") })
+        assertTrue(lines.any { it.startsWith("level btn=50 EARLY") })
+        assertTrue(lines.any { it.startsWith("level btn=50 EXPIRED") })
     }
 
     /** The level the app sees saturates at the byte's bounds: past 0, the first press back up shows at once. */

@@ -78,6 +78,32 @@ class ErgBiasTest {
         assertEquals(0, ErgBias.watts)
     }
 
+    /** 4-oct: raw held 34-56 W above the command for minutes (the rider, not the trainer) and the bias
+     *  integrated it to 28 W. A trainer that is not tracking says nothing about its overshoot. */
+    @Test fun aTrainerThatIsNotTrackingTeachesNothing() {
+        ErgBias.onControl(setTargetPower(116), 0L)
+        var t = 0L
+        repeat(600) { t += 2_000; ErgBias.onPower(140, t) }   // the rider holds 140 whatever we command
+        assertEquals(0, ErgBias.watts)
+        ErgBias.onControl(setTargetPower(185), t)
+        repeat(600) { t += 2_000; ErgBias.onPower(241, t) }
+        assertEquals(0, ErgBias.watts)
+    }
+
+    /** Codex, 11-oct: the gate must not lock out a real overshoot, nor a bad saved estimate. */
+    @Test fun learnsALargeOvershootAndRecoversFromABadSeed() {
+        ride(commandedRaw = 150, overshoot = 15, seconds = 600)
+        assertEquals(15, ErgBias.watts)
+        ErgBias.seed(20)
+        ride(commandedRaw = 150, overshoot = 7, seconds = 600, startMs = 10_000_000L)
+        assertEquals(7, ErgBias.watts)
+        ErgBias.seed(-15)
+        ride(commandedRaw = 150, overshoot = 8, seconds = 600, startMs = 20_000_000L)
+        assertEquals(8, ErgBias.watts)
+        ErgBias.seed(28)                                       // a legacy preference from the 30 W clamp
+        assertEquals(20, ErgBias.watts)
+    }
+
     @Test fun oneAbsurdSampleBarelyMovesIt() {
         ride(commandedRaw = 150, overshoot = 8, seconds = 400)
         ErgBias.onPower(150 + 900, 2_000_000L)                      // a garbage frame / standing sprint
@@ -85,8 +111,10 @@ class ErgBiasTest {
     }
 
     @Test fun staysWithinItsClamp() {
-        ride(commandedRaw = 150, overshoot = 500, seconds = 2000)
-        assertEquals(30, ErgBias.watts)
+        // creeping up inside the tracking tolerance is the worst case that can still teach it something
+        var t = 0L
+        for (o in 1..60) t = ride(commandedRaw = 150, overshoot = o, seconds = 60, startMs = t + 20_000)
+        assertEquals(20, ErgBias.watts)
     }
 
     @Test fun seedSurvivesUntilNewEvidence() {
