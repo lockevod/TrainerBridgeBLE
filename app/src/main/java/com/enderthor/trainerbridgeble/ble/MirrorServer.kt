@@ -73,9 +73,17 @@ class MirrorServer(
     /** The live procedure and its timer, kept together so a cancellation can prove it owns the deadline.
      *  Mostly main-looper, but rebuildServer() reaches it from a binder thread, hence @Volatile. */
     @Volatile private var procedureDeadline: Pair<FtmsControlCoordinator.Procedure, Runnable>? = null
-    /** The client whose TERMINAL Control Point result is currently in flight, so a later failure report
-     *  from onNotificationSent can be attributed. Measurement notifications never set this. */
+    /** The client whose TERMINAL Control Point result is in flight. onNotificationSent names no
+     *  characteristic and, on this stack, is not even in send order (a notification reports at once, an
+     *  indication only when the app confirms). So the result is made the ONLY send to that app: it goes out
+     *  once nothing else to the app is unconfirmed, and measurements to that app pause until it is answered.
+     *  The next report for that app is then the result's, both ways — a stale "last terminal" used to let a
+     *  measurement failure minutes later revoke a healthy owner, and a measurement success hide a real
+     *  failure (11-oct reviews). Main-looper only, except the read in onNotificationSent. */
     @Volatile private var terminalIndication: FtmsControlCoordinator.Client? = null
+    private var terminalSeq = 0   // so an older result's report timer cannot clear a newer one
+    /** Accepted sends per app not yet reported by onNotificationSent. */
+    private val unconfirmed = ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger>()
     // touched from the GATT server binder thread, the client's binder thread and main — a plain ArrayDeque
     // can throw mid-poll when stop() clears it, and an exception on a binder callback kills the process
     private val pendingServices = java.util.concurrent.ConcurrentLinkedDeque<BluetoothGattService>()
@@ -377,7 +385,7 @@ class MirrorServer(
         procedureDeadline?.let { handler.removeCallbacks(it.second) }
         procedureDeadline = null
         ftmsControl.clear()
-        terminalIndication = null
+        terminalIndication = null; unconfirmed.clear()
         audienceWarned.clear()
         clients.clear(); subscribers.clear()
         // ...and never keep broadcasting under the trainer's name with no server behind it: an app that
@@ -403,7 +411,7 @@ class MirrorServer(
         serviceAddWatchdog?.let { handler.removeCallbacks(it) }
         serviceAddWatchdog = null
         ftmsControl.clear()
-        terminalIndication = null
+        terminalIndication = null; unconfirmed.clear()
         audienceWarned.clear()
         procedureDeadline?.let { handler.removeCallbacks(it.second) }
         procedureDeadline = null
@@ -414,7 +422,8 @@ class MirrorServer(
         restoreName()
         built.set(false); advBlueprint = null
         chars.clear(); cache.clear(); subscribers.clear(); clients.clear(); pendingServices.clear()
-        zycleLevel = PowerRewrite.LevelAttribution(); lastZycleTelemetry = null; reanchorLevel = false
+        zycleLevel = newLevelAttribution(); lastZycleTelemetry = null; reanchorLevel = false
+        deferredTelemetry.set(null)
     }
 
     /**
@@ -423,9 +432,24 @@ class MirrorServer(
      * app as presses and it rewrote its target after each (118 of 126 changes, 38 min ride); pinned, the
      * rider's real presses never reached it (28-jul). The rule is in [PowerRewrite.LevelAttribution].
      */
-    @Volatile private var zycleLevel = PowerRewrite.LevelAttribution()
+    @Volatile private var zycleLevel = newLevelAttribution()
+    // Every press decision (claimed, held, early, expired) gets its line: a lost or reversed press must be
+    // provable from the ride log, not reconstructed by replaying raw notifications.
+    private fun newLevelAttribution() = PowerRewrite.LevelAttribution(log = { if (FileLog.enabled) FileLog.event(it) })
     /** The trainer's last telemetry frame, as received: re-sent when a press is claimed after it went out. */
     @Volatile private var lastZycleTelemetry: ByteArray? = null
+    /**
+     * A telemetry frame whose level moved and no press has claimed yet, held up to [PRESS_WAIT_MS] for the
+     * button that may: the bike alone sends ONE frame per press, already at the new level. Sent at once and
+     * then re-sent with the press in, Bestcycling got old-then-new 15 ms apart and moved its target the wrong
+     * way on the first press of a run (5 of 42 presses on 12-oct, never with the bike direct). A button later
+     * than the wait still gets the re-send.
+     * ponytail: the timeout and a new frame can race and swap two frames' order; one sample, harmless.
+     */
+    private val deferredTelemetry = java.util.concurrent.atomic.AtomicReference<ByteArray?>(null)
+    private val flushDeferredTelemetry = Runnable {
+        deferredTelemetry.getAndSet(null)?.let { onZycleValue(GattUuids.ZYCLE_TELEMETRY, it) }
+    }
     /** The trainer link dropped, so the next level we see must be RE-ANCHORED rather than differenced.
      *  A drop does not stop the mirror (the GATT and the connected apps are deliberately kept), so without
      *  this the pair above straddles the outage and the first frame back is differenced against a level from
@@ -633,6 +657,10 @@ class MirrorServer(
             // Zycle's own telemetry carries the same watts as 0x2AD2 and Bestcycling subscribes to both:
             // one bridge must never hand one app two different numbers for the same instant.
             charUuid == GattUuids.ZYCLE_TELEMETRY -> {
+                // A held frame goes out before the one that follows it, never after.
+                deferredTelemetry.getAndSet(null)?.let {
+                    handler.removeCallbacks(flushDeferredTelemetry); onZycleValue(GattUuids.ZYCLE_TELEMETRY, it)
+                }
                 val l = zycleLevel
                 lastZycleTelemetry = value
                 PowerRewrite.zycleLevel(value)?.let { raw ->
@@ -646,7 +674,12 @@ class MirrorServer(
                     // THE line that makes the servo-vs-rider rule auditable from a ride log.
                     if (FileLog.enabled && (reanchored || who != null))
                         FileLog.event("level raw=$prevRaw->$raw shown=$prevShown->${l.shown} " +
-                            (if (reanchored) "REANCHOR" else who))
+                            (if (reanchored) "REANCHOR" else "$who unclaimed=${l.unclaimedNow}"))
+                    if (!reanchored && who == "SERVO" && l.unclaimedNow != 0) {
+                        deferredTelemetry.set(value)
+                        handler.postDelayed(flushDeferredTelemetry, PRESS_WAIT_MS)
+                        return
+                    }
                 }
                 PowerRewrite.correctZycleTelemetry(value, correction(), l.shown)
             }
@@ -654,16 +687,16 @@ class MirrorServer(
             charUuid == GattUuids.ZYCLE_BUTTON -> {
                 PowerRewrite.zycleButtonLevel(value)?.let { lvl ->
                     val l = zycleLevel
-                    val before = l.shown
-                    if (l.onButton(lvl, SystemClock.elapsedRealtime())) {
-                        if (FileLog.enabled) FileLog.event("level shown=$before->${l.shown} RIDER (button)")
-                        // The frame that carried this step already went out with the old level, and the
-                        // next one is up to ~2 s away when nothing moves: re-send it now with the press in.
+                    if (l.onButton(lvl, SystemClock.elapsedRealtime())) {   // logs its own decision
+                        // The frame that carried this step is still held (sent now, once, with the press in)
+                        // or already went out with the old level, the next one up to ~2 s away: re-send it.
+                        handler.removeCallbacks(flushDeferredTelemetry); deferredTelemetry.set(null)
                         lastZycleTelemetry?.let { onZycleValue(GattUuids.ZYCLE_TELEMETRY, it) }
                     }
                 }
                 value
             }
+            charUuid == GattUuids.ZYCLE_POWER_STATUS -> PowerRewrite.correctZyclePowerStatus(value, correction())
             else -> value
         }
         cache[charUuid] = out
@@ -687,6 +720,7 @@ class MirrorServer(
             val targets = synchronized(subs) { subs.toList() }   // copy under lock — a CCCD write may mutate it concurrently
             for (addr in targets) {
                 val dev = clients[addr] ?: continue
+                if (terminalIndication?.address == addr) continue   // paused: its control result is being answered
                 notify(srv, dev, ch, out, indicate)
             }
         }
@@ -694,6 +728,9 @@ class MirrorServer(
 
     @Suppress("DEPRECATION")
     private fun notify(srv: BluetoothGattServer, dev: BluetoothDevice, ch: BluetoothGattCharacteristic, value: ByteArray, indicate: Boolean): Boolean {
+        // Counted BEFORE the call: its report can arrive on a binder thread before the call returns.
+        val pending = unconfirmed.getOrPut(dev.address) { java.util.concurrent.atomic.AtomicInteger() }
+        pending.incrementAndGet()
         return runCatching {
             val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
                 srv.notifyCharacteristicChanged(dev, ch, indicate, value) == android.bluetooth.BluetoothStatusCodes.SUCCESS
@@ -703,9 +740,12 @@ class MirrorServer(
                 srv.notifyCharacteristicChanged(dev, ch, indicate)
             }
             // a refused notification is a silently dropped sample — "power froze in the app"
-            if (!ok) FileLog.event("notify ${shortUuid(ch.uuid)} REFUSED (buffer full?) -> ${dev.address}")
+            if (!ok) {
+                FileLog.event("notify ${shortUuid(ch.uuid)} REFUSED (buffer full?) -> ${dev.address}")
+                pending.updateAndGet { maxOf(0, it - 1) }
+            }
             ok
-        }.getOrDefault(false)
+        }.getOrElse { pending.updateAndGet { n -> maxOf(0, n - 1) }; false }
     }
 
     /** The origin is GONE or the stack refused the indication outright: it will never see the terminal
@@ -726,6 +766,46 @@ class MirrorServer(
         FileLog.event("ftms result not delivered ($why) -> ${client.address}#${client.generation} — control kept")
     }
 
+    /** The send half of [notifyControlResult], on the main looper. A terminal result waits (bounded) until
+     *  nothing else to that app is unconfirmed, so the next report for the app is unambiguously its own. */
+    private fun sendControlResult(
+        client: FtmsControlCoordinator.Client, value: ByteArray, terminal: Boolean,
+        ch: BluetoothGattCharacteristic, uuid: java.util.UUID, attempt: Int,
+    ) {
+        val srv = server ?: return undeliverable(client, "server closed", terminal)
+        if (ftmsControl.identity(client.address) != client) return undeliverable(client, "stale generation", terminal)
+        val dev = clients[client.address] ?: return undeliverable(client, "device gone", terminal)
+        val currentSubs = subscribers[uuid] ?: return undelivered(client, "nobody subscribed to 0x2AD9 yet")
+        if (!synchronized(currentSubs) { currentSubs.contains(client.address) })
+            return undelivered(client, "unsubscribed before send")
+        val busy = (unconfirmed[client.address]?.get() ?: 0) > 0 || terminalIndication != null
+        if (terminal && busy && attempt < RESULT_WAIT_TRIES) {
+            handler.postDelayed({ sendControlResult(client, value, terminal, ch, uuid, attempt + 1) }, RESULT_WAIT_STEP_MS)
+            return
+        }
+        // Still busy after the wait (a report never came): send anyway, but its outcome cannot be told apart
+        // from the other send's, so it is not tracked — a failure then does not revoke. Logged, so it shows.
+        val tracked = terminal && !busy
+        if (terminal && busy) FileLog.event("ftms result sent while ${client.address} had unconfirmed sends — outcome untracked")
+        if (tracked) {
+            terminalIndication = client
+            val seq = ++terminalSeq
+            handler.postDelayed({
+                if (terminalIndication === client && terminalSeq == seq) {
+                    terminalIndication = null
+                    FileLog.event("ftms result to ${client.address}#${client.generation}: no report in ${RESULT_REPORT_MS}ms — resuming its data")
+                }
+            }, RESULT_REPORT_MS)
+        }
+        if (!notify(srv, dev, ch, value, ch.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)) {
+            if (terminalIndication === client) terminalIndication = null
+            // The controller would wait forever for a response it will never get. Drop its claim and cut
+            // the link so it reconnects and re-arbitrates instead of sitting there believing it owns ERG.
+            undeliverable(client, "indication refused", terminal)
+            cancelClient(client)
+        }
+    }
+
     private fun notifyControlResult(
         client: FtmsControlCoordinator.Client,
         value: ByteArray,
@@ -736,22 +816,7 @@ class MirrorServer(
         val subs = subscribers[uuid] ?: return undelivered(client, "nobody subscribed to 0x2AD9 yet")
         if (ftmsControl.identity(client.address) != client) return undeliverable(client, "stale generation", terminal)
         if (!synchronized(subs) { subs.contains(client.address) }) return undelivered(client, "not subscribed yet")
-        handler.post {
-            val srv = server ?: return@post undeliverable(client, "server closed", terminal)
-            if (ftmsControl.identity(client.address) != client) return@post undeliverable(client, "stale generation", terminal)
-            val dev = clients[client.address] ?: return@post undeliverable(client, "device gone", terminal)
-            val currentSubs = subscribers[uuid] ?: return@post undelivered(client, "nobody subscribed to 0x2AD9 yet")
-            if (!synchronized(currentSubs) { currentSubs.contains(client.address) })
-                return@post undelivered(client, "unsubscribed before send")
-            if (terminal) terminalIndication = client
-            if (!notify(srv, dev, ch, value, ch.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)) {
-                terminalIndication = null
-                // The controller would wait forever for a response it will never get. Drop its claim and cut
-                // the link so it reconnects and re-arbitrates instead of sitting there believing it owns ERG.
-                undeliverable(client, "indication refused", terminal)
-                cancelClient(client)
-            }
-        }
+        handler.post { sendControlResult(client, value, terminal, ch, uuid, 0) }
     }
 
     private fun cancelClient(client: FtmsControlCoordinator.Client) {
@@ -806,6 +871,8 @@ class MirrorServer(
                     cancelProcedureDeadline(it.procedure)
                 } != null
                 clients.remove(device.address); subscribers.values.forEach { it.remove(device.address) }
+                unconfirmed.remove(device.address)
+                if (terminalIndication?.address == device.address) terminalIndication = null
                 onStatus(context.getString(R.string.status_app_disconnected, clients.size))
                 FileLog.event("app disconnected ${device.address} status=$status (${clients.size} left)")
                 if (lostPending) handler.post(onTrainerRecycle)
@@ -928,15 +995,19 @@ class MirrorServer(
 
         /** Notification flow control: a failure here means our notifications stopped reaching the app. */
         override fun onNotificationSent(device: BluetoothDevice?, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) return
-            FileLog.event("notify FAILED status=$status -> ${device?.address}")
+            val addr = device?.address ?: return
+            unconfirmed[addr]?.updateAndGet { maxOf(0, it - 1) }
+            val pending = terminalIndication?.takeIf { it.address == addr }
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                if (pending != null) terminalIndication = null
+                return
+            }
+            FileLog.event("notify FAILED status=$status -> $addr" + if (pending != null) " (control result pending)" else "")
             // notifyCharacteristicChanged() returning success only means the send was accepted for
             // dispatch; THIS is where Android reports whether it actually landed. If the send in flight
             // was a terminal Control Point result, its origin will wait forever for an answer it will
             // never see, while every other app is refused because it still holds control.
-            val addr = device?.address ?: return
-            val pendingTerminal = terminalIndication ?: return
-            if (pendingTerminal.address != addr) return
+            val pendingTerminal = pending ?: return
             terminalIndication = null
             undeliverable(pendingTerminal, "onNotificationSent status=$status", terminal = true)
             cancelClient(pendingTerminal)
@@ -1176,6 +1247,10 @@ class MirrorServer(
     }
 
     private companion object {
+        const val RESULT_WAIT_STEP_MS = 10L     // a notification reports within a connection event or two
+        const val RESULT_WAIT_TRIES = 30        // ...so 300 ms of waiting means a report was lost
+        const val PRESS_WAIT_MS = 300L          // a press's button came 2-300 ms after its frame in 961 logged presses
+        const val RESULT_REPORT_MS = 2_000L     // an app confirms an indication within a few connection events
         /**
          * Callbacks retired while their start was STILL UNRESOLVED — and only those. The callback IS the
          * controller registration, and a stop issued while its start is in flight is dropped by the stack,

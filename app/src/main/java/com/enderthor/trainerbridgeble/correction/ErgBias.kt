@@ -14,9 +14,13 @@ import kotlin.math.roundToInt
  * lands where the app asked. Learned rather than configured: it is a property of this particular trainer
  * (and its temperature, and its belt), so no one can be expected to type the number in.
  *
- * It cannot wind up. Commanding `target - bias` makes the trainer deliver `(target - bias) + overshoot`,
- * so the sampled error stays at `overshoot` whatever the bias is — the EMA converges on the trainer's
- * error, it does not chase its own output the way an error integrator would.
+ * It cannot wind up WHILE THE TRAINER TRACKS: commanding `target - bias` makes it deliver
+ * `(target - bias) + overshoot`, so the sampled error stays at `overshoot` whatever the bias is. When it does
+ * NOT track — the rider surging, the servo out of range — `sample - bias` is the power the app sees off its
+ * own target, and the EMA integrates it: 4-oct it climbed to 28 W on 34-56 W gaps and cut every ERG command
+ * by that much. So a sample only counts when the trainer is within [MAX_BIAS_W] of what it was commanded —
+ * an overshoot the bias could legitimately hold. Gated on the sample itself, not on its distance from the
+ * current estimate: that version could never learn a real 13 W from 0, nor walk back a bad saved -15.
  *
  * Pure logic, no Android: the caller passes the clock (as [com.enderthor.trainerbridgeble.CorrectedFeed]
  * does) so this is unit-testable.
@@ -32,9 +36,8 @@ object ErgBias {
     /** ~100 samples to converge; at the trainer's 0.5 Hz that is roughly three minutes. Slow on purpose:
      *  the rider surging over target must not move it. */
     private const val ALPHA = 0.02
-    private const val MAX_BIAS_W = 30
-    /** One absurd sample (a dropout, a standing sprint) must not drag the average. */
-    private const val MAX_SAMPLE_W = 60
+    /** Measured overshoot is ~8 W; 20 leaves room for a warm belt without letting a bad ride cost 30 W. */
+    const val MAX_BIAS_W = 20
 
     private const val OP_SET_TARGET_POWER = 0x05
 
@@ -83,7 +86,9 @@ object ErgBias {
         if (rawWatts <= 0) return null                       // not pedalling: says nothing about tracking
         if (nowMs - commandedAtMs < SETTLE_MS) return null    // still ramping
         val before = watts
-        val sample = (rawWatts - target).coerceIn(-MAX_SAMPLE_W, MAX_SAMPLE_W)
+        val sample = rawWatts - target
+        // Not tracking (a dropout, a standing sprint): nothing to learn about the trainer.
+        if (Math.abs(sample) > MAX_BIAS_W) return null
         bias = (bias + ALPHA * (sample - bias)).coerceIn(-MAX_BIAS_W.toDouble(), MAX_BIAS_W.toDouble())
         return watts.takeIf { it != before }
     }

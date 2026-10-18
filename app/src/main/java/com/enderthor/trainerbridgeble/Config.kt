@@ -124,7 +124,8 @@ class Config(context: Context) {
         const val KEY_OFFSET = "offsetW"
         const val KEY_INVERT_FLOOR = "invertFloorW"
         const val KEY_ERG_BIAS = "ergBiasW"
-        const val ERG_BIAS_LIMIT_W = 30   // must match ErgBias's own clamp
+        // ONE clamp: a legacy 28 W preference must not keep cutting commands past what the learner may hold
+        const val ERG_BIAS_LIMIT_W = com.enderthor.trainerbridgeble.correction.ErgBias.MAX_BIAS_W
         const val KEY_ADDR = "pairedAddress"
         const val KEY_SEEN_ADDR = "lastSeenAddress"
         const val KEY_SEEN_NAME = "lastSeenName"

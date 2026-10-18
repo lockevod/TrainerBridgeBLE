@@ -75,6 +75,12 @@ object PowerRewrite {
         }
     }
 
+    /** [GattUuids.ZYCLE_POWER_STATUS]: power uint16 LE at 0..1, the rest passed verbatim. */
+    fun correctZyclePowerStatus(value: ByteArray, c: PowerCorrection): ByteArray {
+        if (value.size < 2) return value
+        return value.copyOf().also { putLe16(it, 0, c.correct(le16signed(value, 0))) }
+    }
+
     /**
      * Who moved the trainer's level: the RIDER pressing the bike's own +/- buttons (a real intensity change —
      * the app nudges its target for each step) or the SERVO settling on a target the app commanded (must stay
@@ -99,14 +105,30 @@ object PowerRewrite {
      * One notification per press is measured, not assumed: the 4-oct ride has 177 page-0x31 frames, no two
      * consecutive ones naming the same level, and bursts down to 13 ms apart — hence several early presses.
      */
-    class LevelAttribution(private val windowMs: Long = 500) {
+    class LevelAttribution(private val windowMs: Long = 500, private val holdMs: Long = 2_500, private val log: (String) -> Unit = {}) {
         var shown: Int? = null; private set          // what the app sees
         var lastRaw: Int? = null; private set        // what the trainer last reported
         private var unclaimed = 0; private var unclaimedAt = 0L   // the last step, until presses claim it
         private var stepFrom = 0                                  // ...and where it started
+        /** Levels of the last step still unclaimed, for the per-step log line. */
+        val unclaimedNow: Int @Synchronized get() = unclaimed
         // Presses that beat their level frame. Several, not one: two quick presses can both land before
         // the frame that carries them (31 then 32, then 30 -> 32), and keeping only the newest lost one.
         private val early = ArrayList<Pair<Int, Long>>()
+        // A press naming the level one short of where the last step ended. That is ALSO exactly where a press
+        // the other way from the step's end lands: servo 20 -> 30, rider presses - to 29, button first. Claimed
+        // at once it sent the app a + for a -. The bike's button frame does not say which way (its low bits
+        // 0..16 split the same for + and -, 4-oct), so such a press is HELD as an early press with a longer
+        // life: a frame back over it within [holdMs] — wider than the ~2 s between quiet frames — proves the
+        // reverse press; a press further along the step proves a burst through it (31 then 32 for 30 -> 32).
+        // Nothing else decides it, and then it is DROPPED: a guessed direction costs two steps when wrong, a
+        // dropped press one. Each further reverse press (28 after 29) is held the same way.
+        // ponytail: - then + within 500 ms of a servo jump reads as a + burst (+2 for a net 0). Not separable
+        // without frames, which do not come for presses that cancel; never seen in any recorded ride.
+        private val held = HashSet<Pair<Int, Long>>()
+        private var lastHeld: Pair<Int, Long>? = null
+        private var heldAt = 0   // the level the held presses would step back from
+        private var heldSign = 0
 
         /** A telemetry frame: RIDER/SERVO for a step (SERVO may still be claimed by [onButton]), null if none. */
         @Synchronized fun onLevel(raw: Int, nowMs: Long): String? {
@@ -114,36 +136,82 @@ object PowerRewrite {
             lastRaw = raw
             // Anchored off the floor, not at the idle 0 the ride starts from: the app reads the level relatively,
             // and from 0 the rider's first presses - could not show at all.
-            val s = shown ?: return null.also { shown = maxOf(raw, ANCHOR_LEVEL) }
-            if (last == null || raw == last) return null
+            val s = shown ?: return null.also {
+                shown = maxOf(raw, ANCHOR_LEVEL); log("level ANCHOR raw=$raw shown=$shown")
+            }
+            if (last == null) return null
+            early.removeAll { e ->
+                val ambiguous = e in held
+                (nowMs - e.second >= if (ambiguous) holdMs else windowMs).also {
+                    if (it) { held.remove(e); log("level btn=${e.first} EXPIRED ${if (ambiguous) "(direction unknown, dropped)" else "unclaimed"} raw=$raw") }
+                }
+            }
+            if (held.isEmpty()) lastHeld = null
+            if (raw == last) return null
             val step = Integer.signum(raw - last)
-            early.removeAll { nowMs - it.second >= windowMs }
+            // Held presses are credited only by the frame that IS them: back from where they were held, and at
+            // most one level bigger than they explain (one more press in the same frame, whose button is still to
+            // come). A servo pull-back 30 -> 24 also crosses a held 29; crediting it there turned a + press into
+            // a - (11-oct fuzz). Exact size alone dropped the held press of every two-press frame.
+            // Early presses (not held) it crosses explain levels too: three presses in one frame (seed 7127).
+            val crossed = held.filter { within(it.first, last, raw) }
+            val explained = early.count { within(it.first, last, raw) }
+            val heldCount = if (step == -heldSign && last == heldAt && crossed.isNotEmpty() &&
+                Math.abs(raw - last) <= explained + 1) crossed.size else 0
             var credited = 0
             val it = early.iterator()
-            while (it.hasNext() && credited < Math.abs(raw - last))
-                if (within(it.next().first, last, raw)) { it.remove(); credited++ }
+            while (it.hasNext() && credited < Math.abs(raw - last)) {
+                val e = it.next()
+                if (!within(e.first, last, raw) || (e in held && heldCount == 0)) continue
+                it.remove(); held.remove(e); credited++
+            }
             shown = clampLevel(s + step * credited)
             unclaimed = raw - last - step * credited; unclaimedAt = nowMs; stepFrom = last
             return if (credited > 0) "RIDER" else "SERVO"
         }
 
-        /** A button notification for [level]. @return true if it claimed one level of the step just absorbed.
-         *  Any level the step passed through counts: a burst names 31 and 32 for one 30 -> 32 frame. */
+        /** A button notification for [level]. @return true if it changed [shown] (a claim on the step just
+         *  absorbed). Any level the step passed through counts: a burst names 31 and 32 for one 30 -> 32 frame. */
         @Synchronized fun onButton(level: Int, nowMs: Long): Boolean {
             val s = shown; val raw = lastRaw
             if (s != null && raw != null && unclaimed != 0 && nowMs - unclaimedAt < windowMs &&
                 within(level, stepFrom, raw)) {
                 val step = Integer.signum(unclaimed)
+                if (level == (lastHeld?.takeIf { heldSign == step }?.first ?: raw) - step) {
+                    val h = level to nowMs
+                    heldSign = step; heldAt = raw; lastHeld = h; held.add(h); early.add(h)
+                    log("level btn=$level HELD step=$stepFrom->$raw (or a press back from $raw)")
+                    return false
+                }
+                val before = shown
                 shown = clampLevel(s + step); unclaimed -= step
+                log("level btn=$level CLAIMED step=$stepFrom->$raw shown=$before->$shown unclaimed=$unclaimed")
+                // A press further along the step than a held one: the step ran through it, a burst.
+                for (h in held.filter { heldSign == step && it.first != level && within(it.first, stepFrom, level) }) {
+                    if (Integer.signum(unclaimed) != step) break
+                    held.remove(h); early.remove(h)
+                    val b = shown ?: break
+                    shown = clampLevel(b + step); unclaimed -= step
+                    log("level btn=${h.first} CLAIMED (held, burst) shown=$b->$shown unclaimed=$unclaimed")
+                }
+                return true
+            }
+            // At the floor a press - names 0 and moves nothing, so no frame will ever claim it (18-oct: 31 such
+            // presses, every one lost — "pressing - did nothing" at low targets). Only a - can name 0 from 0.
+            // ponytail: the same dead end exists at the machine's top level; unknown (seen 49 and 90), add if hit.
+            if (s != null && level == 0 && raw == 0) {
+                shown = clampLevel(s - 1)
+                log("level btn=0 FLOOR shown=$s->$shown")
                 return true
             }
             early.add(level to nowMs)
-            if (early.size > MAX_EARLY_PRESSES) early.removeAt(0)
+            if (early.size > MAX_EARLY_PRESSES) early.removeAt(0).also { held.remove(it); log("level btn=${it.first} DROPPED (burst)") }
+            log("level btn=$level EARLY raw=$raw")
             return false
         }
 
         /** The trainer link dropped: whatever it moved through meanwhile is nobody's press. */
-        @Synchronized fun rebase(raw: Int) { lastRaw = raw; unclaimed = 0; early.clear() }
+        @Synchronized fun rebase(raw: Int) { lastRaw = raw; unclaimed = 0; early.clear(); held.clear(); lastHeld = null }
 
         /** The levels a step from [from] to [to] moved INTO: (from, to] going up, [to, from) going down. */
         private fun within(level: Int, from: Int, to: Int) =

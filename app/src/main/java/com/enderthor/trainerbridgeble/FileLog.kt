@@ -39,7 +39,11 @@ object FileLog {
                     val rotated = runCatching { if (old.exists()) old.delete(); f.renameTo(old) }.getOrDefault(false)
                     if (rotated) f.writeText("# $ts log rotated at ${MAX_BYTES / 1024 / 1024} MB (previous: ${f.name}.1)\n")
                 }
-                f.appendText("# $ts $msg\n")
+                // fsync at most every few seconds, not per line (~10 lines/s): enough that a power cut costs
+                // seconds of log, not the NUL-filled holes the 24-jul and 8-sep idle shutdowns left behind.
+                val sync = ts - lastSyncMs >= SYNC_EVERY_MS
+                if (sync) lastSyncMs = ts
+                append(f, "# $ts $msg\n", sync)
             } }
         }
     }
@@ -49,8 +53,22 @@ object FileLog {
     fun eventNow(msg: String) {
         if (!enabled) return
         val f = file ?: return
-        runCatching { synchronized(fileLock) { f.appendText("# ${System.currentTimeMillis()} $msg\n") } }
+        val ts = System.currentTimeMillis()
+        // Through the queue, so it lands AFTER the lines that happened before it; the caller's wait is bounded,
+        // so a stalled flash cannot hold the shutdown receiver past its window.
+        runCatching {
+            io.submit { synchronized(fileLock) { append(f, "# $ts $msg\n", sync = true) } }
+                .get(2, java.util.concurrent.TimeUnit.SECONDS)
+        }
     }
+
+    @Volatile private var lastSyncMs = 0L
+    private const val SYNC_EVERY_MS = 5_000L
+
+    /** Append, and optionally force it to flash: without the sync a power cut keeps the file's new length
+     *  but not its data. */
+    private fun append(f: File, line: String, sync: Boolean) =
+        java.io.FileOutputStream(f, true).use { out -> out.write(line.toByteArray()); if (sync) out.fd.sync() }
 
     // Every notification is logged unthrottled (~2 KB/s), so 16 MB filled in ~2 h and rotation threw away
     // the START of the ride — which is exactly where the connect / sync / first-advertise sequence lives,

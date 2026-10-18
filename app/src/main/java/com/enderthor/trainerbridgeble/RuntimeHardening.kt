@@ -350,3 +350,21 @@ internal class ErgBiasPersistence(
 
     fun drain(): Int? = pending.also { pending = null }
 }
+
+/** Android lets an app START a BLE scan 5 times per 30 s. On API 32 the 6th start is dropped silently: no
+ *  onScanFailed, the app believes it is scanning and never finds anything again. Count our own starts and
+ *  say how long to wait before the next one is safe. The margin covers the stack's clock vs ours. */
+class ScanStartBudget(private val max: Int = 5, private val windowMs: Long = 30_000, private val marginMs: Long = 1_000) {
+    private val starts = ArrayDeque<Long>()
+    @Synchronized fun delayMs(nowMs: Long): Long {
+        prune(nowMs)
+        return if (starts.size < max) 0 else starts.first() + windowMs + marginMs - nowMs
+    }
+    @Synchronized fun record(nowMs: Long) { prune(nowMs); starts.addLast(nowMs) }
+    private fun prune(nowMs: Long) { while (starts.isNotEmpty() && nowMs - starts.first() >= windowMs + marginMs) starts.removeFirst() }
+
+    companion object {
+        /** The limit is per app, not per scanner: every client, and the config screen, share one history. */
+        val shared = ScanStartBudget()
+    }
+}
