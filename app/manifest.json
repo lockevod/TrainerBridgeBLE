@@ -7,6 +7,6 @@
   "latestVersionCode": 202610181,
   "developer": "Enderthor",
   "description": "Bridges your indoor trainer to your apps (Bestcycling/Garmin/Karoo), correcting the reported power on the fly and inverting the ERG target, and re-exposes it as a virtual power/cadence/speed sensor to the Karoo.",
-  "releaseNotes": "Reconnection fixes: after several failed attempts on a weak link the bridge could stop looking for the trainer for the rest of the session; it now paces its retries and keeps searching. Slow trainer responses no longer drop the connection. Bike button presses: a press made while the trainer is changing level is no longer sent to the app in the wrong direction. ERG: the learned trainer offset can no longer drift up during hard efforts and lower every target (now capped at 20 W). Keep awake: leaving the settings screen open no longer wakes the screen every minute. All power values sent to apps are now corrected. The diagnostic log records every button press decision and survives power-offs.",
+  "releaseNotes": "Bike button presses: pressing - when the trainer is already at its lowest level now reaches the app (before, those presses were ignored and the app's intensity did not go down). When a press and an automatic trainer level change arrive together, the app now receives a single level update instead of two in quick succession.",
   "tags": ["health","performance"]
 }
