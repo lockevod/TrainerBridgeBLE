@@ -141,6 +141,24 @@ class PowerRewriteTest {
         assertEquals(39, l.shown)
     }
 
+    /** 18-oct: at a low target the machine sits at level 0, and each press - there names 0 and moves nothing —
+     *  no frame ever comes. 31 of them expired unclaimed: "pressing - did nothing". Only a - can land on 0. */
+    @Test fun levelAttribution_aPressMinusAtTheFloorStillReachesTheApp() {
+        val l = PowerRewrite.LevelAttribution()
+        l.onLevel(1, 0)
+        l.onLevel(0, 1000)
+        assertEquals(true, l.onButton(0, 1010))             // the press that took it to 0
+        assertEquals(39, l.shown)
+        assertEquals(true, l.onButton(0, 2000))             // and the ones that could not go further
+        assertEquals(true, l.onButton(0, 2300))
+        assertEquals(37, l.shown)
+        assertEquals(null, l.onLevel(0, 3000))
+        assertEquals(37, l.shown)
+        assertEquals(false, l.onButton(1, 4000))            // a + still waits for its frame
+        assertEquals("RIDER", l.onLevel(1, 4050))
+        assertEquals(38, l.shown)
+    }
+
     /** A press is only evidence for a level change close to it: one seen later cannot claim an old jump. */
     @Test fun levelAttribution_aPressOutsideTheWindowClaimsNothing() {
         val l = PowerRewrite.LevelAttribution()

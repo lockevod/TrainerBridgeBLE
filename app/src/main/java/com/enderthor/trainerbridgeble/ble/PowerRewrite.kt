@@ -196,6 +196,14 @@ object PowerRewrite {
                 }
                 return true
             }
+            // At the floor a press - names 0 and moves nothing, so no frame will ever claim it (18-oct: 31 such
+            // presses, every one lost — "pressing - did nothing" at low targets). Only a - can name 0 from 0.
+            // ponytail: the same dead end exists at the machine's top level; unknown (seen 49 and 90), add if hit.
+            if (s != null && level == 0 && raw == 0) {
+                shown = clampLevel(s - 1)
+                log("level btn=0 FLOOR shown=$s->$shown")
+                return true
+            }
             early.add(level to nowMs)
             if (early.size > MAX_EARLY_PRESSES) early.removeAt(0).also { held.remove(it); log("level btn=${it.first} DROPPED (burst)") }
             log("level btn=$level EARLY raw=$raw")
