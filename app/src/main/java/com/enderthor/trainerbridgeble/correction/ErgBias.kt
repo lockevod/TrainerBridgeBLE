@@ -38,8 +38,6 @@ object ErgBias {
     private const val ALPHA = 0.02
     /** Measured overshoot is ~8 W; 20 leaves room for a warm belt without letting a bad ride cost 30 W. */
     const val MAX_BIAS_W = 20
-    /** One absurd sample (a dropout, a standing sprint) must not drag the average. */
-    private const val MAX_SAMPLE_W = 60
 
     private const val OP_SET_TARGET_POWER = 0x05
 
@@ -88,8 +86,9 @@ object ErgBias {
         if (rawWatts <= 0) return null                       // not pedalling: says nothing about tracking
         if (nowMs - commandedAtMs < SETTLE_MS) return null    // still ramping
         val before = watts
-        val sample = (rawWatts - target).coerceIn(-MAX_SAMPLE_W, MAX_SAMPLE_W)
-        if (Math.abs(sample) > MAX_BIAS_W) return null   // not tracking: nothing to learn about the trainer
+        val sample = rawWatts - target
+        // Not tracking (a dropout, a standing sprint): nothing to learn about the trainer.
+        if (Math.abs(sample) > MAX_BIAS_W) return null
         bias = (bias + ALPHA * (sample - bias)).coerceIn(-MAX_BIAS_W.toDouble(), MAX_BIAS_W.toDouble())
         return watts.takeIf { it != before }
     }
