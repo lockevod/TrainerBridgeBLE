@@ -423,6 +423,7 @@ class MirrorServer(
         built.set(false); advBlueprint = null
         chars.clear(); cache.clear(); subscribers.clear(); clients.clear(); pendingServices.clear()
         zycleLevel = newLevelAttribution(); lastZycleTelemetry = null; reanchorLevel = false
+        deferredTelemetry.set(null)
     }
 
     /**
@@ -437,6 +438,18 @@ class MirrorServer(
     private fun newLevelAttribution() = PowerRewrite.LevelAttribution(log = { if (FileLog.enabled) FileLog.event(it) })
     /** The trainer's last telemetry frame, as received: re-sent when a press is claimed after it went out. */
     @Volatile private var lastZycleTelemetry: ByteArray? = null
+    /**
+     * A telemetry frame whose level moved and no press has claimed yet, held up to [PRESS_WAIT_MS] for the
+     * button that may: the bike alone sends ONE frame per press, already at the new level. Sent at once and
+     * then re-sent with the press in, Bestcycling got old-then-new 15 ms apart and moved its target the wrong
+     * way on the first press of a run (5 of 42 presses on 12-oct, never with the bike direct). A button later
+     * than the wait still gets the re-send.
+     * ponytail: the timeout and a new frame can race and swap two frames' order; one sample, harmless.
+     */
+    private val deferredTelemetry = java.util.concurrent.atomic.AtomicReference<ByteArray?>(null)
+    private val flushDeferredTelemetry = Runnable {
+        deferredTelemetry.getAndSet(null)?.let { onZycleValue(GattUuids.ZYCLE_TELEMETRY, it) }
+    }
     /** The trainer link dropped, so the next level we see must be RE-ANCHORED rather than differenced.
      *  A drop does not stop the mirror (the GATT and the connected apps are deliberately kept), so without
      *  this the pair above straddles the outage and the first frame back is differenced against a level from
@@ -644,6 +657,10 @@ class MirrorServer(
             // Zycle's own telemetry carries the same watts as 0x2AD2 and Bestcycling subscribes to both:
             // one bridge must never hand one app two different numbers for the same instant.
             charUuid == GattUuids.ZYCLE_TELEMETRY -> {
+                // A held frame goes out before the one that follows it, never after.
+                deferredTelemetry.getAndSet(null)?.let {
+                    handler.removeCallbacks(flushDeferredTelemetry); onZycleValue(GattUuids.ZYCLE_TELEMETRY, it)
+                }
                 val l = zycleLevel
                 lastZycleTelemetry = value
                 PowerRewrite.zycleLevel(value)?.let { raw ->
@@ -658,6 +675,11 @@ class MirrorServer(
                     if (FileLog.enabled && (reanchored || who != null))
                         FileLog.event("level raw=$prevRaw->$raw shown=$prevShown->${l.shown} " +
                             (if (reanchored) "REANCHOR" else "$who unclaimed=${l.unclaimedNow}"))
+                    if (!reanchored && who == "SERVO" && l.unclaimedNow != 0) {
+                        deferredTelemetry.set(value)
+                        handler.postDelayed(flushDeferredTelemetry, PRESS_WAIT_MS)
+                        return
+                    }
                 }
                 PowerRewrite.correctZycleTelemetry(value, correction(), l.shown)
             }
@@ -666,8 +688,9 @@ class MirrorServer(
                 PowerRewrite.zycleButtonLevel(value)?.let { lvl ->
                     val l = zycleLevel
                     if (l.onButton(lvl, SystemClock.elapsedRealtime())) {   // logs its own decision
-                        // The frame that carried this step already went out with the old level, and the
-                        // next one is up to ~2 s away when nothing moves: re-send it now with the press in.
+                        // The frame that carried this step is still held (sent now, once, with the press in)
+                        // or already went out with the old level, the next one up to ~2 s away: re-send it.
+                        handler.removeCallbacks(flushDeferredTelemetry); deferredTelemetry.set(null)
                         lastZycleTelemetry?.let { onZycleValue(GattUuids.ZYCLE_TELEMETRY, it) }
                     }
                 }
@@ -1226,6 +1249,7 @@ class MirrorServer(
     private companion object {
         const val RESULT_WAIT_STEP_MS = 10L     // a notification reports within a connection event or two
         const val RESULT_WAIT_TRIES = 30        // ...so 300 ms of waiting means a report was lost
+        const val PRESS_WAIT_MS = 300L          // a press's button came 2-300 ms after its frame in 961 logged presses
         const val RESULT_REPORT_MS = 2_000L     // an app confirms an indication within a few connection events
         /**
          * Callbacks retired while their start was STILL UNRESOLVED — and only those. The callback IS the
