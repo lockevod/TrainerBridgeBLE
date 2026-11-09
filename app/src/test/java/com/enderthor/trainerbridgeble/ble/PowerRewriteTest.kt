@@ -41,6 +41,17 @@ class PowerRewriteTest {
         assertArrayEquals(bytes(0x05, 0xA2, 0x00), PowerRewrite.inverseTargetPower(bytes(0x05, 0xC8, 0x00), c))
     }
 
+    @Test fun softenStallDrop_holdsShareOfLastTarget() {
+        val drop = bytes(0x05, 0x0A, 0x00)   // the app's 10 W anti-stall
+        assertArrayEquals(bytes(0x05, 0x94, 0x00), PowerRewrite.softenStallDrop(drop, 296, 50))    // 148 W
+        assertArrayEquals(bytes(0x05, 0x28, 0x01), PowerRewrite.softenStallDrop(drop, 296, 100))   // relief off
+        assertArrayEquals(drop, PowerRewrite.softenStallDrop(drop, 296, 0))                        // app's own 10 W
+        assertArrayEquals(drop, PowerRewrite.softenStallDrop(drop, 12, 50))                        // never below 10 W
+        assertArrayEquals(drop, PowerRewrite.softenStallDrop(drop, null, 50))                      // no target yet
+        val real = bytes(0x05, 0x28, 0x01)
+        assertArrayEquals(real, PowerRewrite.softenStallDrop(real, 200, 50))                       // only the 10 W drop
+    }
+
     @Test fun inverseTargetPower_passesOtherOpsThrough() {
         val reset = bytes(0x01)
         assertArrayEquals(reset, PowerRewrite.inverseTargetPower(reset, c))

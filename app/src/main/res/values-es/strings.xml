@@ -31,6 +31,7 @@
     <string name="config_scale_label">Ajuste de escala (%, entero)</string>
     <string name="config_offset_label">Offset (W, entero)</string>
     <string name="config_floor_label">Suelo ERG (W, 0 = off): por debajo de este target, no bajar más el comando</string>
+    <string name="config_stall_label" formatted="false">Alivio anti-atasco (% del target, 0 = el de la app, 10 W; 100 = quitarlo): cuando la app baja a 10 W porque te atascas, mantener este % del target</string>
     <string name="config_save_correction">Guardar corrección</string>
     <string name="config_saved">Guardado</string>
     <string name="config_bike">Bicicleta (BLE)</string>

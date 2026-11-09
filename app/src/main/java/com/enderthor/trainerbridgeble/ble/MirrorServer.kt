@@ -56,6 +56,8 @@ class MirrorServer(
      *  without this it is counted as a connected app: the UI shows a client that isn't there and every
      *  trainer connect triggers a needless advertising restart. */
     private val isTrainer: (String) -> Boolean = { false },
+    /** % of the last ERG target held when the app drops to its 10 W anti-stall. See [PowerRewrite.softenStallDrop]. */
+    private val stallReliefPercent: () -> Int = { 0 },
 ) {
     private val tag = "TBB/MirrorServer"
     private val handler = Handler(Looper.getMainLooper())
@@ -68,6 +70,10 @@ class MirrorServer(
     private val subscribers = ConcurrentHashMap<UUID, MutableSet<String>>()             // char uuid → subscribed client addrs
     private val clients = ConcurrentHashMap<String, BluetoothDevice>()                  // connected centrals
     private val ftmsControl = FtmsControlCoordinator()
+    /** The owner's last real ERG target, for [PowerRewrite.softenStallDrop]. Only admitted writes set it, and
+     *  whatever ends ERG (the opcodes ErgBias forgets on) or the session clears it: a 10 W at the start of the
+     *  next ride must stay 10 W, not become half of the last one's target. */
+    @Volatile private var lastAppTarget: Pair<String, Int>? = null   // (app address, W)
     /** Deadline for the admitted FTMS procedure. Without it one unanswered Control Point response wedges
      *  the gate and every later request — Request Control included — is refused for the rest of the ride. */
     /** The live procedure and its timer, kept together so a cancellation can prove it owns the deadline.
@@ -139,7 +145,7 @@ class MirrorServer(
      *  starts advertising again the moment it drops — so advertising with no trainer behind us puts two
      *  identical devices in the air and lets an app bind to a bridge that has no data to give it. */
     fun setTrainerLinked(linked: Boolean) {
-        val controller = if (linked) null else ftmsControl.trainerDropped()
+        val controller = if (linked) null else ftmsControl.trainerDropped().also { lastAppTarget = null }
         if (trainerLinked == linked) {
             controller?.let { handler.post { cancelClient(it) } }
             return
@@ -384,7 +390,7 @@ class MirrorServer(
         // the app reconnects, gets a new generation, and is refused CONTROL_NOT_PERMITTED for the ride.
         procedureDeadline?.let { handler.removeCallbacks(it.second) }
         procedureDeadline = null
-        ftmsControl.clear()
+        ftmsControl.clear(); lastAppTarget = null
         terminalIndication = null; unconfirmed.clear()
         audienceWarned.clear()
         clients.clear(); subscribers.clear()
@@ -410,7 +416,7 @@ class MirrorServer(
         serviceAddOwner.clear()
         serviceAddWatchdog?.let { handler.removeCallbacks(it) }
         serviceAddWatchdog = null
-        ftmsControl.clear()
+        ftmsControl.clear(); lastAppTarget = null
         terminalIndication = null; unconfirmed.clear()
         audienceWarned.clear()
         procedureDeadline?.let { handler.removeCallbacks(it.second) }
@@ -867,6 +873,7 @@ class MirrorServer(
                 // central (e.g. the Garmin) can still discover us.
                 handler.post { restartAdvertising() }
             } else {
+                if (lastAppTarget?.first == device.address) lastAppTarget = null
                 val lostPending = ftmsControl.disconnected(device.address)?.also {
                     cancelProcedureDeadline(it.procedure)
                 } != null
@@ -900,6 +907,14 @@ class MirrorServer(
             runCatching { server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value) }
         }
 
+        // ponytail: a target the trainer then refuses still counts; Bestcycling re-sends targets every ~20-40 s.
+        private fun noteControl(address: String, write: ByteArray) {
+            when (write[0].toInt() and 0xFF) {
+                0x05 -> PowerRewrite.targetPowerW(write)?.takeIf { it != PowerRewrite.STALL_DROP_W }?.let { lastAppTarget = address to it }
+                0x00, 0x01, 0x04, 0x08, 0x11 -> lastAppTarget = null
+            }
+        }
+
         override fun onCharacteristicWriteRequest(device: BluetoothDevice?, requestId: Int, ch: BluetoothGattCharacteristic?,
             preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray?) {
             val uuid = ch?.uuid
@@ -921,7 +936,8 @@ class MirrorServer(
             val tag = "${shortUuid(uuid)} <- ${device?.address}" +
                 (if (preparedWrite) " PREPARED off=$offset" else "") + (if (!responseNeeded) " noResp" else "")
             if (uuid != null && value != null) {
-                val out = if (GattUuids.carriesControl(uuid)) PowerRewrite.inverseTargetPower(value, correction()) else value
+                val out = if (GattUuids.carriesControl(uuid)) PowerRewrite.inverseTargetPower(
+                    PowerRewrite.softenStallDrop(value, lastAppTarget?.takeIf { it.first == device?.address }?.second, stallReliefPercent()), correction()) else value
                 // what the client asked for, unless the trainer's characteristic can't take a Write Command
                 val withResponse = responseNeeded ||
                     (ch.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE == 0)
@@ -951,6 +967,7 @@ class MirrorServer(
                             val procedure = admission.procedure
                             FileLog.event("ftms ADMITTED op=0x%02X #%d <- %s#%d"
                                 .format(opcode, procedure.id, device.address, procedure.client?.generation ?: 0L))
+                            noteControl(device.address, value)
                             relayed = relayAdmitted(procedure, out, withResponse)
                         }
                         // Accepted, waiting its turn behind the procedure in flight. `relayed` stays true:
@@ -960,6 +977,7 @@ class MirrorServer(
                         FtmsControlCoordinator.Admission.Held -> {
                             FileLog.event("ftms HELD op=0x%02X <- %s — behind the procedure in flight or the queue"
                                 .format(opcode, device.address))
+                            noteControl(device.address, value)
                             relayed = true
                         }
                     }

@@ -251,6 +251,23 @@ object PowerRewrite {
         return write.copyOf().also { putLe16(it, 1, c.invert(watts)) }
     }
 
+    /** The watts of an FTMS Set Target Power write, null for any other op. */
+    fun targetPowerW(write: ByteArray): Int? =
+        if (write.size < 3 || (write[0].toInt() and 0xFF) != 0x05) null else le16signed(write, 1)
+
+    /**
+     * Bestcycling's anti-stall: when the rider bogs down at a hard ERG target it writes 10 W, then re-sends
+     * the real target ~6 s later (22-oct: 15 times, at 47-52 rpm under 257-296 W). 10 W is a free spin; hold
+     * [percent] of [lastTargetW] instead. 0 = pass the app's 10 W, 100 = no relief at all. Never below 10 W.
+     */
+    fun softenStallDrop(write: ByteArray, lastTargetW: Int?, percent: Int): ByteArray {
+        if (percent <= 0 || lastTargetW == null || lastTargetW <= STALL_DROP_W || targetPowerW(write) != STALL_DROP_W) return write
+        val held = maxOf(STALL_DROP_W, lastTargetW * percent.coerceAtMost(100) / 100)
+        return write.copyOf().also { putLe16(it, 1, held) }
+    }
+
+    const val STALL_DROP_W = 10
+
     private fun le16(b: ByteArray, i: Int) = (b[i].toInt() and 0xFF) or ((b[i + 1].toInt() and 0xFF) shl 8)
     private fun le16signed(b: ByteArray, i: Int) = le16(b, i).toShort().toInt()
     private fun putLe16(b: ByteArray, i: Int, v: Int) { b[i] = (v and 0xFF).toByte(); b[i + 1] = ((v shr 8) and 0xFF).toByte() }
