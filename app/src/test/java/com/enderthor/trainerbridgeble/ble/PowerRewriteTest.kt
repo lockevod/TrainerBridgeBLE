@@ -41,6 +41,17 @@ class PowerRewriteTest {
         assertArrayEquals(bytes(0x05, 0xA2, 0x00), PowerRewrite.inverseTargetPower(bytes(0x05, 0xC8, 0x00), c))
     }
 
+    @Test fun softenStallDrop_holdsShareOfLastTarget() {
+        val drop = bytes(0x05, 0x0A, 0x00)   // the app's 10 W anti-stall
+        assertArrayEquals(bytes(0x05, 0x94, 0x00), PowerRewrite.softenStallDrop(drop, 296, 50))    // 148 W
+        assertArrayEquals(bytes(0x05, 0x28, 0x01), PowerRewrite.softenStallDrop(drop, 296, 100))   // relief off
+        assertArrayEquals(drop, PowerRewrite.softenStallDrop(drop, 296, 0))                        // app's own 10 W
+        assertArrayEquals(drop, PowerRewrite.softenStallDrop(drop, 12, 50))                        // never below 10 W
+        assertArrayEquals(drop, PowerRewrite.softenStallDrop(drop, null, 50))                      // no target yet
+        val real = bytes(0x05, 0x28, 0x01)
+        assertArrayEquals(real, PowerRewrite.softenStallDrop(real, 200, 50))                       // only the 10 W drop
+    }
+
     @Test fun inverseTargetPower_passesOtherOpsThrough() {
         val reset = bytes(0x01)
         assertArrayEquals(reset, PowerRewrite.inverseTargetPower(reset, c))
@@ -130,6 +141,42 @@ class PowerRewriteTest {
         assertEquals(50, l.shown)                          // the -9 never reaches the app
         assertEquals(false, l.onButton(33, t + 15_010))    // a stale level is not a claim on the drop
         assertEquals(50, l.shown)
+    }
+
+    /** 11-nov ride: after a pause Bestcycling reads a press against the relayed 0x2AD2 resistance, not the
+     *  machine's level. Showing raw+1 for a + (24 -> 28, raw 27, resistance 55) still read as -. */
+    @Test fun levelAttribution_aPressAfterAPauseIsShownPastTheResistance() {
+        val up = PowerRewrite.LevelAttribution()
+        up.onLevel(26, 0); up.onLevel(26, 1000)             // shown 40
+        up.onLevel(25, 1500); up.onButton(25, 1510)         // quick -: just the step, shown 39
+        assertEquals(39, up.shown)
+        up.resistance = 55
+        assertEquals("SERVO", up.onLevel(26, 5000))
+        assertEquals(true, up.onButton(26, 5010))
+        assertEquals(57, up.shown)                          // over the resistance, not raw+1
+        up.onLevel(27, 5600); up.onButton(27, 5610)
+        assertEquals(58, up.shown)                          // quick: just the step
+
+        // a - after a pause from above the resistance lands under it; a tie reads as - (12 -> 13 over 13 went down)
+        val tie = PowerRewrite.LevelAttribution()
+        tie.onLevel(12, 0); tie.onLevel(12, 1000)           // shown 40
+        tie.resistance = 13
+        tie.onLevel(11, 5000); tie.onButton(11, 5010)
+        assertEquals(11, tie.shown)
+        tie.resistance = 12
+        tie.onLevel(12, 9000); tie.onButton(12, 9010)       // 11 + 1 = 12 ties the resistance
+        assertEquals(14, tie.shown)
+
+        // - already under the resistance after a pause: plain step (40 -> 39 under 45)
+        val down = PowerRewrite.LevelAttribution()
+        down.onLevel(27, 0); down.onLevel(27, 1000); down.resistance = 45
+        down.onLevel(26, 9000); down.onButton(26, 9010)
+        assertEquals(39, down.shown)
+    }
+
+    @Test fun indoorBikeResistance_readsTheField() {
+        val f = "7408570082007C05002D008A001702".chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        assertEquals(45, PowerRewrite.indoorBikeResistance(f))
     }
 
     /** The two notifications are on different characteristics; now and then the button one arrives first. */

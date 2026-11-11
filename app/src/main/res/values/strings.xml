@@ -31,6 +31,7 @@
     <string name="config_scale_label">Scale adjustment (%, integer)</string>
     <string name="config_offset_label">Offset (W, integer)</string>
     <string name="config_floor_label">ERG floor (W, 0 = off): below this target, don\'t drop the command lower</string>
+    <string name="config_stall_label" formatted="false">Anti-stall relief (% of the target, 0 = app default 10 W, 100 = off): when the app drops to 10 W because you bog down, hold this share of the target instead</string>
     <string name="config_save_correction">Save correction</string>
     <string name="config_saved">Saved</string>
     <string name="config_bike">Bike (BLE)</string>
