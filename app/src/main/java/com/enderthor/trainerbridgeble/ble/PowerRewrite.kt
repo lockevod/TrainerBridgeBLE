@@ -35,6 +35,20 @@ object PowerRewrite {
         return value
     }
 
+    /** Indoor Bike Data's Resistance Level (sint16), or null if absent. Same field walk as [correctIndoorBikeData]. */
+    fun indoorBikeResistance(value: ByteArray): Int? {
+        if (value.size < 2) return null
+        val flags = le16(value, 0)
+        if (flags and (1 shl 5) == 0) return null
+        var off = 2
+        if (flags and (1 shl 0) == 0) off += 2
+        if (flags and (1 shl 1) != 0) off += 2
+        if (flags and (1 shl 2) != 0) off += 2
+        if (flags and (1 shl 3) != 0) off += 2
+        if (flags and (1 shl 4) != 0) off += 3
+        return if (off + 2 > value.size) null else le16signed(value, off)
+    }
+
     /** FTMS Machine Status (0x2ADA) op 0x08 "Target Power Changed" echoes the watts the trainer was
      *  commanded — which we inverse-corrected. Correct it forward so the app reads back the wattage it will
      *  actually SEE. Below the ERG floor that is not the target it asked for: the floor lifts the command,
@@ -129,6 +143,9 @@ object PowerRewrite {
         private var lastHeld: Pair<Int, Long>? = null
         private var heldAt = 0   // the level the held presses would step back from
         private var heldSign = 0
+        private var shownAt = 0L   // when the app last saw the level change: it reads a press differently after a pause
+        /** The last 0x2AD2 Resistance Level relayed to the app: what it reads a press after a pause against. */
+        @Volatile var resistance: Int? = null
 
         /** A telemetry frame: RIDER/SERVO for a step (SERVO may still be claimed by [onButton]), null if none. */
         @Synchronized fun onLevel(raw: Int, nowMs: Long): String? {
@@ -137,7 +154,7 @@ object PowerRewrite {
             // Anchored off the floor, not at the idle 0 the ride starts from: the app reads the level relatively,
             // and from 0 the rider's first presses - could not show at all.
             val s = shown ?: return null.also {
-                shown = maxOf(raw, ANCHOR_LEVEL); log("level ANCHOR raw=$raw shown=$shown")
+                shown = maxOf(raw, ANCHOR_LEVEL); shownAt = nowMs; log("level ANCHOR raw=$raw shown=$shown")
             }
             if (last == null) return null
             early.removeAll { e ->
@@ -165,7 +182,7 @@ object PowerRewrite {
                 if (!within(e.first, last, raw) || (e in held && heldCount == 0)) continue
                 it.remove(); held.remove(e); credited++
             }
-            shown = clampLevel(s + step * credited)
+            if (credited > 0) shown = press(s, step * credited, raw, nowMs)
             unclaimed = raw - last - step * credited; unclaimedAt = nowMs; stepFrom = last
             return if (credited > 0) "RIDER" else "SERVO"
         }
@@ -184,14 +201,14 @@ object PowerRewrite {
                     return false
                 }
                 val before = shown
-                shown = clampLevel(s + step); unclaimed -= step
+                shown = press(s, step, raw, nowMs); unclaimed -= step
                 log("level btn=$level CLAIMED step=$stepFrom->$raw shown=$before->$shown unclaimed=$unclaimed")
                 // A press further along the step than a held one: the step ran through it, a burst.
                 for (h in held.filter { heldSign == step && it.first != level && within(it.first, stepFrom, level) }) {
                     if (Integer.signum(unclaimed) != step) break
                     held.remove(h); early.remove(h)
                     val b = shown ?: break
-                    shown = clampLevel(b + step); unclaimed -= step
+                    shown = press(b, step, raw, nowMs); unclaimed -= step
                     log("level btn=${h.first} CLAIMED (held, burst) shown=$b->$shown unclaimed=$unclaimed")
                 }
                 return true
@@ -200,7 +217,7 @@ object PowerRewrite {
             // presses, every one lost — "pressing - did nothing" at low targets). Only a - can name 0 from 0.
             // ponytail: the same dead end exists at the machine's top level; unknown (seen 49 and 90), add if hit.
             if (s != null && level == 0 && raw == 0) {
-                shown = clampLevel(s - 1)
+                shown = clampLevel(s - 1); shownAt = nowMs
                 log("level btn=0 FLOOR shown=$s->$shown")
                 return true
             }
@@ -208,6 +225,30 @@ object PowerRewrite {
             if (early.size > MAX_EARLY_PRESSES) early.removeAt(0).also { held.remove(it); log("level btn=${it.first} DROPPED (burst)") }
             log("level btn=$level EARLY raw=$raw")
             return false
+        }
+
+        /**
+         * The level a press moves the app's [s] to. Bestcycling reads a level change two ways: < 2 s after the
+         * previous change it follows the step (8-nov: all 29 that tell the rules apart, up to 1.91 s); after that,
+         * by sign(level - the 0x2AD2 Resistance Level we relay untouched), whatever the step. 11-nov ride: 19 of 19
+         * presses after a pause, ties (level == resistance) read as -. Against the machine's own level (raw, the
+         * 9-nov guess) it is right for every - but wrong for 5 of 5 +: resistance runs 3-28 above raw, so raw+1 was
+         * still under it ("ahora al subir, primero baja").
+         * So after a pause a press on the wrong side is shown [PAUSE_MARGIN] past the resistance: one notch in the
+         * app however far it jumps (46 multi-level jumps after a pause, 8-nov, all one notch).
+         * ponytail: 2.0-2.2 s is left alone (a jump read as a step would be many notches); tune PAUSE_MS from logs.
+         * At the floor (raw 0) FLOOR keeps its old step.
+         */
+        private fun press(s: Int, delta: Int, raw: Int, nowMs: Long): Int {
+            val step = Integer.signum(delta)
+            val paused = nowMs - shownAt >= PAUSE_MS
+            shownAt = nowMs
+            val next = s + delta
+            val ref = resistance ?: raw
+            if (!paused || (next - ref) * step >= PAUSE_MARGIN) return clampLevel(next)
+            val past = clampLevel(ref + step * PAUSE_MARGIN)
+            log("level PAUSE shown=$s->$past (past res=$ref raw=$raw, the app reads a press after a pause against it)")
+            return past
         }
 
         /** The trainer link dropped: whatever it moved through meanwhile is nobody's press. */
@@ -242,6 +283,8 @@ object PowerRewrite {
     // ponytail: a ride past ~100 min of that pace reaches 255 and its further + presses stop showing; re-anchor
     // on each app (re)connect if rides get that long.
     private const val ANCHOR_LEVEL = 40
+    private const val PAUSE_MARGIN = 2   // resistance jitters +-1 between frames; a tie reads as -
+    private const val PAUSE_MS = 2_200L   // Bestcycling's switch is ~2 s (1.91 s step, 2.11 s sign); margin for jitter
     private const val MAX_EARLY_PRESSES = 8   // a burst is a handful; the window expires the rest anyway
 
     /** FTMS Control Point Set Target Power (0x05, uint16 W LE) → inverse-correct the watts. Other ops pass. */

@@ -143,6 +143,42 @@ class PowerRewriteTest {
         assertEquals(50, l.shown)
     }
 
+    /** 11-nov ride: after a pause Bestcycling reads a press against the relayed 0x2AD2 resistance, not the
+     *  machine's level. Showing raw+1 for a + (24 -> 28, raw 27, resistance 55) still read as -. */
+    @Test fun levelAttribution_aPressAfterAPauseIsShownPastTheResistance() {
+        val up = PowerRewrite.LevelAttribution()
+        up.onLevel(26, 0); up.onLevel(26, 1000)             // shown 40
+        up.onLevel(25, 1500); up.onButton(25, 1510)         // quick -: just the step, shown 39
+        assertEquals(39, up.shown)
+        up.resistance = 55
+        assertEquals("SERVO", up.onLevel(26, 5000))
+        assertEquals(true, up.onButton(26, 5010))
+        assertEquals(57, up.shown)                          // over the resistance, not raw+1
+        up.onLevel(27, 5600); up.onButton(27, 5610)
+        assertEquals(58, up.shown)                          // quick: just the step
+
+        // a - after a pause from above the resistance lands under it; a tie reads as - (12 -> 13 over 13 went down)
+        val tie = PowerRewrite.LevelAttribution()
+        tie.onLevel(12, 0); tie.onLevel(12, 1000)           // shown 40
+        tie.resistance = 13
+        tie.onLevel(11, 5000); tie.onButton(11, 5010)
+        assertEquals(11, tie.shown)
+        tie.resistance = 12
+        tie.onLevel(12, 9000); tie.onButton(12, 9010)       // 11 + 1 = 12 ties the resistance
+        assertEquals(14, tie.shown)
+
+        // - already under the resistance after a pause: plain step (40 -> 39 under 45)
+        val down = PowerRewrite.LevelAttribution()
+        down.onLevel(27, 0); down.onLevel(27, 1000); down.resistance = 45
+        down.onLevel(26, 9000); down.onButton(26, 9010)
+        assertEquals(39, down.shown)
+    }
+
+    @Test fun indoorBikeResistance_readsTheField() {
+        val f = "7408570082007C05002D008A001702".chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        assertEquals(45, PowerRewrite.indoorBikeResistance(f))
+    }
+
     /** The two notifications are on different characteristics; now and then the button one arrives first. */
     @Test fun levelAttribution_aPressMayArriveBeforeItsLevelFrame() {
         val l = PowerRewrite.LevelAttribution()

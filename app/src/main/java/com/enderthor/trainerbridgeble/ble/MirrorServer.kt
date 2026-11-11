@@ -655,7 +655,10 @@ class MirrorServer(
             return
         }
         val out = when {
-            charUuid == GattUuids.INDOOR_BIKE_DATA -> PowerRewrite.correctIndoorBikeData(value, correction())
+            charUuid == GattUuids.INDOOR_BIKE_DATA -> {
+                PowerRewrite.indoorBikeResistance(value)?.let { zycleLevel.resistance = it }   // see LevelAttribution.press
+                PowerRewrite.correctIndoorBikeData(value, correction())
+            }
             charUuid == GattUuids.CYCLING_POWER_MEASUREMENT -> PowerRewrite.correctCyclingPower(value, correction())
             // Machine Status "Target Power Changed" echoes the (inverse-corrected) watts we commanded, so
             // correct it forward or the app reads back a target it never asked for
