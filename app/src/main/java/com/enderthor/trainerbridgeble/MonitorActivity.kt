@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.view.View
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.Button
 import android.widget.LinearLayout
@@ -54,7 +55,8 @@ class MonitorActivity : Activity() {
         masterSwitch = switchRow(getString(R.string.monitor_master), config.masterEnabled).apply {
             setOnCheckedChangeListener { _, isChecked -> config.masterEnabled = isChecked; BridgeService.setMaster(this@MonitorActivity, isChecked); render() }
         }
-        startBtn = accentButton(getString(R.string.monitor_emit_start)) { onStartStop() }.apply {
+        startBtn = accentButton(getString(R.string.monitor_emit_start)) {}.apply {
+            guarded { onStartStop() }
             (layoutParams as LinearLayout.LayoutParams).setMargins(0, dp(10), 0, dp(10))   // gap above and before the status card
         }
         body.addView(startBtn)
@@ -87,8 +89,8 @@ class MonitorActivity : Activity() {
             gravity = android.view.Gravity.CENTER; setPadding(0, dp(12), 0, 0)   // caption above the ▼▲ arrows
         })
         val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        downBtn = tileButton(getString(R.string.monitor_resistance_down)) { service?.buttonDown() }
-        upBtn = tileButton(getString(R.string.monitor_resistance_up)) { service?.buttonUp() }
+        downBtn = tileButton(getString(R.string.monitor_resistance_down)) {}.apply { guarded { service?.buttonDown() } }
+        upBtn = tileButton(getString(R.string.monitor_resistance_up)) {}.apply { guarded { service?.buttonUp() } }
         btnRow.addView(downBtn); btnRow.addView(upBtn); mon.addView(btnRow)
         body.addView(mon)
 
@@ -187,6 +189,19 @@ class MonitorActivity : Activity() {
         this.text = text; setTextColor(Palette.ACCENT); background = rounded(Palette.PAGE_BG); textSize = 18f; setPadding(dp(10), dp(8), dp(10), dp(8))
         val lp = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f); lp.setMargins(dp(3), dp(8), dp(3), 0); layoutParams = lp
         setOnClickListener { onClick() }
+    }
+
+    private var holdToast: android.widget.Toast? = null
+
+    /** While emitting, a plain tap only shows a hint and the action needs a long press: on 12-nov sweat on
+     *  the screen toggled emit 12 times in 90 s and the app lost its subscriptions until it dropped. */
+    private fun View.guarded(action: () -> Unit) {
+        setOnClickListener {
+            if (service?.emitting != true) return@setOnClickListener action()
+            holdToast?.cancel()
+            holdToast = android.widget.Toast.makeText(this@MonitorActivity, R.string.monitor_hold_to_act, android.widget.Toast.LENGTH_SHORT).also { it.show() }
+        }
+        setOnLongClickListener { if (service?.emitting == true) { action(); true } else false }
     }
 
     private companion object { const val STALE_MS = 3000L }

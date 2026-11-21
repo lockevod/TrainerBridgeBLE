@@ -9,6 +9,7 @@
     <string name="monitor_master">App activa</string>
     <string name="monitor_emit_start">Emitir</string>
     <string name="monitor_emit_stop">Dejar de emitir</string>
+    <string name="monitor_hold_to_act">Mantén pulsado mientras emites</string>
     <string name="monitor_off">Apagada</string>
     <string name="monitor_banner_stopped">Detenido</string>
     <string name="monitor_banner_searching">Buscando trainer…</string>
