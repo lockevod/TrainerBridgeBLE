@@ -571,6 +571,7 @@ class BridgeService : Service() {
             context = this,
             advertisedName = config.advertisedName,
             correction = { config.correction() },
+            stallReliefPercent = { config.stallReliefPercent },
             toZycle = { uuid, bytes, withResponse, onComplete ->
                 // CAPTURE the source under the owner; dispatch outside it (see [emitOwner]). A callback from
                 // a stopped mirror captures nothing and relays nothing; one admitted before the clear still

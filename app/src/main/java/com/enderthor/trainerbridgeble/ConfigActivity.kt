@@ -22,6 +22,7 @@ class ConfigActivity : Activity() {
     private lateinit var scaleField: EditText
     private lateinit var offsetField: EditText
     private lateinit var floorField: EditText
+    private lateinit var stallField: EditText
     private lateinit var nameField: EditText
     private lateinit var pairedLine: TextView
     private lateinit var scanBtn: TextView
@@ -58,6 +59,8 @@ class ConfigActivity : Activity() {
         offsetField = intField(config.offsetW.toString()); corr.addView(offsetField)
         corr.addView(bodyText(getString(R.string.config_floor_label), 13f))
         floorField = intField(config.invertFloorW.toString()); corr.addView(floorField)
+        corr.addView(bodyText(getString(R.string.config_stall_label), 13f))
+        stallField = intField(config.stallReliefPercent.toString()); corr.addView(stallField)
         corr.addView(accentButton(getString(R.string.config_save_correction)) { save(); toast(getString(R.string.config_saved)) })
         body.addView(corr)
 
@@ -119,6 +122,7 @@ class ConfigActivity : Activity() {
         intField(scaleField, getString(R.string.config_scale_label), { it > -100 }) { config.scaleAdjustPercent = it }
         intField(offsetField, getString(R.string.config_offset_label), { true }) { config.offsetW = it }
         intField(floorField, getString(R.string.config_floor_label), { it >= 0 }) { config.invertFloorW = it }
+        intField(stallField, getString(R.string.config_stall_label), { it in 0..100 }) { config.stallReliefPercent = it }
         config.advertisedName = nameField.text.toString().trim()   // blank = keep the device's own name
         config.keepAwake = keepAwakeCheck.isChecked
         config.keepScreenOn = keepScreenCheck.isChecked

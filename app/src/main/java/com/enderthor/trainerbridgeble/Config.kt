@@ -24,6 +24,12 @@ class Config(context: Context) {
         get() = p.getInt(KEY_INVERT_FLOOR, 50)
         set(v) = p.edit().putInt(KEY_INVERT_FLOOR, v).apply()
 
+    /** When the app drops to its 10 W anti-stall target, hold this % of the last target instead.
+     *  0 = leave the app's 10 W, 100 = no relief. */
+    var stallReliefPercent: Int
+        get() = p.getInt(KEY_STALL_RELIEF, 0).coerceIn(0, 100)
+        set(v) = p.edit().putInt(KEY_STALL_RELIEF, v.coerceIn(0, 100)).apply()
+
     /** Raw watts the trainer settles above its ERG command, LEARNED at ride time (not a setting anyone is
      *  expected to know) and kept so the next ride starts calibrated. See
      *  [com.enderthor.trainerbridgeble.correction.ErgBias]. Clamped on the way OUT too: this value goes
@@ -124,6 +130,7 @@ class Config(context: Context) {
         const val KEY_OFFSET = "offsetW"
         const val KEY_INVERT_FLOOR = "invertFloorW"
         const val KEY_ERG_BIAS = "ergBiasW"
+        const val KEY_STALL_RELIEF = "stallReliefPercent"
         // ONE clamp: a legacy 28 W preference must not keep cutting commands past what the learner may hold
         const val ERG_BIAS_LIMIT_W = com.enderthor.trainerbridgeble.correction.ErgBias.MAX_BIAS_W
         const val KEY_ADDR = "pairedAddress"
